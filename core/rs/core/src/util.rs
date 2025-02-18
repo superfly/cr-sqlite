@@ -47,7 +47,7 @@ pub fn get_db_version_union_query(tbl_names: &[String]) -> String {
         .iter()
         .map(|tbl_name| {
             format!(
-                "SELECT max(db_version) as version FROM \"{}\"",
+                "SELECT max(db_version) as version FROM \"{}\" WHERE site_id = 0",
                 escape_ident(tbl_name),
             )
         })

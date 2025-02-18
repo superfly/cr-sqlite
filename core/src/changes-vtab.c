@@ -28,7 +28,7 @@ static int changesConnect(sqlite3 *db, void *pAux, int argc,
       "CREATE TABLE x([table] TEXT NOT NULL, [pk] BLOB NOT NULL, [cid] TEXT "
       "NOT NULL, [val] ANY, [col_version] INTEGER NOT NULL, [db_version] "
       "INTEGER NOT NULL, [site_id] BLOB NOT NULL, [cl] INTEGER NOT NULL, [seq] "
-      "INTEGER NOT NULL, [site_version] INTEGER NOT NULL)");
+      "INTEGER NOT NULL)");
   if (rc != SQLITE_OK) {
     *pzErr = sqlite3_mprintf("Could not define the table");
     return rc;
@@ -96,7 +96,7 @@ static int changesCrsrFinalize(crsql_Changes_cursor *crsr) {
   crsr->pRowStmt = 0;
 
   crsr->dbVersion = MIN_POSSIBLE_DB_VERSION;
-  crsr->siteVersion = MIN_POSSIBLE_SITE_VERSION;
+  // crsr->siteVersion = MIN_POSSIBLE_SITE_VERSION;
 
   return rc;
 }

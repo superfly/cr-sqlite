@@ -86,7 +86,6 @@ fn mark_new_pk_row_created(
     key_new: sqlite::int64,
     db_version: i64,
     seq: i32,
-    site_version: i64,
 ) -> Result<ResultCode, String> {
     let mark_locally_created_stmt_ref = tbl_info
         .get_mark_locally_created_stmt(db)
@@ -99,7 +98,6 @@ fn mark_new_pk_row_created(
         .bind_int64(1, key_new)
         .and_then(|_| mark_locally_created_stmt.bind_int64(2, db_version))
         .and_then(|_| mark_locally_created_stmt.bind_int(3, seq))
-        .and_then(|_| mark_locally_created_stmt.bind_int64(4, site_version))
         .map_err(|_| "failed binding to mark_locally_created_stmt")?;
     step_trigger_stmt(mark_locally_created_stmt)
 }
@@ -118,7 +116,6 @@ fn mark_locally_inserted(
     tbl_info: &TableInfo,
     new_key: sqlite::int64,
     db_version: sqlite::int64,
-    site_version: sqlite::int64,
 ) -> Result<ResultCode, String> {
     let mut last_seq = None;
     let mut to_insert = Vec::with_capacity(tbl_info.non_pks.len());
@@ -135,9 +132,8 @@ fn mark_locally_inserted(
         update_clock_stmt
             .bind_int64(1, db_version)
             .and_then(|_| update_clock_stmt.bind_int(2, seq))
-            .and_then(|_| update_clock_stmt.bind_int64(3, site_version))
-            .and_then(|_| update_clock_stmt.bind_int64(4, new_key))
-            .and_then(|_| update_clock_stmt.bind_text(5, &col.name, sqlite::Destructor::STATIC))
+            .and_then(|_| update_clock_stmt.bind_int64(3, new_key))
+            .and_then(|_| update_clock_stmt.bind_text(4, &col.name, sqlite::Destructor::STATIC))
             .map_err(|_| "failed binding to update_clock_stmt")?;
 
         step_trigger_stmt(update_clock_stmt)?;
@@ -160,7 +156,7 @@ fn mark_locally_inserted(
                 .ok_or("Failed to deref combo_insert_clock_stmt")?;
             for (i, col) in tbl_info.non_pks.iter().enumerate() {
                 let seq = last_seq.take().unwrap_or_else(|| bump_seq(ext_data));
-                let offset = i as i32 * 5;
+                let offset = i as i32 * 4;
 
                 combo_insert_clock_stmt
                     .bind_int64(offset + 1, new_key)
@@ -173,7 +169,6 @@ fn mark_locally_inserted(
                     })
                     .and_then(|_| combo_insert_clock_stmt.bind_int64(offset + 3, db_version))
                     .and_then(|_| combo_insert_clock_stmt.bind_int(offset + 4, seq))
-                    .and_then(|_| combo_insert_clock_stmt.bind_int64(offset + 5, site_version))
                     .map_err(|code| {
                         format!("failed binding to combo_insert_clock_stmt, code: {code}")
                     })?;
@@ -203,7 +198,6 @@ fn mark_locally_inserted(
                     })
                     .and_then(|_| insert_clock_stmt.bind_int64(3, db_version))
                     .and_then(|_| insert_clock_stmt.bind_int(4, seq))
-                    .and_then(|_| insert_clock_stmt.bind_int64(5, site_version))
                     .map_err(|_| "failed binding to insert_clock_stmt")?;
 
                 step_trigger_stmt(insert_clock_stmt)?;
@@ -222,7 +216,6 @@ fn mark_locally_updated(
     col_info: &ColumnInfo,
     db_version: sqlite::int64,
     seq: i32,
-    site_version: sqlite::int64,
 ) -> Result<ResultCode, String> {
     // libc_print::libc_println!("mark_locally_updated, site_version = {}", site_version);
 
@@ -236,9 +229,8 @@ fn mark_locally_updated(
     update_clock_stmt
         .bind_int64(1, db_version)
         .and_then(|_| update_clock_stmt.bind_int(2, seq))
-        .and_then(|_| update_clock_stmt.bind_int64(3, site_version))
-        .and_then(|_| update_clock_stmt.bind_int64(4, new_key))
-        .and_then(|_| update_clock_stmt.bind_text(5, &col_info.name, sqlite::Destructor::STATIC))
+        .and_then(|_| update_clock_stmt.bind_int64(3, new_key))
+        .and_then(|_| update_clock_stmt.bind_text(4, &col_info.name, sqlite::Destructor::STATIC))
         .map_err(|_| "failed binding to update_clock_stmt")?;
 
     step_trigger_stmt(update_clock_stmt)?;
@@ -258,7 +250,6 @@ fn mark_locally_updated(
             })
             .and_then(|_| insert_clock_stmt.bind_int64(3, db_version))
             .and_then(|_| insert_clock_stmt.bind_int(4, seq))
-            .and_then(|_| insert_clock_stmt.bind_int64(5, site_version))
             .map_err(|_| "failed binding to insert_clock_stmt")?;
 
         step_trigger_stmt(insert_clock_stmt)?;

@@ -171,7 +171,6 @@ fn set_winner_clock(
     insert_db_vrsn: sqlite::int64,
     insert_site_id: &[u8],
     insert_seq: sqlite::int64,
-    insert_site_vrsn: sqlite::int64,
 ) -> Result<sqlite::int64, ResultCode> {
     // set the site_id ordinal
     // get the returned ordinal
@@ -244,8 +243,8 @@ fn set_winner_clock(
         .and_then(|_| match ordinal {
             Some(ordinal) => set_stmt.bind_int64(6, ordinal),
             None => set_stmt.bind_null(6),
-        })
-        .and_then(|_| set_stmt.bind_int64(7, insert_site_vrsn));
+        });
+        // .and_then(|_| set_stmt.bind_int64(7, insert_site_vrsn));
 
     if let Err(rc) = bind_result {
         reset_cached_stmt(set_stmt.stmt)?;
@@ -265,7 +264,7 @@ fn set_winner_clock(
     };
 
     if !insert_site_id.is_empty() {
-        insert_site_version(ext_data, insert_site_id, insert_site_vrsn)?;
+        insert_site_version(ext_data, insert_site_id, insert_db_vrsn)?;
     }
     Ok(rowid)
 }
@@ -280,7 +279,7 @@ fn merge_sentinel_only_insert(
     remote_db_vsn: sqlite::int64,
     remote_site_id: &[u8],
     remote_seq: sqlite::int64,
-    remote_site_vrsn: sqlite::int64,
+    // remote_site_vrsn: sqlite::int64,
 ) -> Result<sqlite::int64, ResultCode> {
     let merge_stmt_ref = tbl_info.get_merge_pk_only_insert_stmt(db)?;
     let merge_stmt = merge_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
@@ -327,7 +326,7 @@ fn merge_sentinel_only_insert(
             remote_db_vsn,
             remote_site_id,
             remote_seq,
-            remote_site_vrsn,
+            // remote_site_vrsn,
         );
     }
 
@@ -361,7 +360,7 @@ unsafe fn merge_delete(
     remote_db_vrsn: sqlite::int64,
     remote_site_id: &[u8],
     remote_seq: sqlite::int64,
-    remote_site_vrsn: sqlite::int64,
+    // remote_site_vrsn: sqlite::int64,
 ) -> Result<sqlite::int64, ResultCode> {
     let delete_stmt_ref = tbl_info.get_merge_delete_stmt(db)?;
     let delete_stmt = delete_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
@@ -400,7 +399,7 @@ unsafe fn merge_delete(
         remote_db_vrsn,
         remote_site_id,
         remote_seq,
-        remote_site_vrsn,
+        // remote_site_vrsn,
     )?;
 
     // Drop clocks _after_ setting the winner clock so we don't lose track of the max db_version!!
@@ -509,7 +508,7 @@ unsafe fn merge_insert(
     let insert_site_id = args[2 + CrsqlChangesColumn::SiteId as usize];
     let insert_cl = args[2 + CrsqlChangesColumn::Cl as usize].int64();
     let insert_seq = args[2 + CrsqlChangesColumn::Seq as usize].int64();
-    let insert_site_vrsn = args[2 + CrsqlChangesColumn::SiteVrsn as usize].int64();
+    // let insert_site_vrsn: i64 = args[2 + CrsqlChangesColumn::SiteVrsn as usize].int64();
 
     if insert_site_id.bytes() > crate::consts::SITE_ID_LEN {
         let err = CString::new("crsql - site id exceeded max length")?;
@@ -583,7 +582,7 @@ unsafe fn merge_insert(
             insert_db_vrsn,
             insert_site_id,
             insert_seq,
-            insert_site_vrsn,
+            // insert_site_vrsn,
         );
         match merge_result {
             Err(rc) => {
@@ -611,6 +610,7 @@ unsafe fn merge_insert(
         if insert_cl == local_cl {
             return Ok(ResultCode::OK);
         }
+        libc_print::libc_println!("merge_sentinel_only_insert");
         let merge_result = merge_sentinel_only_insert(
             db,
             (*tab).pExtData,
@@ -621,7 +621,7 @@ unsafe fn merge_insert(
             insert_db_vrsn,
             insert_site_id,
             insert_seq,
-            insert_site_vrsn,
+            // insert_site_vrsn,
         );
         match merge_result {
             Err(rc) => {
@@ -659,7 +659,7 @@ unsafe fn merge_insert(
             insert_db_vrsn,
             insert_site_id,
             insert_seq,
-            insert_site_vrsn,
+            // insert_site_vrsn,
         )?;
         (*(*tab).pExtData).rowsImpacted += 1;
     }
@@ -729,7 +729,6 @@ unsafe fn merge_insert(
         insert_db_vrsn,
         insert_site_id,
         insert_seq,
-        insert_site_vrsn,
     );
     match merge_result {
         Err(rc) => {

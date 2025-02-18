@@ -41,7 +41,7 @@ fn changes_crsr_finalize(crsr: *mut crsql_Changes_cursor) -> c_int {
         }
         (*crsr).pRowStmt = null_mut();
         (*crsr).dbVersion = crate::consts::MIN_POSSIBLE_DB_VERSION;
-        (*crsr).siteVersion = crate::consts::MIN_POSSIBLE_SITE_VERSION;
+        // (*crsr).siteVersion = crate::consts::MIN_POSSIBLE_SITE_VERSION;
 
         rc
     }
@@ -209,7 +209,7 @@ fn get_clock_table_col_name(col: &Option<CrsqlChangesColumn>) -> Option<String> 
         Some(CrsqlChangesColumn::SiteId) => Some("site_id".to_string()),
         Some(CrsqlChangesColumn::Seq) => Some("seq".to_string()),
         Some(CrsqlChangesColumn::Cl) => Some("cl".to_string()),
-        Some(CrsqlChangesColumn::SiteVrsn) => Some("site_vrsn".to_string()),
+        // Some(CrsqlChangesColumn::SiteVrsn) => Some("site_vrsn".to_string()),
         None => None,
     }
 }
@@ -368,11 +368,11 @@ unsafe fn changes_next(
     let changes_rowid = (*cursor)
         .pChangesStmt
         .column_int64(ClockUnionColumn::RowId as i32);
-    let site_version = (*cursor)
-        .pChangesStmt
-        .column_int64(ClockUnionColumn::SiteVrsn as i32);
+    // let site_version = (*cursor)
+    //     .pChangesStmt
+    //     .column_int64(ClockUnionColumn::SiteVrsn as i32);
     (*cursor).dbVersion = db_version;
-    (*cursor).siteVersion = site_version;
+    // (*cursor).siteVersion = site_version;
 
     // libc_print::libc_println!(
     //     "db_version = {}, site_version = {}",
@@ -513,9 +513,9 @@ fn column_impl(
         Some(CrsqlChangesColumn::Cl) => {
             ctx.result_value(changes_stmt.column_value(ClockUnionColumn::Cl as i32))
         }
-        Some(CrsqlChangesColumn::SiteVrsn) => {
-            ctx.result_value(changes_stmt.column_value(ClockUnionColumn::SiteVrsn as i32))
-        }
+        // Some(CrsqlChangesColumn::SiteVrsn) => {
+        //     ctx.result_value(changes_stmt.column_value(ClockUnionColumn::SiteVrsn as i32))
+        // }
         None => return Err(ResultCode::MISUSE),
     }
 

@@ -19,7 +19,7 @@ def test_insert_row():
     # db version, seq, col version, site id, cl should all be from the insertion
     c = create_db()
     c.execute(
-        "INSERT INTO crsql_changes VALUES ('foo', x'010901', 'b', 1, 4, 4, x'1dc8d6bb7f8941088327d9439a7927a4', 3, 6, 1)")
+        "INSERT INTO crsql_changes VALUES ('foo', x'010901', 'b', 1, 4, 4, x'1dc8d6bb7f8941088327d9439a7927a4', 3, 6)")
     c.commit()
 
     changes = c.execute("SELECT * FROM crsql_changes").fetchall()
@@ -32,8 +32,7 @@ def test_insert_row():
                          4,
                          b"\x1d\xc8\xd6\xbb\x7f\x89A\x08\x83'\xd9C\x9ay'\xa4",
                          3,
-                         6,
-                         1),
+                         6),
                         ('foo',
                          b'\x01\t\x01',
                          'b',
@@ -42,8 +41,7 @@ def test_insert_row():
                          4,
                          b"\x1d\xc8\xd6\xbb\x7f\x89A\x08\x83'\xd9C\x9ay'\xa4",
                          3,
-                         6,
-                         1)])
+                         6)])
 
 
 def test_update_row():
@@ -51,7 +49,7 @@ def test_update_row():
     c.execute("INSERT INTO foo VALUES (1, 2)")
     c.commit()
     c.execute(
-        "INSERT INTO crsql_changes VALUES ('foo', x'010901', 'b', 1, 4, 4, x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF', 3, 6, 1)")
+        "INSERT INTO crsql_changes VALUES ('foo', x'010901', 'b', 1, 4, 4, x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF', 3, 6)")
     changes = c.execute("SELECT * FROM crsql_changes").fetchall()
     # what we wrote should be what we get back since we win the merge
     assert (changes == [('foo',
@@ -62,8 +60,7 @@ def test_update_row():
                          4,
                          b'\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff',
                          3,
-                         6,
-                         1),
+                         6),
                         ('foo',
                          b'\x01\t\x01',
                          'b',
@@ -72,15 +69,14 @@ def test_update_row():
                          4,
                          b'\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff',
                          3,
-                         6,
-                         1)])
+                         6)])
 
 
 def test_delete_row():
     c = create_db()
     c.execute("INSERT INTO foo VALUES (1, 2)")
     c.commit()
-    c.execute("INSERT INTO crsql_changes VALUES ('foo', x'010901', '-1', 1, 4, 4, x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF', 4, 6, 1)")
+    c.execute("INSERT INTO crsql_changes VALUES ('foo', x'010901', '-1', 1, 4, 4, x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF', 4, 6)")
     c.commit()
     changes = c.execute("SELECT * FROM crsql_changes").fetchall()
     assert (changes == [('foo',
@@ -91,8 +87,7 @@ def test_delete_row():
                          4,
                          b'\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff',
                          4,
-                         6,
-                         1)])
+                         6)])
 
 
 def test_custom_trigger():
@@ -103,7 +98,7 @@ def test_custom_trigger():
               END;""")
     c.commit()
     c.execute(
-        "INSERT INTO crsql_changes VALUES ('foo', x'010901', 'b', 1, 4, 4, x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF', 3, 6, 1)")
+        "INSERT INTO crsql_changes VALUES ('foo', x'010901', 'b', 1, 4, 4, x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF', 3, 6)")
     c.commit()
     rows = c.execute("SELECT * FROM log").fetchall()
     assert (rows == [])
@@ -122,6 +117,6 @@ def test_custom_trigger():
               END;""")
     c.commit()
     c.execute(
-        "INSERT INTO crsql_changes VALUES ('foo', x'010902', 'b', 1, 4, 4, x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF', 3, 6, 1)")
+        "INSERT INTO crsql_changes VALUES ('foo', x'010902', 'b', 1, 4, 4, x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF', 3, 6)")
     rows = c.execute("SELECT * FROM log").fetchall()
     assert (rows == [(1, 1), (2, 1)])

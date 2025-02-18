@@ -26,6 +26,7 @@ static void testManyPkTable() {
   rc += sqlite3_exec(db, "INSERT INTO foo VALUES (4,5,6);", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
+  printf("SELECT [table], quote(pk) FROM crsql_changes\n");
   rc += sqlite3_prepare_v2(db, "SELECT [table], quote(pk) FROM crsql_changes",
                            -1, &pStmt, 0);
   assert(rc == SQLITE_OK);

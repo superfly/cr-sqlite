@@ -21,10 +21,10 @@ struct crsql_ExtData {
   // if that transaction were to commit at the time this value is checked.
   sqlite3_int64 pendingDbVersion;
 
-  sqlite3_int64 siteVersion;
-  sqlite3_int64 pendingSiteVersion;
-  sqlite3_stmt *pSetSiteVersionStmt;
-  int nextSiteVersionSet;
+  // sqlite3_int64 siteVersion;
+  // sqlite3_int64 pendingSiteVersion;
+  // sqlite3_stmt *pSetSiteVersionStmt;
+  // int nextSiteVersionSet;
 
   int pragmaSchemaVersion;
   int updatedTableInfosThisTx;
@@ -35,9 +35,9 @@ struct crsql_ExtData {
 
   unsigned char *siteId;
   sqlite3_stmt *pDbVersionStmt;
-  sqlite3_stmt *pSiteVersionStmt;
+  sqlite3_stmt *pSetDbVersionStmt;
   void *tableInfos;
-  void *lastSiteVersions;
+  void *lastDbVersions;
 
   // tracks the number of rows impacted by all inserts into crsql_changes in the
   // current transaction. This number is reset on transaction commit.

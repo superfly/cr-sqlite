@@ -40,8 +40,8 @@ fn after_delete(
     pks_old: &[*mut value],
 ) -> Result<ResultCode, String> {
     // libc_print::libc_println!("after delete");
-    let db_version = crate::db_version::next_db_version(db, ext_data, None)?;
-    let site_version = crate::site_version::next_site_version(db, ext_data)?;
+    let db_version = crate::db_version::next_db_version(db, ext_data)?;
+    // let site_version = crate::site_version::next_site_version(db, ext_data)?;
     // libc_print::libc_println!("next site version: {}", site_version);
     let seq = bump_seq(ext_data);
     let key = tbl_info
@@ -58,7 +58,6 @@ fn after_delete(
         .bind_int64(1, key)
         .and_then(|_| mark_locally_deleted_stmt.bind_int64(2, db_version))
         .and_then(|_| mark_locally_deleted_stmt.bind_int(3, seq))
-        .and_then(|_| mark_locally_deleted_stmt.bind_int64(4, site_version))
         .map_err(|_| "failed binding to mark locally deleted stmt")?;
     super::step_trigger_stmt(mark_locally_deleted_stmt)?;
 

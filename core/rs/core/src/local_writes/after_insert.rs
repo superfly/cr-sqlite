@@ -40,8 +40,7 @@ fn after_insert(
     pks_new: &[*mut value],
 ) -> Result<ResultCode, String> {
     // libc_print::libc_println!("after_insert");
-    let db_version = crate::db_version::next_db_version(db, ext_data, None)?;
-    let site_version = crate::site_version::next_site_version(db, ext_data)?;
+    let db_version = crate::db_version::next_db_version(db, ext_data)?;
     // libc_print::libc_println!("next site version: {}", site_version);
     let (create_record_existed, key_new) = tbl_info
         .get_or_create_key_for_insert(db, pks_new)
@@ -55,12 +54,11 @@ fn after_insert(
             key_new,
             db_version,
             seq,
-            site_version,
         );
     } else if create_record_existed {
         // update the create record since it already exists.
         let seq = bump_seq(ext_data);
-        update_create_record(db, tbl_info, key_new, db_version, seq, site_version)?;
+        update_create_record(db, tbl_info, key_new, db_version, seq)?;
     }
 
     // now for each non-pk column, create or update the column record
@@ -69,7 +67,7 @@ fn after_insert(
     //     super::mark_locally_updated(db, tbl_info, key_new, col, db_version, seq, site_version)?;
     // }
 
-    super::mark_locally_inserted(db, ext_data, tbl_info, key_new, db_version, site_version)?;
+    super::mark_locally_inserted(db, ext_data, tbl_info, key_new, db_version)?;
 
     Ok(ResultCode::OK)
 }
@@ -80,7 +78,6 @@ fn update_create_record(
     new_key: sqlite::int64,
     db_version: sqlite::int64,
     seq: i32,
-    site_version: sqlite::int64,
 ) -> Result<ResultCode, String> {
     let update_create_record_stmt_ref = tbl_info
         .get_maybe_mark_locally_reinserted_stmt(db)
@@ -92,11 +89,10 @@ fn update_create_record(
     update_create_record_stmt
         .bind_int64(1, db_version)
         .and_then(|_| update_create_record_stmt.bind_int(2, seq))
-        .and_then(|_| update_create_record_stmt.bind_int64(3, site_version))
-        .and_then(|_| update_create_record_stmt.bind_int64(4, new_key))
+        .and_then(|_| update_create_record_stmt.bind_int64(3, new_key))
         .and_then(|_| {
             update_create_record_stmt.bind_text(
-                5,
+                4,
                 crate::c::INSERT_SENTINEL,
                 sqlite::Destructor::STATIC,
             )

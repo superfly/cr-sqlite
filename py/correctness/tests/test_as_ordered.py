@@ -2,8 +2,11 @@ from crsql_correctness import connect, close, min_db_v
 from pprint import pprint
 
 
-def make_simple_schema():
-    c = connect(":memory:")
+def make_simple_schema(count=-1):
+    if count == -1:
+        c = connect(":memory:")
+    else:
+        c = connect("test" + str(count) + ".db")
     # O... so the type must be `ANY` for the orderable column for our triggers and the like to work...
     # we could cast the whatever to an int...
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, spot TEXT, list)")

@@ -72,8 +72,7 @@ fn after_update(
     non_pks_old: &[*mut value],
 ) -> Result<ResultCode, String> {
     // libc_print::libc_println!("after_update");
-    let next_db_version = crate::db_version::next_db_version(db, ext_data, None)?;
-    let next_site_version = crate::site_version::next_site_version(db, ext_data)?;
+    let next_db_version = crate::db_version::next_db_version(db, ext_data)?;
     // libc_print::libc_println!("next site version: {}", next_site_version);
     let new_key = tbl_info
         .get_or_create_key_via_raw_values(db, pks_new)
@@ -102,7 +101,6 @@ fn after_update(
             new_key,
             next_db_version,
             next_seq,
-            next_site_version,
         )?;
         // }
     }
@@ -125,7 +123,6 @@ fn after_update(
                 col_info,
                 next_db_version,
                 next_seq,
-                next_site_version,
             )?;
         }
     }
@@ -151,7 +148,7 @@ fn after_update__mark_old_pk_row_deleted(
         .bind_int64(1, old_key)
         .and_then(|_| mark_locally_deleted_stmt.bind_int64(2, db_version))
         .and_then(|_| mark_locally_deleted_stmt.bind_int(3, seq))
-        .and_then(|_| mark_locally_deleted_stmt.bind_int64(4, db_version))
+        // .and_then(|_| mark_locally_deleted_stmt.bind_int64(4, db_version))
         .or_else(|_| Err("failed binding to mark_locally_deleted_stmt"))?;
     super::step_trigger_stmt(mark_locally_deleted_stmt)
 }

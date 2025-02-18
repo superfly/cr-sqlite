@@ -31,11 +31,12 @@ pub extern "C" fn crsql_config_set(
         }
     };
 
-    // libc_print::libc_println!("merge equal values set to {}", value.int());
+    libc_print::libc_println!("merge equal values set to {}", value.int());
 
     let db = ctx.db_handle();
     match insert_config_setting(db, name, value) {
         Ok(value) => {
+            libc_print::libc_println!("insert_config_setting succeeded: {}", value.int());
             ctx.result_value(value);
         }
         Err(rc) => {
@@ -60,6 +61,7 @@ fn insert_config_setting(
     if let ResultCode::ROW = stmt.step()? {
         stmt.column_value(0)
     } else {
+        libc_print::libc_println!("insert_config_setting failed");
         Err(ResultCode::ERROR)
     }
 }

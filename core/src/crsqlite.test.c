@@ -57,13 +57,13 @@ int syncLeftToRight(sqlite3 *db1, sqlite3 *db2, sqlite3_int64 since) {
   rc += sqlite3_bind_value(pStmtRead, 1, sqlite3_column_value(pStmt, 0));
   assert(rc == SQLITE_OK);
   rc += sqlite3_prepare_v2(
-      db2, "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      db2, "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       -1, &pStmtWrite, 0);
   assert(rc == SQLITE_OK);
   // printf("err: %s\n", err);
 
   while (sqlite3_step(pStmtRead) == SQLITE_ROW) {
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 9; ++i) {
       assert(sqlite3_bind_value(pStmtWrite, i + 1,
                                 sqlite3_column_value(pStmtRead, i)) ==
              SQLITE_OK);
@@ -440,6 +440,40 @@ static sqlite3_int64 getDbVersion(sqlite3 *db) {
   return db2v;
 }
 
+static const void *getSiteId(sqlite3 *db) {
+  sqlite3_stmt *pStmt = 0;
+  int rc = sqlite3_prepare_v2(db, "SELECT crsql_site_id()", -1, &pStmt, 0);
+  if (rc != SQLITE_OK) {
+    return NULL;
+  }
+
+  
+  sqlite3_step(pStmt);
+  const void *site_id = sqlite3_column_blob(pStmt, 0);
+  sqlite3_finalize(pStmt);
+
+  return site_id;
+}
+
+static sqlite3_int64 getSiteDbVersion(sqlite3 *db, const void *site_id) {
+  sqlite3_stmt *pStmt = 0;
+  int rc = sqlite3_prepare_v2(db, "SELECT db_version FROM crsql_db_versions WHERE site_id = ?", -1, &pStmt, 0);
+  if (rc != SQLITE_OK) {
+    return -1;
+  }
+
+  rc = sqlite3_bind_blob(pStmt, 1, site_id, 16, SQLITE_STATIC);
+  if (rc != SQLITE_OK) {
+    return -1;
+  }
+
+  sqlite3_step(pStmt);
+  sqlite3_int64 db2v = sqlite3_column_int64(pStmt, 0);
+  sqlite3_finalize(pStmt);
+
+  return db2v;
+}
+
 static void testLamportCondition() {
   printf("LamportCondition\n");
   // syncing from A -> B, while no changes happen on B, moves up
@@ -474,8 +508,19 @@ static void testLamportCondition() {
   sqlite3_int64 db1v = getDbVersion(db1);
   sqlite3_int64 db2v = getDbVersion(db2);
 
+
   assert(db1v > 0);
-  assert(db1v == db2v);
+
+  const void *site_id1 = getSiteId(db1);
+  assert(site_id1 != NULL);
+  // const void *site_id2 = getSiteId(db2);
+  // assert(site_id2 != NULL);
+
+  sqlite3_int64 db2_db1v = getSiteDbVersion(db2, site_id1);
+  
+  printf("db1v: %lld\n", db1v);
+  printf("db2_db1v: %lld\n", db2_db1v);
+  assert(db1v == db2_db1v);
 
   // now update col c on db2
   // and sync right to left

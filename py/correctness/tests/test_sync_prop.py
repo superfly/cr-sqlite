@@ -112,6 +112,7 @@ def test_delta_sync(all_scripts):
         right_rows = conn2.execute(
             "SELECT * FROM item ORDER BY id ASC").fetchall()
 
+        print("check for db " + str(i))
         assert (left_rows == right_rows)
     for db in dbs:
         close(db[1])
@@ -173,26 +174,26 @@ def sync_all(dbs, since_is_rowid):
     pull_from_dbids = list(range(1, len(dbs)))
     db0 = dbs[0]
 
-    peer_tracker = db0[2]
+    #peer_tracker = db0[2]
     conn = db0[1]
-
+    since_map = {}
     for pull_from in pull_from_dbids:
-        since = peer_tracker.get(pull_from, 0)
-        new_since = sync_left_to_right(
-            dbs[pull_from][1], conn, since, since_is_rowid)
-        peer_tracker[pull_from] = new_since
+        # since = peer_tracker.get(pull_from, 0)
+        since_map = new_since = sync_left_to_right(
+            dbs[pull_from][1], conn, since_map, since_is_rowid)
+        # peer_tracker[pull_from] = new_since
 
     for push_to in pull_from_dbids:
         push_to_db = dbs[push_to]
-        peer_tracker = push_to_db[2]
+        # peer_tracker = push_to_db[2]
         push_to_conn = push_to_db[1]
-        since = peer_tracker.get(0, 0)
+        #since = peer_tracker.get(0, 0)
 
-        sync_left_to_right(conn, push_to_conn, since, since_is_rowid)
+        since_map = sync_left_to_right(conn, push_to_conn, since_map, since_is_rowid)
 
 
 def sync_from_random_peers(num_peers_to_sync, db, dbs, since_is_rowid):
-    peer_tracker = db[2]
+    # peer_tracker = db[2]
     conn = db[1]
     dbid = db[0]
 
@@ -200,35 +201,53 @@ def sync_from_random_peers(num_peers_to_sync, db, dbs, since_is_rowid):
     # don't sync with self
     dbids.remove(dbid)
 
+    since_map = {}
     # pull 1-n other dbids to pull from
     pull_from_dbids = random.choices(
         dbids, k=num_peers_to_sync)
 
     for pull_from in pull_from_dbids:
-        since = peer_tracker.get(pull_from, 0)
+        # since = peer_tracker.get(pull_from, 0)
         new_since = sync_left_to_right(
-            dbs[pull_from][1], conn, since, since_is_rowid)
-        peer_tracker[pull_from] = new_since
+            dbs[pull_from][1], conn, since_map, since_is_rowid)
+        since_map = new_since
 
 
-def sync_left_to_right(l, r, since, since_is_rowid):
+def sync_left_to_right(l, r, since_map, since_is_rowid):
+    actors = l.execute("SELECT site_id FROM crsql_db_versions").fetchall()
+    # use db_version of each actor to filter changes
+    filter_versions = []
+    params = ()
+    for actor in actors:
+        if actor[0] not in since_map:
+            since_map[actor[0]] = 0
+        filter_versions.append("(site_id = ? AND db_version > ?)")
+        params += (actor[0], since_map[actor[0]])
+
+
     if since_is_rowid:
         changes = l.execute(
-            "SELECT *, rowid FROM crsql_changes WHERE rowid > ? ORDER BY db_version, seq ASC", (since,))
+            "SELECT *, rowid FROM crsql_changes WHERE rowid > ? ORDER BY site_id, db_version, seq ASC", (since,))
     else:
-        changes = l.execute(
-            "SELECT * FROM crsql_changes WHERE db_version > ? ORDER BY db_version, seq ASC", (since,))
+        if len(filter_versions) == 0:
+            changes = l.execute("SELECT * FROM crsql_changes ORDER BY site_id, db_version, seq ASC")
+        else:
+            query = "SELECT * FROM crsql_changes WHERE {} ORDER BY site_id, db_version, seq ASC".format(
+                " OR ".join(filter_versions))
+            # params = tuple(sum(since_map.items(), ()))
+            print("Running query: {}, and params: {}".format(query, params))
+            changes = l.execute(query, params)
 
-    ret = 0
+    ret = {}
     for change in changes:
         if since_is_rowid:
             temp = list(change)
             ret = temp.pop()
             change = tuple(temp)
         else:
-            ret = change[5]
+            ret[change[0]] = change[5]
         r.execute(
-            "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
+            "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
 
     r.commit()
     return ret

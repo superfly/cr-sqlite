@@ -57,9 +57,9 @@ pub extern "C" fn crsql_init_peer_tracking_table(db: *mut sqlite3) -> c_int {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn crsql_init_site_versions_table(db: *mut sqlite3) -> c_int {
-    match db.exec_safe("CREATE TABLE IF NOT EXISTS crsql_site_versions (\"site_id\" BLOB NOT NULL PRIMARY KEY, \"version\" INTEGER NOT NULL) STRICT;") {
+// #[no_mangle]
+pub extern "C" fn crsql_init_db_versions_table(db: *mut sqlite3) -> c_int {
+    match db.exec_safe("CREATE TABLE IF NOT EXISTS crsql_db_versions (\"site_id\" BLOB NOT NULL PRIMARY KEY, \"db_version\" INTEGER NOT NULL) STRICT;") {
       Ok(_) => ResultCode::OK as c_int,
       Err(code) => code as c_int
     }
@@ -166,11 +166,11 @@ fn maybe_update_db_inner(
         }
     }
 
-    if recorded_version < consts::CRSQLITE_VERSION_0_17_0 && !is_blank_slate {
-        if let Err(e) = update_to_0_17_0(db) {
-            return Err(e);
-        }
-    }
+    // if recorded_version < consts::CRSQLITE_VERSION_0_17_0 && !is_blank_slate {
+    //     if let Err(e) = update_to_0_17_0(db) {
+    //         return Err(e);
+    //     }
+    // }
 
     // write the db version if we migrated to a new one or we are a blank slate db
     if recorded_version < consts::CRSQLITE_VERSION || is_blank_slate {
@@ -215,22 +215,22 @@ pub fn create_clock_table(
       db_version INTEGER NOT NULL,
       site_id INTEGER NOT NULL DEFAULT 0,  
       seq INTEGER NOT NULL,
-      site_version INTEGER NOT NULL,
       PRIMARY KEY (key, col_name)
     ) WITHOUT ROWID, STRICT",
         table_name = crate::util::escape_ident(table_name),
     ))?;
 
+    // TODO: (we probably need to recreate index when upgrading)
     db.exec_safe(
         &format!(
-        "CREATE INDEX IF NOT EXISTS \"{table_name}__crsql_clock_dbv_idx\" ON \"{table_name}__crsql_clock\" (\"db_version\")",
+        "CREATE INDEX IF NOT EXISTS \"{table_name}__crsql_clock_dbv_idx\" ON \"{table_name}__crsql_clock\" (\"site_id\", \"db_version\")",
         table_name = crate::util::escape_ident(table_name),
         ))?;
-    db.exec_safe(
-        &format!(
-            "CREATE INDEX IF NOT EXISTS \"{table_name}__crsql_clock_sitev_idx\" ON \"{table_name}__crsql_clock\" (\"site_version\")",
-            table_name = crate::util::escape_ident(table_name),
-        ))?;
+    // db.exec_safe(
+    //     &format!(
+    //         "CREATE INDEX IF NOT EXISTS \"{table_name}__crsql_clock_sitev_idx\" ON \"{table_name}__crsql_clock\" (\"site_version\")",
+    //         table_name = crate::util::escape_ident(table_name),
+    //     ))?;
     db.exec_safe(
         &format!(
         "CREATE TABLE IF NOT EXISTS \"{table_name}__crsql_pks\" (__crsql_key INTEGER PRIMARY KEY, {pk_list})",

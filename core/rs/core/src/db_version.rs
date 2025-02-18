@@ -14,8 +14,9 @@ use crate::c::crsql_fetchPragmaDataVersion;
 use crate::c::crsql_fetchPragmaSchemaVersion;
 use crate::c::DB_VERSION_SCHEMA_VERSION;
 use crate::consts::MIN_POSSIBLE_DB_VERSION;
+use crate::consts::SITE_ID_LEN;
 use crate::ext_data::recreate_db_version_stmt;
-
+use crate::stmt_cache::reset_cached_stmt;
 #[no_mangle]
 pub extern "C" fn crsql_fill_db_version_if_needed(
     db: *mut sqlite3,
@@ -35,10 +36,9 @@ pub extern "C" fn crsql_fill_db_version_if_needed(
 pub extern "C" fn crsql_next_db_version(
     db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
-    merging_version: sqlite::int64,
     errmsg: *mut *mut c_char,
 ) -> sqlite::int64 {
-    match next_db_version(db, ext_data, Some(merging_version)) {
+    match next_db_version(db, ext_data) {
         Ok(version) => version,
         Err(msg) => {
             errmsg.set(&msg);
@@ -52,22 +52,54 @@ pub extern "C" fn crsql_next_db_version(
  * TODO: We could optimize to only do a pragma check once per transaction.
  * Need to save some bit that states we checked the pragma already and reset on tx commit or rollback.
  */
-pub fn next_db_version(
-    db: *mut sqlite3,
-    ext_data: *mut crsql_ExtData,
-    merging_version: Option<i64>,
-) -> Result<i64, String> {
+pub fn next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> Result<i64, String> {
     fill_db_version_if_needed(db, ext_data)?;
 
     let mut ret = unsafe { (*ext_data).dbVersion + 1 };
+    libc_print::libc_println!(
+        "incrementing db_version: {} => {}, ret: {}",
+        unsafe { (*ext_data).dbVersion },
+        unsafe { (*ext_data).pendingDbVersion },
+        ret
+    );
     if ret < unsafe { (*ext_data).pendingDbVersion } {
         ret = unsafe { (*ext_data).pendingDbVersion };
     }
-    if let Some(merging_version) = merging_version {
-        if ret < merging_version {
-            ret = merging_version;
+
+    // update db_version in db if it changed
+    if ret != unsafe { (*ext_data).pendingDbVersion } {
+        // update site_version in db
+        // libc_print::libc_println!(
+        //     "next_site_version: setting into DB! => {}",
+        //     ret
+        // );
+        // next site id is not set in the DB yet, do this now.
+        unsafe {
+            let site_id_slice =
+                core::slice::from_raw_parts((*ext_data).siteId, SITE_ID_LEN as usize);
+
+            let bind_result = (*ext_data)
+                .pSetDbVersionStmt
+                .bind_blob(1, site_id_slice, sqlite_nostd::Destructor::STATIC)
+                .and_then(|_| (*ext_data).pSetDbVersionStmt.bind_int64(2, ret));
+
+            if bind_result.is_err() {
+                return Err("failed binding to set_site_version_stmt".into());
+            }
+
+            if (*ext_data).pSetDbVersionStmt.step().is_err() {
+                reset_cached_stmt((*ext_data).pSetDbVersionStmt)
+                    .map_err(|_| "failed to reset cached set_site_version_stmt")?;
+                return Err("failed to insert site_version for current site ID".into());
+            }
+
+            reset_cached_stmt((*ext_data).pSetDbVersionStmt)
+                .map_err(|_| "failed to reset cached set_site_version_stmt")?;
+
+            //         (*ext_data).nextSiteVersionSet = 1;
         }
     }
+
     unsafe {
         (*ext_data).pendingDbVersion = ret;
     }

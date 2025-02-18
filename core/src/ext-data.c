@@ -14,6 +14,7 @@ void crsql_drop_last_site_versions_map(crsql_ExtData *pExtData);
 // void crsql_drop_table_info_vec(crsql_ExtData *pExtData);
 
 crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer) {
+  printf("crsql_newExtData\n");
   crsql_ExtData *pExtData = sqlite3_malloc(sizeof *pExtData);
 
   pExtData->siteId = siteIdBuffer;
@@ -51,30 +52,30 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer) {
   pExtData->dbVersion = -1;
   pExtData->pendingDbVersion = -1;
 
-  pExtData->siteVersion = -1;
-  pExtData->pendingSiteVersion = -1;
-  pExtData->nextSiteVersionSet = 0;
+  // pExtData->siteVersion = -1;
+  // pExtData->pendingSiteVersion = -1;
+  // pExtData->nextSiteVersionSet = 0;
 
-  pExtData->pSetSiteVersionStmt = 0;
-  // printf("instantiating pSetSiteVersionStmt... current rc: %d\n", rc);
+  pExtData->pSetDbVersionStmt = 0;
+  printf("instantiating pSetDbVersionStmt... current rc: %d\n", rc);
   rc += sqlite3_prepare_v3(
       db,
-      "INSERT OR REPLACE INTO crsql_site_versions (site_id, version) VALUES "
+      "INSERT OR REPLACE INTO crsql_db_versions (site_id, db_version) VALUES "
       "(?, ?)  ON "
-      "CONFLICT (site_id) DO UPDATE SET version = max(excluded.version, "
-      "crsql_site_versions.version) RETURNING version",
-      -1, SQLITE_PREPARE_PERSISTENT, &(pExtData->pSetSiteVersionStmt), 0);
+      "CONFLICT (site_id) DO UPDATE SET db_version = max(excluded.db_version, "
+      "crsql_db_versions.db_version) RETURNING db_version",
+      -1, SQLITE_PREPARE_PERSISTENT, &(pExtData->pSetDbVersionStmt), 0);
 
-  // printf("instantiated pSetSiteVersionStmt, rc: %d\n", rc);
+  printf("instantiated pSetDbVersionStmt, rc: %d\n", rc);
 
   pExtData->seq = 0;
   pExtData->pragmaSchemaVersion = -1;
   pExtData->pragmaDataVersion = -1;
   pExtData->pragmaSchemaVersionForTableInfos = -1;
   pExtData->pDbVersionStmt = 0;
-  pExtData->pSiteVersionStmt = 0;
+  // pExtData->pSiteVersionStmt = 0;
   pExtData->tableInfos = 0;
-  pExtData->lastSiteVersions = 0;
+  pExtData->lastDbVersions = 0;
   pExtData->rowsImpacted = 0;
   pExtData->updatedTableInfosThisTx = 0;
   crsql_init_table_info_vec(pExtData);
@@ -82,12 +83,14 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer) {
 
   sqlite3_stmt *pStmt;
 
+
   rc += sqlite3_prepare_v2(db,
                            "SELECT ltrim(key, 'config.'), value FROM "
                            "crsql_master WHERE key LIKE 'config.%';",
                            -1, &pStmt, 0);
 
   if (rc != SQLITE_OK) {
+    printf("crsql_newExtData, rc != SQLITE_OK\n");
     crsql_freeExtData(pExtData);
     return 0;
   }
@@ -114,7 +117,7 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer) {
   }
 
   sqlite3_finalize(pStmt);
-
+  printf("crsql_newExtData, finalizing pStmt\n");
   int pv = crsql_fetchPragmaDataVersion(db, pExtData);
   if (pv == -1 || rc != SQLITE_OK) {
     crsql_freeExtData(pExtData);
@@ -128,8 +131,7 @@ void crsql_freeExtData(crsql_ExtData *pExtData) {
   // printf("free ext\n");
   sqlite3_free(pExtData->siteId);
   sqlite3_finalize(pExtData->pDbVersionStmt);
-  sqlite3_finalize(pExtData->pSiteVersionStmt);
-  sqlite3_finalize(pExtData->pSetSiteVersionStmt);
+  sqlite3_finalize(pExtData->pSetDbVersionStmt);
   sqlite3_finalize(pExtData->pPragmaSchemaVersionStmt);
   sqlite3_finalize(pExtData->pPragmaDataVersionStmt);
   sqlite3_finalize(pExtData->pSetSyncBitStmt);
@@ -139,8 +141,8 @@ void crsql_freeExtData(crsql_ExtData *pExtData) {
   sqlite3_finalize(pExtData->pSelectClockTablesStmt);
   // printf("finalized statements\n");
   pExtData->pDbVersionStmt = 0;
-  pExtData->pSiteVersionStmt = 0;
-  pExtData->pSetSiteVersionStmt = 0;
+  // pExtData->pSiteVersionStmt = 0;
+  pExtData->pSetDbVersionStmt = 0;
   pExtData->pPragmaSchemaVersionStmt = 0;
   pExtData->pPragmaDataVersionStmt = 0;
   pExtData->pSetSyncBitStmt = 0;
@@ -162,8 +164,7 @@ void crsql_freeExtData(crsql_ExtData *pExtData) {
 void crsql_finalize(crsql_ExtData *pExtData) {
   // printf("crsql_finalize\n");
   sqlite3_finalize(pExtData->pDbVersionStmt);
-  sqlite3_finalize(pExtData->pSiteVersionStmt);
-  sqlite3_finalize(pExtData->pSetSiteVersionStmt);
+  sqlite3_finalize(pExtData->pSetDbVersionStmt);
   sqlite3_finalize(pExtData->pPragmaSchemaVersionStmt);
   sqlite3_finalize(pExtData->pPragmaDataVersionStmt);
   sqlite3_finalize(pExtData->pSetSyncBitStmt);
@@ -173,8 +174,8 @@ void crsql_finalize(crsql_ExtData *pExtData) {
   sqlite3_finalize(pExtData->pSelectClockTablesStmt);
   crsql_clear_stmt_cache(pExtData);
   pExtData->pDbVersionStmt = 0;
-  pExtData->pSiteVersionStmt = 0;
-  pExtData->pSetSiteVersionStmt = 0;
+  // pExtData->pSiteVersionStmt = 0;
+  pExtData->pSetDbVersionStmt = 0;
   pExtData->pPragmaSchemaVersionStmt = 0;
   pExtData->pPragmaDataVersionStmt = 0;
   pExtData->pSetSyncBitStmt = 0;
