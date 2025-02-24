@@ -244,7 +244,7 @@ fn set_winner_clock(
             Some(ordinal) => set_stmt.bind_int64(6, ordinal),
             None => set_stmt.bind_null(6),
         });
-        // .and_then(|_| set_stmt.bind_int64(7, insert_site_vrsn));
+    // .and_then(|_| set_stmt.bind_int64(7, insert_site_vrsn));
 
     if let Err(rc) = bind_result {
         reset_cached_stmt(set_stmt.stmt)?;

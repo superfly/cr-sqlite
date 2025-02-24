@@ -95,13 +95,7 @@ fn after_update(
         // if db.changes64() == 0 { <-- an optimization if we can get to it. we'd need to know to increment causal length.
         // so we can get to this when CL is stored in the lookaside.
         let next_seq = super::bump_seq(ext_data);
-        super::mark_new_pk_row_created(
-            db,
-            tbl_info,
-            new_key,
-            next_db_version,
-            next_seq,
-        )?;
+        super::mark_new_pk_row_created(db, tbl_info, new_key, next_db_version, next_seq)?;
         // }
     }
 

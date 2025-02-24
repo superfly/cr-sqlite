@@ -48,13 +48,7 @@ fn after_insert(
     if tbl_info.non_pks.is_empty() {
         let seq = bump_seq(ext_data);
         // just a sentinel record
-        return super::mark_new_pk_row_created(
-            db,
-            tbl_info,
-            key_new,
-            db_version,
-            seq,
-        );
+        return super::mark_new_pk_row_created(db, tbl_info, key_new, db_version, seq);
     } else if create_record_existed {
         // update the create record since it already exists.
         let seq = bump_seq(ext_data);
