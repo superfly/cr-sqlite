@@ -165,7 +165,7 @@ mod tests {
         let union = get_db_version_union_query(&tbl_names);
         assert_eq!(
             union,
-            "SELECT max(version) as version FROM (SELECT max(db_version) as version FROM \"foo\" UNION ALL SELECT max(db_version) as version FROM \"bar\" UNION ALL SELECT max(db_version) as version FROM \"baz\" UNION SELECT value as\n        version FROM crsql_master WHERE key = 'pre_compact_dbversion')"
+            "SELECT max(version) as version FROM (SELECT max(db_version) as version FROM \"foo\" WHERE site_id = 0 UNION ALL SELECT max(db_version) as version FROM \"bar\" WHERE site_id = 0 UNION ALL SELECT max(db_version) as version FROM \"baz\" WHERE site_id = 0 UNION SELECT value as\n        version FROM crsql_master WHERE key = 'pre_compact_dbversion')"
         );
     }
 }
