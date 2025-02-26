@@ -342,10 +342,7 @@ fn zero_clocks_on_resurrect(
     let zero_stmt_ref = tbl_info.get_zero_clocks_on_resurrect_stmt(db)?;
     let zero_stmt = zero_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
 
-    let ret = zero_stmt
-        .bind_int64(1, insert_db_vrsn)
-        .and_then(|_| zero_stmt.bind_int64(2, key))
-        .and_then(|_| zero_stmt.step());
+    let ret = zero_stmt.bind_int64(1, key).and_then(|_| zero_stmt.step());
     reset_cached_stmt(zero_stmt.stmt)?;
     return ret;
 }

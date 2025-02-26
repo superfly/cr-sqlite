@@ -56,12 +56,12 @@ pub fn next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> Result
     fill_db_version_if_needed(db, ext_data)?;
 
     let mut ret = unsafe { (*ext_data).dbVersion + 1 };
-    libc_print::libc_println!(
-        "incrementing db_version: {} => {}, ret: {}",
-        unsafe { (*ext_data).dbVersion },
-        unsafe { (*ext_data).pendingDbVersion },
-        ret
-    );
+    // libc_print::libc_println!(
+    //     // "incrementing db_version: {} => {}, ret: {}",
+    //     unsafe { (*ext_data).dbVersion },
+    //     unsafe { (*ext_data).pendingDbVersion },
+    //     ret
+    // );
     if ret < unsafe { (*ext_data).pendingDbVersion } {
         ret = unsafe { (*ext_data).pendingDbVersion };
     }

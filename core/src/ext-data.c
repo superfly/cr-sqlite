@@ -14,7 +14,6 @@ void crsql_drop_last_site_versions_map(crsql_ExtData *pExtData);
 // void crsql_drop_table_info_vec(crsql_ExtData *pExtData);
 
 crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer) {
-  printf("crsql_newExtData\n");
   crsql_ExtData *pExtData = sqlite3_malloc(sizeof *pExtData);
 
   pExtData->siteId = siteIdBuffer;
@@ -57,7 +56,7 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer) {
   // pExtData->nextSiteVersionSet = 0;
 
   pExtData->pSetDbVersionStmt = 0;
-  printf("instantiating pSetDbVersionStmt... current rc: %d\n", rc);
+  // printf("instantiating pSetDbVersionStmt... current rc: %d\n", rc);
   rc += sqlite3_prepare_v3(
       db,
       "INSERT OR REPLACE INTO crsql_db_versions (site_id, db_version) VALUES "
@@ -66,7 +65,7 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer) {
       "crsql_db_versions.db_version) RETURNING db_version",
       -1, SQLITE_PREPARE_PERSISTENT, &(pExtData->pSetDbVersionStmt), 0);
 
-  printf("instantiated pSetDbVersionStmt, rc: %d\n", rc);
+  // printf("instantiated pSetDbVersionStmt, rc: %d\n", rc);
 
   pExtData->seq = 0;
   pExtData->pragmaSchemaVersion = -1;
@@ -90,7 +89,6 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer) {
                            -1, &pStmt, 0);
 
   if (rc != SQLITE_OK) {
-    printf("crsql_newExtData, rc != SQLITE_OK\n");
     crsql_freeExtData(pExtData);
     return 0;
   }
@@ -117,7 +115,6 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer) {
   }
 
   sqlite3_finalize(pStmt);
-  printf("crsql_newExtData, finalizing pStmt\n");
   int pv = crsql_fetchPragmaDataVersion(db, pExtData);
   if (pv == -1 || rc != SQLITE_OK) {
     crsql_freeExtData(pExtData);

@@ -571,11 +571,11 @@ unsafe extern "C" fn x_crsql_as_crr(
         ("main\0", args[0].text())
     };
 
-    libc_print::libc_println!(
-        "crsql_as_crr, schema_name = {}, table_name = {}",
-        schema_name,
-        table_name
-    );
+    // libc_print::libc_println!(
+    //     "crsql_as_crr, schema_name = {}, table_name = {}",
+    //     schema_name,
+    //     table_name
+    // );
     let db = ctx.db_handle();
     let mut err_msg = null_mut();
     let rc = db.exec_safe("SAVEPOINT as_crr");

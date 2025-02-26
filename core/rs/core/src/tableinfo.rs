@@ -412,7 +412,7 @@ impl TableInfo {
     ) -> Result<Ref<Option<ManagedStmt>>, ResultCode> {
         if self.zero_clocks_on_resurrect_stmt.try_borrow()?.is_none() {
             let sql = format!(
-              "UPDATE \"{table_name}__crsql_clock\" SET col_version = 0, db_version = crsql_next_db_version(?) WHERE key = ? AND col_name IS NOT '{sentinel}'",
+              "UPDATE \"{table_name}__crsql_clock\" SET col_version = 0 WHERE key = ? AND col_name IS NOT '{sentinel}'",
               table_name = crate::util::escape_ident(&self.tbl_name),
               sentinel = crate::c::INSERT_SENTINEL
             );
