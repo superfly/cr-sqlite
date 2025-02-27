@@ -95,11 +95,7 @@ fn did_cid_win(
             let local_value = col_val_stmt.column_value(0)?;
             let mut ret = crsql_compare_sqlite_values(insert_val, local_value);
             reset_cached_stmt(col_val_stmt.stmt)?;
-            // libc_print::libc_println!("mergeEqualValues ? {}", unsafe {
-            //     (*ext_data).mergeEqualValues
-            // });
             if ret == 0 && unsafe { (*ext_data).mergeEqualValues == 1 } {
-                // libc_print::libc_println!("SAME VALUE + mergeEqualValues == 1");
                 // values are the same (ret == 0) and the option to tie break on site_id is true
                 let col_site_id_stmt_ref = tbl_info.get_col_site_id_stmt(db)?;
                 let col_site_id_stmt = col_site_id_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
