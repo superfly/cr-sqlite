@@ -603,7 +603,6 @@ unsafe fn merge_insert(
         if insert_cl == local_cl {
             return Ok(ResultCode::OK);
         }
-        libc_print::libc_println!("merge_sentinel_only_insert");
         let merge_result = merge_sentinel_only_insert(
             db,
             (*tab).pExtData,
