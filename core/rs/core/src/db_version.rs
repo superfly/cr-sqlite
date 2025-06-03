@@ -47,6 +47,31 @@ pub extern "C" fn crsql_next_db_version(
     }
 }
 
+#[no_mangle]
+pub extern "C" fn crsql_peek_next_db_version(
+    db: *mut sqlite3,
+    ext_data: *mut crsql_ExtData,
+    errmsg: *mut *mut c_char,
+) -> sqlite::int64 {
+    match peek_next_db_version(db, ext_data) {
+        Ok(version) => version,
+        Err(msg) => {
+            errmsg.set(&msg);
+            -1
+        }
+    }
+}
+
+pub fn peek_next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> Result<i64, String> {
+    fill_db_version_if_needed(db, ext_data)?;
+
+    let mut ret = unsafe { (*ext_data).dbVersion + 1 };
+    if ret < unsafe { (*ext_data).pendingDbVersion } {
+        ret = unsafe { (*ext_data).pendingDbVersion };
+    }
+    Ok(ret)
+}
+
 /**
  * Given this needs to do a pragma check, invoke it as little as possible.
  * TODO: We could optimize to only do a pragma check once per transaction.

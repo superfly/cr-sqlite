@@ -25,7 +25,8 @@ int crsql_fill_db_version_if_needed(sqlite3 *db, crsql_ExtData *pExtData,
                                     char **errmsg);
 sqlite_int64 crsql_next_db_version(sqlite3 *db, crsql_ExtData *pExtData,
                                    sqlite3_int64 mergingVersion, char **errmsg);
-
+sqlite_int64 crsql_peek_next_db_version(sqlite3 *db, crsql_ExtData *pExtData,
+                                          char **errmsg);
 void crsql_after_update(sqlite3_context *context, int argc,
                         sqlite3_value **argv);
 void crsql_after_insert(sqlite3_context *context, int argc,

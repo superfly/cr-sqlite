@@ -72,12 +72,12 @@ use crate::c::DB_VERSION_SCHEMA_VERSION;
 
 //         let site_id_slice =
 //             core::slice::from_raw_parts((*ext_data).siteId, consts::SITE_ID_LEN as usize);
-        // libc_print::libc_println!(
-        //     "next_site_version: setting into DB! {:?} => {}",
-        //     site_id_slice,
-        //     ret
-        // );
-        // next site id is not set in the DB yet, do this now.
+// libc_print::libc_println!(
+//     "next_site_version: setting into DB! {:?} => {}",
+//     site_id_slice,
+//     ret
+// );
+// next site id is not set in the DB yet, do this now.
 //         let bind_result = (*ext_data)
 //             .pSetSiteVersionStmt
 //             .bind_blob(1, site_id_slice, sqlite_nostd::Destructor::STATIC)

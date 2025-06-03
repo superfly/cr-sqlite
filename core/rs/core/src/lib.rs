@@ -48,11 +48,11 @@ mod triggers;
 mod unpack_columns_vtab;
 mod util;
 
+use alloc::borrow::Cow;
 use alloc::format;
 use core::ffi::c_char;
 use core::mem;
 use core::ptr::null_mut;
-use alloc::borrow::Cow;
 extern crate alloc;
 use alter::crsql_compact_post_alter;
 use automigrate::*;
@@ -61,7 +61,9 @@ use c::{crsql_freeExtData, crsql_newExtData};
 use config::{crsql_config_get, crsql_config_set};
 use core::ffi::{c_int, c_void, CStr};
 use create_crr::create_crr;
-use db_version::{crsql_fill_db_version_if_needed, crsql_next_db_version};
+use db_version::{
+    crsql_fill_db_version_if_needed, crsql_next_db_version, crsql_peek_next_db_version,
+};
 use is_crr::*;
 use local_writes::after_delete::x_crsql_after_delete;
 use local_writes::after_insert::x_crsql_after_insert;
@@ -272,6 +274,23 @@ pub extern "C" fn sqlite3_crsqlcore_init(
             sqlite::UTF8 | sqlite::INNOCUOUS,
             Some(ext_data as *mut c_void),
             Some(x_crsql_next_db_version),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
+    let rc = db
+        .create_function_v2(
+            "crsql_peek_next_db_version",
+            0,
+            sqlite::UTF8 | sqlite::INNOCUOUS,
+            Some(ext_data as *mut c_void),
+            Some(x_crsql_peek_next_db_version),
             None,
             None,
             None,
@@ -735,7 +754,10 @@ unsafe extern "C" fn x_crsql_commit_alter(
         } else {
             Cow::Borrowed("Hello World")
         };
-        ctx.result_error(&format!("failed compacting tables post alteration: {}", error_str));
+        ctx.result_error(&format!(
+            "failed compacting tables post alteration: {}",
+            error_str
+        ));
         let _ = db.exec_safe("ROLLBACK");
         return;
     }
@@ -808,6 +830,37 @@ unsafe extern "C" fn x_crsql_next_db_version(
     };
 
     let ret = crsql_next_db_version(db, ext_data, &mut err_msg as *mut _);
+    if ret < 0 {
+        // TODO: use err_msg!
+        ctx.result_error("Unable to determine the next db version");
+        return;
+    }
+
+    ctx.result_int64(ret);
+}
+
+/**
+ * Return the next version of the database for use in inserts/updates/deletes
+ * without updating the the database or value in ext_data.
+ *
+ * `select crsql_peek_next_db_version()`
+ */
+unsafe extern "C" fn x_crsql_peek_next_db_version(
+    ctx: *mut sqlite::context,
+    argc: i32,
+    argv: *mut *mut sqlite::value,
+) {
+    let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+    let db = ctx.db_handle();
+    let mut err_msg = null_mut();
+
+    let provided_version = if argc == 1 {
+        sqlite::args!(argc, argv)[0].int64()
+    } else {
+        0
+    };
+
+    let ret = crsql_peek_next_db_version(db, ext_data, &mut err_msg as *mut _);
     if ret < 0 {
         // TODO: use err_msg!
         ctx.result_error("Unable to determine the next db version");
