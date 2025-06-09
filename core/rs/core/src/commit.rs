@@ -1,15 +1,11 @@
-use alloc::collections::BTreeMap;
 use core::{
     ffi::{c_int, c_void},
-    mem,
     ptr::null,
 };
 
 use sqlite_nostd::ResultCode;
 
 use crate::c::crsql_ExtData;
-
-use crate::alloc::{boxed::Box, vec::Vec};
 
 #[no_mangle]
 pub unsafe extern "C" fn crsql_commit_hook(user_data: *mut c_void) -> c_int {

@@ -49,17 +49,40 @@ def test_site_version_restored_from_disk():
     c.commit()
     assert c.execute("SELECT crsql_db_version()").fetchone()[0] == 1
 
-    # Close and reopen to check that version was persisted and re-initialized correctly
-    close(c)
-    c = connect('file:siteversion_c3.db?mode=ro', uri=True)
-    assert c.execute("SELECT crsql_db_version()").fetchone()[0] == 1
-    close(c)
-
-    c = connect(dbfile)
     # insert so we get a clock entry
     c.execute("insert into foo values (2, 3)")
     c.commit()
-    
+    assert c.execute("SELECT crsql_db_version()").fetchone()[0] == 2
+
+    # Close and reopen to check that version was persisted and re-initialized correctly
+    close(c)
+    c = connect('file:siteversion_c3.db?mode=ro', uri=True)
+    assert c.execute("SELECT crsql_db_version()").fetchone()[0] == 2
+    close(c)
+
+    c = connect(dbfile)
+    # create a new db and sync with it
+    c2 = connect(":memory:")
+    c2.execute("CREATE TABLE foo (id primary key not null, a);")
+    c2.execute("SELECT crsql_as_crr('foo');")
+
+    sync_left_to_right(c, c2, 0)
+    assert c2.execute("SELECT crsql_db_version()").fetchone()[0] == 0
+
+    # create changes that would override rows in db1
+    c2.execute("UPDATE foo SET a = 5")
+    c2.commit()
+    assert c2.execute("SELECT crsql_db_version()").fetchone()[0] == 1
+
+    sync_left_to_right(c2, c, 0)
+    assert c2.execute("SELECT crsql_db_version()").fetchone()[0] == 1
+    assert c.execute("SELECT crsql_db_version()").fetchone()[0] == 2
+
+    # Close and reopen to check that version was persisted and re-initialized correctly
+    close(c)
+    c = connect('file:siteversion_c3.db?mode=ro', uri=True)
+    assert c.execute("SELECT crsql_db_version()").fetchone()[0] == 2
+
     close(c)
 
 def test_each_tx_gets_a_site_version():
@@ -175,5 +198,3 @@ def test_overwriting_keeps_track_of_true_site_version():
 
     close(db1)
     close(db2)
-
-

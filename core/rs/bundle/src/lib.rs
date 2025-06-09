@@ -4,7 +4,6 @@
 
 extern crate alloc;
 
-use core::alloc::GlobalAlloc;
 use core::ffi::c_char;
 use core::panic::PanicInfo;
 use crsql_core;

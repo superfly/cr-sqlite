@@ -1,5 +1,4 @@
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
 use alloc::format;
 use alloc::vec::Vec;
@@ -12,9 +11,9 @@ use sqlite_nostd::{sqlite3, ResultCode, Value};
 use crate::c::crsql_ExtData;
 use crate::c::{crsql_Changes_vtab, CrsqlChangesColumn};
 use crate::compare_values::crsql_compare_sqlite_values;
+use crate::db_version::insert_db_version;
 use crate::pack_columns::bind_package_to_stmt;
 use crate::pack_columns::{unpack_columns, ColumnValue};
-use crate::site_version::insert_site_version;
 use crate::stmt_cache::reset_cached_stmt;
 use crate::tableinfo::{crsql_ensure_table_infos_are_up_to_date, TableInfo};
 use crate::util::slab_rowid;
@@ -260,7 +259,7 @@ fn set_winner_clock(
     };
 
     if !insert_site_id.is_empty() {
-        insert_site_version(ext_data, insert_site_id, insert_db_vrsn)?;
+        insert_db_version(ext_data, insert_site_id, insert_db_vrsn)?;
     }
     Ok(rowid)
 }

@@ -35,7 +35,6 @@ pub mod pack_columns;
 #[cfg(not(feature = "test"))]
 mod pack_columns;
 mod sha;
-mod site_version;
 mod stmt_cache;
 #[cfg(feature = "test")]
 pub mod tableinfo;

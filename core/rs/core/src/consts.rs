@@ -22,5 +22,4 @@ pub const ROWID_SLAB_SIZE: i64 = 10000000000000;
 // retrieving unsigned 64bit ints. (2^64 / 2) is a big enough number to write 1
 // million entries per second for 3,000 centuries.
 pub const MIN_POSSIBLE_DB_VERSION: i64 = 0;
-pub const MIN_POSSIBLE_SITE_VERSION: i64 = 0;
 pub const MAX_TBL_NAME_LEN: i32 = 2048;
