@@ -12,3 +12,4 @@ build/
 tsconfig.tsbuildinfo
 .turbo/
 target/
+py/correctness/.hypothesis/

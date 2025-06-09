@@ -1,5 +1,5 @@
 extern crate alloc;
-use alloc::{ffi::CString, string::String};
+use alloc::{boxed::Box, ffi::CString, string::String};
 use core::ffi::c_char;
 use crsql_bundle::test_exports;
 use sqlite::{Connection, ResultCode};
@@ -10,11 +10,27 @@ fn make_site() -> *mut c_char {
     inner_ptr
 }
 
+fn get_site_id(db: *mut sqlite::sqlite3) -> *mut c_char {
+    let mut stmt = db
+        .prepare_v2("SELECT crsql_site_id();")
+        .expect("failed to prepare crsql_site_id stmt");
+
+    stmt.step().expect("failed to execute crsql_site_id query");
+
+    let mut blob_ptr = stmt.column_blob(0).expect("failed to get site_id");
+
+    let cstring = CString::new(blob_ptr.to_vec()).expect("failed to create CString from site id");
+    cstring.into_raw() as *mut c_char
+}
+
 fn test_fetch_db_version_from_storage() -> Result<ResultCode, String> {
     let c = crate::opendb().expect("db opened");
     let db = &c.db;
     let raw_db = db.db;
-    let ext_data = unsafe { test_exports::c::crsql_newExtData(raw_db, make_site()) };
+
+    let site_id = get_site_id(raw_db);
+
+    let ext_data = unsafe { test_exports::c::crsql_newExtData(raw_db, site_id) };
 
     test_exports::db_version::fetch_db_version_from_storage(raw_db, ext_data)?;
     // no clock tables, no version.
@@ -47,6 +63,7 @@ fn test_fetch_db_version_from_storage() -> Result<ResultCode, String> {
         .expect("bar as crr");
     db.exec_safe("INSERT INTO bar VALUES (1, 2)")
         .expect("inserted into bar");
+
     test_exports::db_version::fetch_db_version_from_storage(raw_db, ext_data)?;
     assert_eq!(2, unsafe { (*ext_data).dbVersion });
 
