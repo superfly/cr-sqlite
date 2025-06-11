@@ -258,9 +258,6 @@ fn set_winner_clock(
         }
     };
 
-    if !insert_site_id.is_empty() {
-        insert_db_version(ext_data, insert_site_id, insert_db_vrsn)?;
-    }
     Ok(rowid)
 }
 
@@ -544,37 +541,183 @@ unsafe fn merge_insert(
 
     // We can ignore all updates from older causal lengths.
     // They won't win at anything.
-    if insert_cl < local_cl {
-        return Ok(ResultCode::OK);
-    }
-
-    let is_delete = insert_cl % 2 == 0;
-    // Resurrect or update to latest cl.
-    // The current node might have missed the delete preceeding this causal length
-    // in out-of-order delivery setups but we still call it a resurrect as special
-    // handling needs to happen in the "alive -> missed_delete -> alive" case.
-    let needs_resurrect = insert_cl > local_cl && insert_cl % 2 == 1;
-    let row_exists_locally = local_cl != 0;
-    let is_sentinel_only = crate::c::INSERT_SENTINEL == insert_col;
-
-    if is_delete {
-        // We got a delete event but we've already processed a delete at that version.
-        // Just bail.
-        if insert_cl == local_cl {
+    let res = (|| {
+        if insert_cl < local_cl {
             return Ok(ResultCode::OK);
         }
-        // else, it is a delete and the cl is > than ours. Drop the row.
-        let merge_result = merge_delete(
+
+        let is_delete = insert_cl % 2 == 0;
+        // Resurrect or update to latest cl.
+        // The current node might have missed the delete preceeding this causal length
+        // in out-of-order delivery setups but we still call it a resurrect as special
+        // handling needs to happen in the "alive -> missed_delete -> alive" case.
+        let needs_resurrect = insert_cl > local_cl && insert_cl % 2 == 1;
+        let row_exists_locally = local_cl != 0;
+        let is_sentinel_only = crate::c::INSERT_SENTINEL == insert_col;
+
+        if is_delete {
+            // We got a delete event but we've already processed a delete at that version.
+            // Just bail.
+            if insert_cl == local_cl {
+                return Ok(ResultCode::OK);
+            }
+            // else, it is a delete and the cl is > than ours. Drop the row.
+            let merge_result = merge_delete(
+                db,
+                (*tab).pExtData,
+                &tbl_info,
+                &unpacked_pks,
+                key,
+                insert_col_vrsn,
+                insert_db_vrsn,
+                insert_site_id,
+                insert_seq,
+                // insert_site_vrsn,
+            );
+            match merge_result {
+                Err(rc) => {
+                    return Err(rc);
+                }
+                Ok(inner_rowid) => {
+                    (*(*tab).pExtData).rowsImpacted += 1;
+                    *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
+                    return Ok(ResultCode::OK);
+                }
+            }
+        }
+
+        /*
+        || crsql_columnExists(
+                // TODO: only safe because we _know_ this is actually a cstr
+                insert_col.as_ptr() as *const c_char,
+                (*tbl_info).nonPks,
+                (*tbl_info).nonPksLen,
+            ) == 0
+         */
+        if is_sentinel_only {
+            // If it is a sentinel but the local_cl already matches, nothing to do
+            // as the local sentinel already has the same data!
+            if insert_cl == local_cl {
+                return Ok(ResultCode::OK);
+            }
+            let merge_result = merge_sentinel_only_insert(
+                db,
+                (*tab).pExtData,
+                &tbl_info,
+                &unpacked_pks,
+                key,
+                insert_col_vrsn,
+                insert_db_vrsn,
+                insert_site_id,
+                insert_seq,
+                // insert_site_vrsn,
+            );
+            match merge_result {
+                Err(rc) => {
+                    return Err(rc);
+                }
+                Ok(inner_rowid) => {
+                    // a success & rowid of -1 means the merge was a no-op
+                    if inner_rowid != -1 {
+                        (*(*tab).pExtData).rowsImpacted += 1;
+                        *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
+                        return Ok(ResultCode::OK);
+                    } else {
+                        return Ok(ResultCode::OK);
+                    }
+                }
+            }
+        }
+
+        // we got a causal length which would resurrect the row.
+        // In an in-order delivery situation then `sentinel_only` would have already resurrected the row
+        // In out-of-order delivery, we need to resurrect the row as soon as we get a value
+        // which should resurrect the row. I.e., don't wait on the sentinel value to resurrect the row!
+        // If the row does not exist locally and the insert_cl is > 1 then we need to create a sentinel to record the insert cl.
+        // Not doing so will cause us to assume a cl of 1.
+        if needs_resurrect && (row_exists_locally || (!row_exists_locally && insert_cl > 1)) {
+            // this should work -- same as `merge_sentinel_only_insert` except we're not done once we do it
+            // and the version to set to is the cl not col_vrsn of current insert
+            merge_sentinel_only_insert(
+                db,
+                (*tab).pExtData,
+                &tbl_info,
+                &unpacked_pks,
+                key,
+                insert_cl,
+                insert_db_vrsn,
+                insert_site_id,
+                insert_seq,
+                // insert_site_vrsn,
+            )?;
+            (*(*tab).pExtData).rowsImpacted += 1;
+        }
+
+        // we can short-circuit via needs_resurrect
+        // given the greater cl automatically means a win.
+        // or if we realize that the row does not exist locally at all.
+        let does_cid_win = needs_resurrect
+            || !row_exists_locally
+            || did_cid_win(
+                db,
+                (*tab).pExtData,
+                insert_tbl,
+                &tbl_info,
+                &unpacked_pks,
+                key,
+                insert_val,
+                insert_site_id,
+                insert_col,
+                insert_col_vrsn,
+                errmsg,
+            )?;
+
+        if !does_cid_win {
+            // doesCidWin == 0? compared against our clocks, nothing wins. OK and
+            // Done.
+            // libc_print::libc_println!("CID did not win");
+            return Ok(ResultCode::OK);
+        }
+        // libc_print::libc_println!("remote won!");
+
+        // TODO: this is all almost identical between all three merge cases!
+        let merge_stmt_ref = tbl_info.get_merge_insert_stmt(db, insert_col)?;
+        let merge_stmt = merge_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
+
+        let bind_result = bind_package_to_stmt(merge_stmt.stmt, &unpacked_pks, 0)
+            .and_then(|_| merge_stmt.bind_value(unpacked_pks.len() as i32 + 1, insert_val))
+            .and_then(|_| merge_stmt.bind_value(unpacked_pks.len() as i32 + 2, insert_val));
+        if let Err(rc) = bind_result {
+            reset_cached_stmt(merge_stmt.stmt)?;
+            return Err(rc);
+        }
+
+        let rc = (*(*tab).pExtData)
+            .pSetSyncBitStmt
+            .step()
+            .and_then(|_| (*(*tab).pExtData).pSetSyncBitStmt.reset())
+            .and_then(|_| merge_stmt.step());
+
+        reset_cached_stmt(merge_stmt.stmt)?;
+
+        let sync_rc = (*(*tab).pExtData)
+            .pClearSyncBitStmt
+            .step()
+            .and_then(|_| (*(*tab).pExtData).pClearSyncBitStmt.reset());
+
+        rc?;
+        sync_rc?;
+
+        let merge_result = set_winner_clock(
             db,
             (*tab).pExtData,
             &tbl_info,
-            &unpacked_pks,
             key,
+            insert_col,
             insert_col_vrsn,
             insert_db_vrsn,
             insert_site_id,
             insert_seq,
-            // insert_site_vrsn,
         );
         match merge_result {
             Err(rc) => {
@@ -586,149 +729,14 @@ unsafe fn merge_insert(
                 return Ok(ResultCode::OK);
             }
         }
-    }
+    })();
 
-    /*
-    || crsql_columnExists(
-            // TODO: only safe because we _know_ this is actually a cstr
-            insert_col.as_ptr() as *const c_char,
-            (*tbl_info).nonPks,
-            (*tbl_info).nonPksLen,
-        ) == 0
-     */
-    if is_sentinel_only {
-        // If it is a sentinel but the local_cl already matches, nothing to do
-        // as the local sentinel already has the same data!
-        if insert_cl == local_cl {
-            return Ok(ResultCode::OK);
-        }
-        let merge_result = merge_sentinel_only_insert(
-            db,
-            (*tab).pExtData,
-            &tbl_info,
-            &unpacked_pks,
-            key,
-            insert_col_vrsn,
-            insert_db_vrsn,
-            insert_site_id,
-            insert_seq,
-            // insert_site_vrsn,
-        );
-        match merge_result {
-            Err(rc) => {
-                return Err(rc);
-            }
-            Ok(inner_rowid) => {
-                // a success & rowid of -1 means the merge was a no-op
-                if inner_rowid != -1 {
-                    (*(*tab).pExtData).rowsImpacted += 1;
-                    *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
-                    return Ok(ResultCode::OK);
-                } else {
-                    return Ok(ResultCode::OK);
-                }
-            }
+    // Update the received db_version whether the change won or not.
+    if res == Ok(ResultCode::OK) {
+        if !insert_site_id.is_empty() {
+            insert_db_version((*tab).pExtData, insert_site_id, insert_db_vrsn)?;
         }
     }
 
-    // we got a causal length which would resurrect the row.
-    // In an in-order delivery situation then `sentinel_only` would have already resurrected the row
-    // In out-of-order delivery, we need to resurrect the row as soon as we get a value
-    // which should resurrect the row. I.e., don't wait on the sentinel value to resurrect the row!
-    // If the row does not exist locally and the insert_cl is > 1 then we need to create a sentinel to record the insert cl.
-    // Not doing so will cause us to assume a cl of 1.
-    if needs_resurrect && (row_exists_locally || (!row_exists_locally && insert_cl > 1)) {
-        // this should work -- same as `merge_sentinel_only_insert` except we're not done once we do it
-        // and the version to set to is the cl not col_vrsn of current insert
-        merge_sentinel_only_insert(
-            db,
-            (*tab).pExtData,
-            &tbl_info,
-            &unpacked_pks,
-            key,
-            insert_cl,
-            insert_db_vrsn,
-            insert_site_id,
-            insert_seq,
-            // insert_site_vrsn,
-        )?;
-        (*(*tab).pExtData).rowsImpacted += 1;
-    }
-
-    // we can short-circuit via needs_resurrect
-    // given the greater cl automatically means a win.
-    // or if we realize that the row does not exist locally at all.
-    let does_cid_win = needs_resurrect
-        || !row_exists_locally
-        || did_cid_win(
-            db,
-            (*tab).pExtData,
-            insert_tbl,
-            &tbl_info,
-            &unpacked_pks,
-            key,
-            insert_val,
-            insert_site_id,
-            insert_col,
-            insert_col_vrsn,
-            errmsg,
-        )?;
-
-    if !does_cid_win {
-        // doesCidWin == 0? compared against our clocks, nothing wins. OK and
-        // Done.
-        // libc_print::libc_println!("CID did not win");
-        return Ok(ResultCode::OK);
-    }
-    // libc_print::libc_println!("remote won!");
-
-    // TODO: this is all almost identical between all three merge cases!
-    let merge_stmt_ref = tbl_info.get_merge_insert_stmt(db, insert_col)?;
-    let merge_stmt = merge_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
-
-    let bind_result = bind_package_to_stmt(merge_stmt.stmt, &unpacked_pks, 0)
-        .and_then(|_| merge_stmt.bind_value(unpacked_pks.len() as i32 + 1, insert_val))
-        .and_then(|_| merge_stmt.bind_value(unpacked_pks.len() as i32 + 2, insert_val));
-    if let Err(rc) = bind_result {
-        reset_cached_stmt(merge_stmt.stmt)?;
-        return Err(rc);
-    }
-
-    let rc = (*(*tab).pExtData)
-        .pSetSyncBitStmt
-        .step()
-        .and_then(|_| (*(*tab).pExtData).pSetSyncBitStmt.reset())
-        .and_then(|_| merge_stmt.step());
-
-    reset_cached_stmt(merge_stmt.stmt)?;
-
-    let sync_rc = (*(*tab).pExtData)
-        .pClearSyncBitStmt
-        .step()
-        .and_then(|_| (*(*tab).pExtData).pClearSyncBitStmt.reset());
-
-    rc?;
-    sync_rc?;
-
-    let merge_result = set_winner_clock(
-        db,
-        (*tab).pExtData,
-        &tbl_info,
-        key,
-        insert_col,
-        insert_col_vrsn,
-        insert_db_vrsn,
-        insert_site_id,
-        insert_seq,
-    );
-    match merge_result {
-        Err(rc) => {
-            return Err(rc);
-        }
-        Ok(inner_rowid) => {
-            (*(*tab).pExtData).rowsImpacted += 1;
-            *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
-            return Ok(ResultCode::OK);
-        }
-    }
+    res
 }
