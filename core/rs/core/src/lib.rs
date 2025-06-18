@@ -26,6 +26,7 @@ mod create_crr;
 pub mod db_version;
 #[cfg(not(feature = "test"))]
 mod db_version;
+mod debug;
 mod ext_data;
 mod is_crr;
 mod local_writes;
@@ -68,6 +69,8 @@ use sqlite_nostd::{Connection, Context, Value};
 use tableinfo::is_table_compatible;
 use teardown::*;
 
+pub use debug::debug_log;
+
 pub extern "C" fn crsql_as_table(
     ctx: *mut sqlite::context,
     argc: i32,
@@ -107,6 +110,22 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     api: *mut sqlite::api_routines,
 ) -> *mut c_void {
     sqlite::EXTENSION_INIT2(api);
+
+    let rc = db
+        .create_function_v2(
+            "crsql_set_debug",
+            1,
+            sqlite::UTF8 | sqlite::DIRECTONLY,
+            None,
+            Some(debug::x_crsql_set_debug),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(sqlite::ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        return null_mut();
+    }
 
     let rc = db
         .create_function_v2(
@@ -547,7 +566,7 @@ unsafe extern "C" fn x_crsql_as_crr(
 ) {
     if argc == 0 {
         ctx.result_error(
-            "Wrong number of args provided to crsql_as_crr. Provide the schema 
+            "Wrong number of args provided to crsql_as_crr. Provide the schema
           name and table name or just the table name.",
         );
         return;
@@ -607,7 +626,7 @@ unsafe extern "C" fn x_crsql_begin_alter(
 ) {
     if argc == 0 {
         ctx.result_error(
-            "Wrong number of args provided to crsql_begin_alter. Provide the 
+            "Wrong number of args provided to crsql_begin_alter. Provide the
           schema name and table name or just the table name.",
         );
         return;
@@ -643,7 +662,7 @@ unsafe extern "C" fn x_crsql_commit_alter(
 ) {
     if argc == 0 {
         ctx.result_error(
-            "Wrong number of args provided to crsql_commit_alter. Provide the 
+            "Wrong number of args provided to crsql_commit_alter. Provide the
           schema name and table name or just the table name.",
         );
         return;

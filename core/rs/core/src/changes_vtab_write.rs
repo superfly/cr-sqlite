@@ -11,6 +11,7 @@ use sqlite_nostd::{sqlite3, ResultCode, Value};
 use crate::c::crsql_ExtData;
 use crate::c::{crsql_Changes_vtab, CrsqlChangesColumn};
 use crate::compare_values::crsql_compare_sqlite_values;
+use crate::debug::debug_log;
 use crate::pack_columns::bind_package_to_stmt;
 use crate::pack_columns::{unpack_columns, ColumnValue};
 use crate::stmt_cache::reset_cached_stmt;
@@ -263,21 +264,23 @@ fn merge_sentinel_only_insert(
         return Err(rc);
     }
     let rc = unsafe {
-        (*ext_data)
+        let rc = (*ext_data)
             .pSetSyncBitStmt
             .step()
-            .and_then(|_| (*ext_data).pSetSyncBitStmt.reset())
-            .and_then(|_| merge_stmt.step())
+            .and_then(|_| merge_stmt.step());
+
+        (*ext_data).pSetSyncBitStmt.reset()?;
+        rc
     };
 
     // TODO: report err?
     let _ = reset_cached_stmt(merge_stmt.stmt);
 
     let sync_rc = unsafe {
-        (*ext_data)
-            .pClearSyncBitStmt
-            .step()
-            .and_then(|_| (*ext_data).pClearSyncBitStmt.reset())
+        let rc = (*ext_data).pClearSyncBitStmt.step();
+
+        (*ext_data).pClearSyncBitStmt.reset()?;
+        rc
     };
 
     if let Err(sync_rc) = sync_rc {
@@ -507,9 +510,15 @@ unsafe fn merge_insert(
 
     // Get or create key as the first thing we do.
     // We'll need the key for all later operations.
-    let key = tbl_info.get_or_create_key(db, &unpacked_pks)?;
+    let key = tbl_info.get_or_create_key(db, &unpacked_pks).map_err(|e| {
+        debug_log(&format!("[merge_insert] get_or_create_key error: {:?}", e));
+        e
+    })?;
 
-    let local_cl = get_local_cl(db, &tbl_info, key)?;
+    let local_cl = get_local_cl(db, &tbl_info, key).map_err(|e| {
+        debug_log(&format!("[merge_insert] get_local_cl error: {:?}", e));
+        e
+    })?;
 
     // We can ignore all updates from older causal lengths.
     // They won't win at anything.
@@ -546,6 +555,7 @@ unsafe fn merge_insert(
         );
         match merge_result {
             Err(rc) => {
+                debug_log(&format!("[merge_insert] merge_delete error:"));
                 return Err(rc);
             }
             Ok(inner_rowid) => {
@@ -583,6 +593,7 @@ unsafe fn merge_insert(
         );
         match merge_result {
             Err(rc) => {
+                debug_log(&format!("[merge_insert] merge_sentinel_only_insert error:"));
                 return Err(rc);
             }
             Ok(inner_rowid) => {
@@ -597,6 +608,8 @@ unsafe fn merge_insert(
             }
         }
     }
+
+    debug_log("[merge_insert] check if row needs resurrect");
 
     // we got a causal length which would resurrect the row.
     // In an in-order delivery situation then `sentinel_only` would have already resurrected the row
@@ -617,9 +630,18 @@ unsafe fn merge_insert(
             insert_db_vrsn,
             insert_site_id,
             insert_seq,
-        )?;
+        )
+        .map_err(|e| {
+            debug_log(&format!(
+                "[merge_insert] merge_sentinel_only_insert error: {:?}",
+                e
+            ));
+            e
+        })?;
         (*(*tab).pExtData).rowsImpacted += 1;
     }
+
+    debug_log("[merge_insert] checking which cid wins");
 
     // we can short-circuit via needs_resurrect
     // given the greater cl automatically means a win.
@@ -638,7 +660,10 @@ unsafe fn merge_insert(
             insert_col,
             insert_col_vrsn,
             errmsg,
-        )?;
+        ).map_err(|e| {
+            debug_log(&format!("[merge_insert] did_cid_win: {:?}", e));
+            e
+        })?;
 
     if !does_cid_win {
         // doesCidWin == 0? compared against our clocks, nothing wins. OK and
@@ -646,30 +671,44 @@ unsafe fn merge_insert(
         return Ok(ResultCode::OK);
     }
 
+    debug_log("[merge_insert] merging row");
     // TODO: this is all almost identical between all three merge cases!
-    let merge_stmt_ref = tbl_info.get_merge_insert_stmt(db, insert_col)?;
+    let merge_stmt_ref = tbl_info
+        .get_merge_insert_stmt(db, insert_col)
+        .map_err(|e| {
+            debug_log(&format!(
+                "[merge_insert] get_merge_insert_stmt error: {:?}",
+                e
+            ));
+            e
+        })?;
     let merge_stmt = merge_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
 
     let bind_result = bind_package_to_stmt(merge_stmt.stmt, &unpacked_pks, 0)
         .and_then(|_| merge_stmt.bind_value(unpacked_pks.len() as i32 + 1, insert_val))
         .and_then(|_| merge_stmt.bind_value(unpacked_pks.len() as i32 + 2, insert_val));
     if let Err(rc) = bind_result {
-        reset_cached_stmt(merge_stmt.stmt)?;
+        reset_cached_stmt(merge_stmt.stmt).map_err(|e| {
+            debug_log(&format!("[merge_insert] reset_cached_stmt error: {:?}", e));
+            e
+        })?;
         return Err(rc);
     }
 
     let rc = (*(*tab).pExtData)
         .pSetSyncBitStmt
         .step()
-        .and_then(|_| (*(*tab).pExtData).pSetSyncBitStmt.reset())
         .and_then(|_| merge_stmt.step());
 
-    reset_cached_stmt(merge_stmt.stmt)?;
+    reset_cached_stmt(merge_stmt.stmt).map_err(|e| {
+        debug_log(&format!("[merge_insert] reset_cached_stmt error: {:?}", e));
+        e
+    })?;
 
-    let sync_rc = (*(*tab).pExtData)
-        .pClearSyncBitStmt
-        .step()
-        .and_then(|_| (*(*tab).pExtData).pClearSyncBitStmt.reset());
+    let sync_rc = (*(*tab).pExtData).pClearSyncBitStmt.step();
+
+    (*(*tab).pExtData).pSetSyncBitStmt.reset();
+    (*(*tab).pExtData).pClearSyncBitStmt.reset();
 
     if let Err(rc) = rc {
         return Err(rc);
