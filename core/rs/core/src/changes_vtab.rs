@@ -1,6 +1,7 @@
 extern crate alloc;
 use crate::alloc::string::ToString;
 use crate::changes_vtab_write::crsql_merge_insert;
+use crate::debug_log;
 use crate::stmt_cache::reset_cached_stmt;
 use crate::tableinfo::{crsql_ensure_table_infos_are_up_to_date, TableInfo};
 use alloc::boxed::Box;
@@ -543,6 +544,7 @@ pub extern "C" fn crsql_changes_update(
                 (*vtab).zErrMsg = err_msg;
             }
         }
+        debug_log(&format!("[crsql_changes_update] rc: {:?}", rc));
         return rc;
     } else {
         if let Ok(err) = CString::new(
@@ -551,6 +553,7 @@ pub extern "C" fn crsql_changes_update(
             unsafe {
                 (*vtab).zErrMsg = err.into_raw();
             }
+            debug_log("[crsql_changes_update] MISUSE Error??");
             return ResultCode::MISUSE as c_int;
         } else {
             return ResultCode::NOMEM as c_int;

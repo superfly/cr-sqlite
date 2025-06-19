@@ -398,7 +398,13 @@ pub unsafe extern "C" fn crsql_merge_insert(
     errmsg: *mut *mut c_char,
 ) -> c_int {
     match merge_insert(vtab, argc, argv, rowid, errmsg) {
-        Err(rc) | Ok(rc) => rc as c_int,
+        Err(rc) | Ok(rc) => {
+            debug_log(&format!(
+                "[crsql_merge_insert] merge_insert error: {:?}",
+                rc
+            ));
+            rc as c_int
+        }
     }
 }
 
@@ -449,6 +455,7 @@ unsafe fn merge_insert(
     let tab = vtab.cast::<crsql_Changes_vtab>();
     let db = (*tab).db;
 
+    debug_log("[merge_insert] got to merge insert!");
     let rc = crsql_ensure_table_infos_are_up_to_date(db, (*tab).pExtData, errmsg);
     if rc != ResultCode::OK as i32 {
         let err = CString::new("Failed to update CRR table information")?;
@@ -660,7 +667,8 @@ unsafe fn merge_insert(
             insert_col,
             insert_col_vrsn,
             errmsg,
-        ).map_err(|e| {
+        )
+        .map_err(|e| {
             debug_log(&format!("[merge_insert] did_cid_win: {:?}", e));
             e
         })?;
@@ -711,9 +719,11 @@ unsafe fn merge_insert(
     (*(*tab).pExtData).pClearSyncBitStmt.reset();
 
     if let Err(rc) = rc {
+        debug_log(&format!("[merge_insert] rc error: {:?}", rc));
         return Err(rc);
     }
     if let Err(sync_rc) = sync_rc {
+        debug_log(&format!("[merge_insert] sync_rc error: {:?}", sync_rc));
         return Err(sync_rc);
     }
 
@@ -730,11 +740,16 @@ unsafe fn merge_insert(
     );
     match merge_result {
         Err(rc) => {
+            debug_log(&format!("[merge_insert] set_winner_clock error: {:?}", rc));
             return Err(rc);
         }
         Ok(inner_rowid) => {
             (*(*tab).pExtData).rowsImpacted += 1;
             *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
+            debug_log(&format!(
+                "[merge_insert] set_winner_clock success: {:?}",
+                inner_rowid
+            ));
             return Ok(ResultCode::OK);
         }
     }
