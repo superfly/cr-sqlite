@@ -3,11 +3,13 @@ use alloc::vec::Vec;
 use core::mem::ManuallyDrop;
 
 use alloc::boxed::Box;
+use alloc::format;
 use sqlite::Stmt;
 use sqlite_nostd as sqlite;
 use sqlite_nostd::ResultCode;
 
 use crate::c::crsql_ExtData;
+use crate::debug::debug_log;
 use crate::tableinfo::TableInfo;
 
 // Finalize prepared statements attached to table infos.
@@ -28,6 +30,15 @@ pub fn reset_cached_stmt(stmt: *mut sqlite::stmt) -> Result<ResultCode, ResultCo
     if stmt.is_null() {
         return Ok(ResultCode::OK);
     }
-    stmt.clear_bindings()?;
-    stmt.reset()
+    stmt.clear_bindings().map_err(|e| {
+        debug_log(&format!(
+            "[reset_cached_stmt] clear_bindings error: {:?}",
+            e
+        ));
+        e
+    })?;
+    stmt.reset().map_err(|e| {
+        debug_log(&format!("[reset_cached_stmt] reset error: {:?}", e));
+        e
+    })
 }

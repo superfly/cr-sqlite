@@ -172,37 +172,67 @@ fn set_winner_clock(
         if insert_site_id.is_empty() {
             None
         } else {
-            (*ext_data).pSelectSiteIdOrdinalStmt.bind_blob(
+            let bind_result = (*ext_data).pSelectSiteIdOrdinalStmt.bind_blob(
                 1,
                 insert_site_id,
                 sqlite::Destructor::STATIC,
-            )?;
-            let rc = (*ext_data).pSelectSiteIdOrdinalStmt.step()?;
+            );
+
+            if let Err(rc) = bind_result {
+                debug_log(&format!(
+                    "[set_winner_clock] pSelectSiteIdOrdinalStmt bind_result error: {:?}",
+                    rc
+                ));
+                reset_cached_stmt((*ext_data).pSelectSiteIdOrdinalStmt)?;
+                return Err(rc);
+            }
+
+            let rc = (*ext_data).pSelectSiteIdOrdinalStmt.step().map_err(|e| {
+                debug_log(&format!(
+                    "[set_winner_clock] pSelectSiteIdOrdinalStmt step error: {:?}",
+                    e
+                ));
+                reset_cached_stmt((*ext_data).pSelectSiteIdOrdinalStmt);
+                e
+            })?;
+
             if rc == ResultCode::ROW {
                 let ordinal = (*ext_data).pSelectSiteIdOrdinalStmt.column_int64(0);
-                (*ext_data).pSelectSiteIdOrdinalStmt.clear_bindings()?;
-                (*ext_data).pSelectSiteIdOrdinalStmt.reset()?;
-
+                reset_cached_stmt((*ext_data).pSelectSiteIdOrdinalStmt)?;
                 Some(ordinal)
             } else {
-                (*ext_data).pSelectSiteIdOrdinalStmt.clear_bindings()?;
-                (*ext_data).pSelectSiteIdOrdinalStmt.reset()?;
+                reset_cached_stmt((*ext_data).pSelectSiteIdOrdinalStmt)?;
                 // site id had no ordinal yet.
                 // set one and return the ordinal.
-                (*ext_data).pSetSiteIdOrdinalStmt.bind_blob(
+                let bind_result = (*ext_data).pSetSiteIdOrdinalStmt.bind_blob(
                     1,
                     insert_site_id,
                     sqlite::Destructor::STATIC,
-                )?;
-                let rc = (*ext_data).pSetSiteIdOrdinalStmt.step()?;
+                );
+
+                if let Err(rc) = bind_result {
+                    debug_log(&format!(
+                        "[set_winner_clock] pSetSiteIdOrdinalStmt bind_result error (done): {:?}",
+                        rc
+                    ));
+                    reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt);
+                    return Err(rc);
+                }
+
+                let rc = (*ext_data).pSetSiteIdOrdinalStmt.step().map_err(|e| {
+                    debug_log(&format!(
+                        "[set_winner_clock] pSetSiteIdOrdinalStmt step error (done): {:?}",
+                        e
+                    ));
+                    reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt);
+                    e
+                })?;
                 if rc == ResultCode::DONE {
-                    (*ext_data).pSetSiteIdOrdinalStmt.clear_bindings()?;
-                    (*ext_data).pSetSiteIdOrdinalStmt.reset()?;
+                    reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
                     return Err(ResultCode::ABORT);
                 }
                 let ordinal = (*ext_data).pSetSiteIdOrdinalStmt.column_int64(0);
-                (*ext_data).pSetSiteIdOrdinalStmt.clear_bindings()?;
-                (*ext_data).pSetSiteIdOrdinalStmt.reset()?;
+                reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
                 Some(ordinal)
             }
         }
@@ -227,6 +257,10 @@ fn set_winner_clock(
         });
 
     if let Err(rc) = bind_result {
+        debug_log(&format!(
+            "[set_winner_clock] bind_result set_stmt error: {:?}",
+            rc
+        ));
         reset_cached_stmt(set_stmt.stmt)?;
         return Err(rc);
     }
@@ -238,6 +272,7 @@ fn set_winner_clock(
             Ok(rowid)
         }
         _ => {
+            debug_log(&format!("[set_winner_clock] step_stmt step error"));
             reset_cached_stmt(set_stmt.stmt)?;
             Err(ResultCode::ERROR)
         }
