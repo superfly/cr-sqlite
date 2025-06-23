@@ -72,6 +72,8 @@ dbg_prefix=./dbg
 bundle=bundle_static
 valgrind: bundle = integration_check
 test: bundle = integration_check
+ubsan: bundle = integration_check
+asan: bundle = integration_check
 
 TARGET_LOADABLE=$(prefix)/crsqlite.$(LOADABLE_EXTENSION)
 TARGET_DBG_LOADABLE=$(dbg_prefix)/crsqlite.$(LOADABLE_EXTENSION)
@@ -124,7 +126,10 @@ valgrind: $(TARGET_TEST)
 	valgrind $(prefix)/test
 analyzer:
 	scan-build $(MAKE) clean loadable
-ubsan: CC=clang
+asan: export RUSTFLAGS=-Zsanitizer=address
+asan: rs_build_flags=--target x86_64-unknown-linux-gnu -Zbuild-std
+asan: rs_lib_dbg_static=./rs/$(bundle)/target/x86_64-unknown-linux-gnu/debug/libcrsql_$(bundle).a
+asan: CC=clang
 ubsan: LDLIBS += -lubsan
 ubsan: clean $(TARGET_TEST)
 	$(prefix)/test
@@ -255,7 +260,7 @@ $(TARGET_TEST): $(prefix) $(TARGET_SQLITE3_EXTRA_C) src/tests.c src/*.test.c $(e
 	$(TARGET_SQLITE3_EXTRA_C) src/tests.c src/*.test.c $(ext_files) $(rs_lib_dbg_static_cpy) \
 	$(LDLIBS) -o $@
 
-$(TARGET_TEST_ASAN): $(prefix) $(TARGET_SQLITE3_EXTRA_C) src/tests.c src/*.test.c $(ext_files)
+$(TARGET_TEST_ASAN): $(prefix) $(TARGET_SQLITE3_EXTRA_C) src/tests.c src/*.test.c $(ext_files) $(rs_lib_dbg_static_cpy)
 	$(CC) -fsanitize=address -g -fno-omit-frame-pointer -Wall \
 	-DSQLITE_THREADSAFE=0 \
 	-DSQLITE_OMIT_LOAD_EXTENSION=1 \

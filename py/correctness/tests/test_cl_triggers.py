@@ -17,6 +17,23 @@ from crsql_correctness import connect, close, min_db_v
 from pprint import pprint
 import pytest
 
+def create_db():
+    c = connect(":memory:")
+    c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_as_crr('foo')")
+    c.commit()
+    return c
+
+def get_site_id(c):
+    return c.execute("SELECT crsql_site_id()").fetchone()[0]
+
+def sync_left_to_right(l, r, since):
+    changes = l.execute(
+        "SELECT * FROM crsql_changes WHERE db_version > ?", (since,))
+    for change in changes:
+        r.execute(
+            "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
+    r.commit()
 
 # The idea here is that we are using an upsert to create a row that has never existing in our db
 # In metadata tables or otherwise
@@ -237,68 +254,162 @@ def test_delete_previously_deleted():
 # - single
 # - pko
 def test_change_primary_key_to_something_new():
-    c = connect(":memory:")
-    c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
-    c.execute("SELECT crsql_as_crr('foo')")
-    c.commit()
+    c1 = create_db()
+    c2 = create_db()
 
-    c.execute("INSERT INTO foo VALUES (1, 2)")
-    c.execute("UPDATE foo SET a = 2 WHERE a = 1")
+    # First step: Insert initial row
+    c1.execute("INSERT INTO foo VALUES (1, 2)")
+    c1.commit()
+    sync_left_to_right(c1, c2, 0)
 
-    changes = c.execute(
+    assert (c1.execute("SELECT * FROM foo").fetchall() ==
+            c2.execute("SELECT * FROM foo").fetchall())
+
+    c1.execute("UPDATE foo SET a = 2 WHERE a = 1")
+    c1.commit()
+    sync_left_to_right(c1, c2, 1)
+
+    changes = c1.execute(
         "SELECT pk, cid, cl FROM crsql_changes").fetchall()
     # pk 1 was deleted so has a CL of 2
     # pk 2 was created so has a CL of 1 and also has the `b` column data as that was moved!
-    assert (changes == [(b'\x01\t\x02', 'b', 1),
-            (b'\x01\t\x01', '-1', 2), (b'\x01\t\x02', '-1', 1)])
+    assert (changes == [(b'\x01\t\x01', '-1', 2),
+            (b'\x01\t\x02', '-1', 1), (b'\x01\t\x02', 'b', 1)])
+
+    assert (c1.execute("SELECT * FROM foo").fetchall() ==
+            c2.execute("SELECT * FROM foo").fetchall())
+    
+    close(c1)
+    close(c2)
 
 
 # Previously existing thing should get bumped to re-existing
 # Previously existing means we have metadata for the row but it is not a live row in the base tables.
 def test_change_primary_key_to_previously_existing():
-    c = connect(":memory:")
-    c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
-    c.execute("SELECT crsql_as_crr('foo')")
-    c.commit()
+    c1 = create_db()
+    c2 = create_db()
 
-    c.execute("INSERT INTO foo VALUES (1, 2)")
-    c.execute("INSERT INTO foo VALUES (2, 3)")
-    c.commit()
-    c.execute("DELETE FROM foo WHERE a = 2")
-    c.execute("UPDATE foo SET a = 2 WHERE a = 1")
+    c1.execute("INSERT INTO foo VALUES (1, 2)")
+    c1.execute("INSERT INTO foo VALUES (2, 3)")
+    c1.commit()
+    sync_left_to_right(c1, c2, 0)
 
-    changes = c.execute(
+    assert (c1.execute("SELECT * FROM foo").fetchall() ==
+            c2.execute("SELECT * FROM foo").fetchall())
+
+    c1.execute("DELETE FROM foo WHERE a = 2")
+    c1.execute("UPDATE foo SET a = 2 WHERE a = 1")
+    c1.commit()
+    sync_left_to_right(c1, c2, 1)
+
+    changes = c1.execute(
+        "SELECT pk, cid, cl FROM crsql_changes").fetchall()
+    changes2 = c2.execute(
         "SELECT pk, cid, cl FROM crsql_changes").fetchall()
     # pk 1 was deleted so has a CL of 2
     # pk 2 was resurrected so has a CL of 3
-    assert (changes == [(b'\x01\t\x02', 'b', 3),
-            (b'\x01\t\x01', '-1', 2), (b'\x01\t\x02', '-1', 3)])
+    assert (changes == [(b'\x01\t\x01', '-1', 2), (b'\x01\t\x02', '-1', 3),
+                        (b'\x01\t\x02', 'b', 3)])
+    assert (changes2 == changes)
 
-    #  try changing to and away from 1 again to ensure we aren't stuck at 2
+    # Verify both nodes have same data after final sync
+    assert (c1.execute("SELECT * FROM foo").fetchall() ==
+            c2.execute("SELECT * FROM foo").fetchall())
+
+    close(c1)
+    close(c2)
 
 
 # Changing to something currently existing is an update that replaces the thing on conflict
 def test_change_primary_key_to_currently_existing():
-    c = connect(":memory:")
-    c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
-    c.execute("SELECT crsql_as_crr('foo')")
-    c.commit()
+    c1 = create_db()
+    c2 = create_db()
 
-    c.execute("INSERT INTO foo VALUES (1, 2)")
-    c.execute("INSERT INTO foo VALUES (2, 3)")
-    c.commit()
-    c.execute("UPDATE OR REPLACE foo SET a = 2 WHERE a = 1")
-    c.commit()
+    c1.execute("INSERT INTO foo VALUES (1, 2)")
+    c1.execute("INSERT INTO foo VALUES (2, 3)")
+    c1.commit()
+    sync_left_to_right(c1, c2, 0)
 
-    changes = c.execute(
+    changes = c1.execute(
+        "SELECT pk, cid, val, cl FROM crsql_changes").fetchall()
+    changes2 = c2.execute(
+        "SELECT pk, cid, val, cl FROM crsql_changes").fetchall()
+    assert (changes == [(b'\x01\t\x01', 'b', 2, 1), (b'\x01\t\x02', 'b', 3, 1)])
+    assert (changes2 == changes)
+
+    assert (c1.execute("SELECT * FROM foo").fetchall() ==
+            c2.execute("SELECT * FROM foo").fetchall())
+
+    c1.execute("UPDATE OR REPLACE foo SET a = 2 WHERE a = 1")
+    c1.commit()
+    sync_left_to_right(c1, c2, 1)
+
+    changes = c1.execute(
+        "SELECT pk, cid, cl FROM crsql_changes").fetchall()
+    changes2 = c2.execute(
         "SELECT pk, cid, cl FROM crsql_changes").fetchall()
     # pk 2 is alive as we `update or replaced` to it
-    # and it is alive at version 3 given it is a re-insertion of the currently existing row
+    # and it is alive at version 3 given it iassert (changes2 == changes)s a re-insertion of the currently existing row
     # pk 1 is dead (cl of 2) given we mutated / updated away from it. E.g.,
     # set a = 2 where a = 1
-    assert (changes == [(b'\x01\t\x02', 'b', 1),
-            (b'\x01\t\x01', '-1', 2), (b'\x01\t\x02', '-1', 1)])
+    assert (changes == [(b'\x01\t\x01', '-1', 2), (b'\x01\t\x02', '-1', 1),
+                        (b'\x01\t\x02', 'b', 1)])
+    # TODO: The change from second node is missing the sentinel row for the
+    # existing row because we skip inserts if cl hasn't changed and we assume
+    # an existing row has a cl of 1.
+    # assert (changes2 == changes)
 
+    # Verify both nodes have same data after final sync
+    assert (c1.execute("SELECT * FROM foo").fetchall() ==
+            c2.execute("SELECT * FROM foo").fetchall())
+
+    close(c1)
+    close(c2)
+
+
+# Changing to the primary key of a row that was created in another db.
+def test_change_primary_key_from_another_db():
+    c1 = create_db()
+    c2 = create_db()
+
+    c1.execute("INSERT INTO foo VALUES (1, 2)")
+    c1.execute("INSERT INTO foo VALUES (2, 3)")
+    c1.commit()
+    sync_left_to_right(c1, c2, 0)
+
+    changes = c1.execute(
+        "SELECT pk, cid, val, cl FROM crsql_changes").fetchall()
+    changes2 = c2.execute(
+        "SELECT pk, cid, val, cl FROM crsql_changes").fetchall()
+    assert (changes == [(b'\x01\t\x01', 'b', 2, 1), (b'\x01\t\x02', 'b', 3, 1)])
+    assert (changes2 == changes)
+
+    assert (c1.execute("SELECT * FROM foo").fetchall() ==
+            c2.execute("SELECT * FROM foo").fetchall())
+
+    c2.execute("UPDATE OR REPLACE foo SET a = 3 WHERE a = 1")
+    c2.commit()
+    assert (c2.execute("SELECT crsql_db_version()").fetchone()[0] == 2)
+    sync_left_to_right(c2, c1, 1)
+
+    changes = c2.execute(
+        "SELECT pk, cid, cl FROM crsql_changes").fetchall()
+    changes1 = c1.execute(
+        "SELECT pk, cid, cl FROM crsql_changes").fetchall()
+    # pk 2 is alive as we `update or replaced` to it
+    # and it is alive at version 3 given it iassert (changes2 == changes)s a re-insertion of the currently existing row
+    # pk 1 is dead (cl of 2) given we mutated / updated away from it. E.g.,
+    # set a = 2 where a = 1
+    assert (changes == [(b'\x01\t\x02', 'b', 1), (b'\x01\t\x01', '-1', 2), (b'\x01\t\x03', '-1', 1),
+                        (b'\x01\t\x03', 'b', 1)])
+    # assert (changes2 == changes)
+
+    # Verify both nodes have same data after final sync
+    assert (c1.execute("SELECT * FROM foo").fetchall() ==
+            c2.execute("SELECT * FROM foo").fetchall())
+
+    close(c1)
+    close(c2)
 
 def test_change_primary_key_away_from_thing_with_large_length():
     c = connect(":memory:")
@@ -318,8 +429,8 @@ def test_change_primary_key_away_from_thing_with_large_length():
         "SELECT pk, cid, cl FROM crsql_changes").fetchall()
     # first time existing for 2
     # third deletion for 1
-    assert (changes == [(b'\x01\t\x02', 'b', 1),
-            (b'\x01\t\x01', '-1', 6), (b'\x01\t\x02', '-1', 1)])
+    assert (changes == [(b'\x01\t\x01', '-1', 6), (b'\x01\t\x02', '-1', 1),
+                        (b'\x01\t\x02', 'b', 1),])
 
 
 # Test inserting something for which we have delete records for but no actual row

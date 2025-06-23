@@ -472,6 +472,32 @@ impl TableInfo {
         Ok(self.move_non_sentinels_stmt.try_borrow()?)
     }
 
+    pub fn get_move_non_pk_col_stmt(
+        &self,
+        db: *mut sqlite3,
+    ) -> Result<Ref<Option<ManagedStmt>>, ResultCode> {
+        if self.move_non_sentinels_stmt.try_borrow()?.is_none() {
+            // Incrementing col_version is especially important for the case where we
+            // are updating to a currently existing pk, so that the columns
+            // from the old pk can override the ones from the new at a node
+            // following our changes.
+            let sql = format!(
+            "UPDATE OR REPLACE \"{table_name}__crsql_clock\" SET
+                key = ?,
+                db_version = ?,
+                seq = ?,
+                col_version = col_version + 1,
+                site_id = 0
+            WHERE
+                key = ? AND col_name = ?",
+              table_name = crate::util::escape_ident(&self.tbl_name),
+            );
+            let ret = db.prepare_v3(&sql, sqlite::PREPARE_PERSISTENT)?;
+            *self.move_non_sentinels_stmt.try_borrow_mut()? = Some(ret);
+        }
+        Ok(self.move_non_sentinels_stmt.try_borrow()?)
+    }
+
     pub fn get_mark_locally_created_stmt(
         &self,
         db: *mut sqlite3,
