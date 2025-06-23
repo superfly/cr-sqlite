@@ -41,7 +41,6 @@ fn changes_crsr_finalize(crsr: *mut crsql_Changes_cursor) -> c_int {
         }
         (*crsr).pRowStmt = null_mut();
         (*crsr).dbVersion = crate::consts::MIN_POSSIBLE_DB_VERSION;
-        // (*crsr).siteVersion = crate::consts::MIN_POSSIBLE_SITE_VERSION;
 
         rc
     }
@@ -324,22 +323,17 @@ unsafe fn changes_next(
     cursor: *mut crsql_Changes_cursor,
     vtab: *mut sqlite::vtab,
 ) -> Result<ResultCode, ResultCode> {
-    // libc_print::libc_println!("chnages_next");
     if (*cursor).pChangesStmt.is_null() {
         let err = CString::new("pChangesStmt is null in changes_next")?;
         (*vtab).zErrMsg = err.into_raw();
         return Err(ResultCode::ABORT);
     }
 
-    // libc_print::libc_println!("chnages_next 2");
-
     if !(*cursor).pRowStmt.is_null() {
         let rc = reset_cached_stmt((*cursor).pRowStmt);
         (*cursor).pRowStmt = null_mut();
         rc?;
     }
-
-    // libc_print::libc_println!("chnages_next 3");
 
     let rc = (*cursor).pChangesStmt.step()?;
     if rc == ResultCode::DONE {
@@ -350,7 +344,6 @@ unsafe fn changes_next(
             return Err(ResultCode::ERROR);
         }
     }
-    // libc_print::libc_println!("chnages_next 4");
 
     // we had a row... we can do the rest
     let tbl = (*cursor)
@@ -368,17 +361,7 @@ unsafe fn changes_next(
     let changes_rowid = (*cursor)
         .pChangesStmt
         .column_int64(ClockUnionColumn::RowId as i32);
-    // let site_version = (*cursor)
-    //     .pChangesStmt
-    //     .column_int64(ClockUnionColumn::SiteVrsn as i32);
     (*cursor).dbVersion = db_version;
-    // (*cursor).siteVersion = site_version;
-
-    // libc_print::libc_println!(
-    //     "db_version = {}, site_version = {}",
-    //     db_version,
-    //     site_version
-    // );
 
     let tbl_infos = mem::ManuallyDrop::new(Box::from_raw(
         (*(*(*cursor).pTab).pExtData).tableInfos as *mut Vec<TableInfo>,
@@ -466,7 +449,6 @@ fn column_impl(
     let column = CrsqlChangesColumn::from_i32(i);
     // TODO: only de-reference where needed?
     let changes_stmt = unsafe { (*cursor).pChangesStmt };
-    // libc_print::libc_println!("getting column value for i = {} => {:?}", i, column);
     match column {
         Some(CrsqlChangesColumn::Tbl) => {
             ctx.result_value(changes_stmt.column_value(ClockUnionColumn::Tbl as i32));

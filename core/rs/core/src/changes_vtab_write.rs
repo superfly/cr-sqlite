@@ -732,10 +732,8 @@ unsafe fn merge_insert(
     })();
 
     // Update the received db_version whether the change won or not.
-    if res == Ok(ResultCode::OK) {
-        if !insert_site_id.is_empty() {
-            insert_db_version((*tab).pExtData, insert_site_id, insert_db_vrsn)?;
-        }
+    if res.is_ok() && !insert_site_id.is_empty() {
+        insert_db_version((*tab).pExtData, insert_site_id, insert_db_vrsn)?;
     }
 
     res

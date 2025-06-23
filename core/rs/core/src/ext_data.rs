@@ -61,36 +61,3 @@ pub fn recreate_db_version_stmt(
 
     Ok(ResultCode::OK)
 }
-
-// #[no_mangle]
-// pub extern "C" fn crsql_recreate_site_version_stmt(
-//     db: *mut sqlite3,
-//     ext_data: *mut crsql_ExtData,
-// ) -> c_int {
-//     match recreate_site_version_stmt(db, ext_data) {
-//         Ok(ResultCode::DONE) => -1, // negative 1 means no clock tables exist and there is nothing to fetch
-//         Ok(rc) | Err(rc) => rc as c_int,
-//     }
-// }
-
-// pub fn recreate_site_version_stmt(
-//     db: *mut sqlite3,
-//     ext_data: *mut crsql_ExtData,
-// ) -> Result<ResultCode, ResultCode> {
-//     let site_version_stmt = unsafe { (*ext_data).pSiteVersionStmt };
-
-//     site_version_stmt.finalize()?;
-//     unsafe {
-//         (*ext_data).pSiteVersionStmt = null_mut();
-//     }
-
-//     let site_version_stmt = db.prepare_v3(
-//         "SELECT version FROM crsql_site_versions WHERE site_id = crsql_site_id()",
-//         sqlite::PREPARE_PERSISTENT,
-//     )?;
-//     unsafe {
-//         (*ext_data).pSiteVersionStmt = site_version_stmt.into_raw();
-//     }
-
-//     Ok(ResultCode::OK)
-// }

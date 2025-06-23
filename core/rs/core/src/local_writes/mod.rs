@@ -217,8 +217,6 @@ fn mark_locally_updated(
     db_version: sqlite::int64,
     seq: i32,
 ) -> Result<ResultCode, String> {
-    // libc_print::libc_println!("mark_locally_updated, site_version = {}", site_version);
-
     let update_clock_stmt_ref = tbl_info
         .get_update_clock_stmt(db)
         .map_err(|_e| "failed to get update_clock_stmt")?;

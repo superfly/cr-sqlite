@@ -166,11 +166,13 @@ fn maybe_update_db_inner(
         }
     }
 
-    // if recorded_version < consts::CRSQLITE_VERSION_0_17_0 && !is_blank_slate {
-    //     if let Err(e) = update_to_0_17_0(db) {
-    //         return Err(e);
-    //     }
-    // }
+    if recorded_version < consts::CRSQLITE_VERSION_0_17_0 && !is_blank_slate {
+        let cstring = CString::new(format!("Opening a db created with cr-sqlite version {} is not supported. Upcoming release 0.17.0 is a breaking change.", recorded_version))?;
+        unsafe {
+            (*err_msg) = cstring.into_raw();
+            return Err(ResultCode::ERROR);
+        }
+    }
 
     // write the db version if we migrated to a new one or we are a blank slate db
     if recorded_version < consts::CRSQLITE_VERSION || is_blank_slate {
@@ -213,24 +215,18 @@ pub fn create_clock_table(
       col_name TEXT NOT NULL,
       col_version INTEGER NOT NULL,
       db_version INTEGER NOT NULL,
-      site_id INTEGER NOT NULL DEFAULT 0,  
+      site_id INTEGER NOT NULL DEFAULT 0,
       seq INTEGER NOT NULL,
       PRIMARY KEY (key, col_name)
     ) WITHOUT ROWID, STRICT",
         table_name = crate::util::escape_ident(table_name),
     ))?;
 
-    // TODO: (we probably need to recreate index when upgrading)
     db.exec_safe(
         &format!(
         "CREATE INDEX IF NOT EXISTS \"{table_name}__crsql_clock_dbv_idx\" ON \"{table_name}__crsql_clock\" (\"site_id\", \"db_version\")",
         table_name = crate::util::escape_ident(table_name),
         ))?;
-    // db.exec_safe(
-    //     &format!(
-    //         "CREATE INDEX IF NOT EXISTS \"{table_name}__crsql_clock_sitev_idx\" ON \"{table_name}__crsql_clock\" (\"site_version\")",
-    //         table_name = crate::util::escape_ident(table_name),
-    //     ))?;
     db.exec_safe(
         &format!(
         "CREATE TABLE IF NOT EXISTS \"{table_name}__crsql_pks\" (__crsql_key INTEGER PRIMARY KEY, {pk_list})",
@@ -245,28 +241,4 @@ pub fn create_clock_table(
         pk_list = pk_list
         )
     )
-}
-
-fn update_to_0_17_0(db: *mut sqlite3) -> Result<(), ResultCode> {
-    let stmt = db.prepare_v2(
-        "SELECT tbl_name FROM sqlite_master WHERE type = 'table' AND tbl_name LIKE '%__crsql_clock'",
-    )?;
-
-    let mut names = alloc::vec::Vec::new();
-
-    while stmt.step()? == ResultCode::ROW {
-        names.push(stmt.column_text(0)?.to_string());
-    }
-
-    for name in names {
-        db.exec_safe(&format!(
-            "ALTER TABLE {name} ADD COLUMN site_version INTEGER NOT NULL DEFAULT 0"
-        ))?;
-        db.exec_safe(&format!(
-            "CREATE INDEX IF NOT EXISTS \"{table_name}_sitev_idx\" ON \"{table_name}\" (\"site_version\")",
-            table_name = crate::util::escape_ident(&name),
-        ))?;
-    }
-
-    Ok(())
 }

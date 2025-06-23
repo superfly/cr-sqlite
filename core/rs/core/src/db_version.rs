@@ -85,24 +85,12 @@ pub fn next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> Result
     fill_db_version_if_needed(db, ext_data)?;
 
     let mut ret = unsafe { (*ext_data).dbVersion + 1 };
-    // libc_print::libc_println!(
-    //     // "incrementing db_version: {} => {}, ret: {}",
-    //     unsafe { (*ext_data).dbVersion },
-    //     unsafe { (*ext_data).pendingDbVersion },
-    //     ret
-    // );
     if ret < unsafe { (*ext_data).pendingDbVersion } {
         ret = unsafe { (*ext_data).pendingDbVersion };
     }
 
     // update db_version in db if it changed
     if ret != unsafe { (*ext_data).pendingDbVersion } {
-        // update site_version in db
-        // libc_print::libc_println!(
-        //     "next_site_version: setting into DB! => {}",
-        //     ret
-        // );
-        // next site id is not set in the DB yet, do this now.
         unsafe {
             let site_id_slice =
                 core::slice::from_raw_parts((*ext_data).siteId, SITE_ID_LEN as usize);
@@ -113,25 +101,21 @@ pub fn next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> Result
                 .and_then(|_| (*ext_data).pSetDbVersionStmt.bind_int64(2, ret));
 
             if bind_result.is_err() {
-                return Err("failed binding to set_site_version_stmt".into());
+                return Err("failed binding to pSetDbVersionStmt".into());
             }
 
-            if (*ext_data).pSetDbVersionStmt.step().is_err() {
-                reset_cached_stmt((*ext_data).pSetDbVersionStmt)
-                    .map_err(|_| "failed to reset cached set_site_version_stmt")?;
-                return Err("failed to insert site_version for current site ID".into());
-            }
+            let res = (*ext_data).pSetDbVersionStmt.step();
 
             reset_cached_stmt((*ext_data).pSetDbVersionStmt)
-                .map_err(|_| "failed to reset cached set_site_version_stmt")?;
+                .map_err(|_| "failed to reset cached pSetDbVersionStmt")?;
 
-            //         (*ext_data).nextSiteVersionSet = 1;
+            if res.is_err() {
+                return Err("failed to insert db_version for current site ID".into());
+            }
+            (*ext_data).pendingDbVersion = ret;
         }
     }
 
-    unsafe {
-        (*ext_data).pendingDbVersion = ret;
-    }
     Ok(ret)
 }
 

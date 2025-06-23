@@ -31,8 +31,6 @@ pub extern "C" fn crsql_config_set(
         }
     };
 
-    // libc_print::libc_println!("merge equal values set to {}", value.int());
-
     let db = ctx.db_handle();
     match insert_config_setting(db, name, value) {
         Ok(value) => {

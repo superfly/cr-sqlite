@@ -71,9 +71,7 @@ fn after_update(
     non_pks_new: &[*mut value],
     non_pks_old: &[*mut value],
 ) -> Result<ResultCode, String> {
-    // libc_print::libc_println!("after_update");
     let next_db_version = crate::db_version::next_db_version(db, ext_data)?;
-    // libc_print::libc_println!("next site version: {}", next_site_version);
     let new_key = tbl_info
         .get_or_create_key_via_raw_values(db, pks_new)
         .map_err(|_| "failed geteting or creating lookaside key")?;

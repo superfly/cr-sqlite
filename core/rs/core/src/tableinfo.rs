@@ -482,7 +482,7 @@ impl TableInfo {
             // from the old pk can override the ones from the new at a node
             // following our changes.
             let sql = format!(
-            "UPDATE OR REPLACE \"{table_name}__crsql_clock\" SET
+                "UPDATE OR REPLACE \"{table_name}__crsql_clock\" SET
                 key = ?,
                 db_version = ?,
                 seq = ?,
@@ -490,7 +490,7 @@ impl TableInfo {
                 site_id = 0
             WHERE
                 key = ? AND col_name = ?",
-              table_name = crate::util::escape_ident(&self.tbl_name),
+                table_name = crate::util::escape_ident(&self.tbl_name),
             );
             let ret = db.prepare_v3(&sql, sqlite::PREPARE_PERSISTENT)?;
             *self.move_non_sentinels_stmt.try_borrow_mut()? = Some(ret);
