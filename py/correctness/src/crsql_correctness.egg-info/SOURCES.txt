@@ -20,7 +20,6 @@ tests/test_sentinel_omission.py
 tests/test_seq.py
 tests/test_site_id_lookaside.py
 tests/test_siteid.py
-tests/test_siteversion.py
 tests/test_sync.py
 tests/test_sync_bit.py
 tests/test_sync_prop.py

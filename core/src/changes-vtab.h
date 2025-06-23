@@ -101,7 +101,6 @@ struct crsql_Changes_cursor {
   sqlite3_stmt *pRowStmt;
 
   sqlite3_int64 dbVersion;
-  sqlite3_int64 siteVersion;
   int rowType;
 
   sqlite3_int64 changesRowid;

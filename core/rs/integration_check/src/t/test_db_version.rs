@@ -102,15 +102,6 @@ fn test_next_db_version() -> Result<(), String> {
         1,
         test_exports::db_version::next_db_version(raw_db, ext_data)?
     );
-    // // sets to max of current and provided
-    // assert_eq!(
-    //     1,
-    //     test_exports::db_version::next_db_version(raw_db, ext_data)?
-    // );
-    // assert_eq!(
-    //     1,
-    //     test_exports::db_version::next_db_version(raw_db, ext_data)?
-    // );
 
     // existing db version not touched
     assert_eq!(0, unsafe { (*ext_data).dbVersion });

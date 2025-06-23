@@ -96,7 +96,6 @@ static int changesCrsrFinalize(crsql_Changes_cursor *crsr) {
   crsr->pRowStmt = 0;
 
   crsr->dbVersion = MIN_POSSIBLE_DB_VERSION;
-  // crsr->siteVersion = MIN_POSSIBLE_SITE_VERSION;
 
   return rc;
 }

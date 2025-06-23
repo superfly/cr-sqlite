@@ -5,7 +5,6 @@
 // retrieving unsigned 64bit ints. (2^64 / 2) is a big enough number to write 1
 // million entries per second for 3,000 centuries.
 #define MIN_POSSIBLE_DB_VERSION 0L
-#define MIN_POSSIBLE_SITE_VERSION 0L
 
 #define __CRSQL_CLOCK_LEN 13
 

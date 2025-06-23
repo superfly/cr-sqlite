@@ -18,6 +18,13 @@ def close(c):
 def get_site_id(c):
     return c.execute("SELECT crsql_site_id()").fetchone()[0]
 
+def sync_left_to_right(l, r, since):
+    print("sync_left_to_right")
+    changes = l.execute(
+        "SELECT * FROM crsql_changes WHERE db_version > ?", (since,))
+    for change in changes:
+        r.execute(
+            "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
+    r.commit()
 
 min_db_v = 0
-min_site_v = 0
