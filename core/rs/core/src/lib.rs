@@ -573,11 +573,6 @@ unsafe extern "C" fn x_crsql_as_crr(
         ("main\0", args[0].text())
     };
 
-    // libc_print::libc_println!(
-    //     "crsql_as_crr, schema_name = {}, table_name = {}",
-    //     schema_name,
-    //     table_name
-    // );
     let db = ctx.db_handle();
     let mut err_msg = null_mut();
     let rc = db.exec_safe("SAVEPOINT as_crr");
@@ -674,8 +669,6 @@ unsafe extern "C" fn x_crsql_commit_alter(
     } else {
         ("main\0", args[0].text())
     };
-
-    //libc_print::libc_println!("x_crsql_commit_alter");
 
     let non_destructive = if argc >= 3 { args[2].int() == 1 } else { false };
 
@@ -804,12 +797,6 @@ unsafe extern "C" fn x_crsql_next_db_version(
     let db = ctx.db_handle();
     let mut err_msg = null_mut();
 
-    let provided_version = if argc == 1 {
-        sqlite::args!(argc, argv)[0].int64()
-    } else {
-        0
-    };
-
     let ret = crsql_next_db_version(db, ext_data, &mut err_msg as *mut _);
     if ret < 0 {
         // TODO: use err_msg!
@@ -835,11 +822,6 @@ unsafe extern "C" fn x_crsql_peek_next_db_version(
     let db = ctx.db_handle();
     let mut err_msg = null_mut();
 
-    let provided_version = if argc == 1 {
-        sqlite::args!(argc, argv)[0].int64()
-    } else {
-        0
-    };
 
     let ret = crsql_peek_next_db_version(db, ext_data, &mut err_msg as *mut _);
     if ret < 0 {

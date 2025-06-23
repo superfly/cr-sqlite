@@ -62,13 +62,11 @@ where
 fn step_trigger_stmt(stmt: &ManagedStmt) -> Result<ResultCode, String> {
     match stmt.step() {
         Ok(ResultCode::DONE) => {
-            // libc_print::libc_eprintln!("stepped code: DONE");
             reset_cached_stmt(stmt.stmt)
                 .map_err(|_e| "done -- unable to reset cached trigger stmt")?;
             Ok(ResultCode::OK)
         }
         Ok(code) | Err(code) => {
-            // libc_print::libc_eprintln!("stepped code: {code}");
             reset_cached_stmt(stmt.stmt).map_err(|_e| {
                 format!("error -- unable to reset cached trigger stmt, code {code}")
             })?;

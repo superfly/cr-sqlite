@@ -367,7 +367,6 @@ impl TableInfo {
                 pk_idents = crate::util::as_identifier_list(&self.pks, None)?,
                 pk_bindings = crate::util::binding_list(self.pks.len()),
             );
-            // libc_print::libc_println!("pk-only-insert, sql = {}", sql);
             let ret = db.prepare_v3(&sql, sqlite::PREPARE_PERSISTENT)?;
             *self.merge_pk_only_insert_stmt.try_borrow_mut()? = Some(ret);
         }
