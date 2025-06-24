@@ -397,7 +397,7 @@ def test_change_primary_key_from_another_db():
     changes1 = c1.execute(
         "SELECT pk, cid, cl FROM crsql_changes").fetchall()
     # pk 2 is alive as we `update or replaced` to it
-    # and it is alive at version 3 given it iassert (changes2 == changes)s a re-insertion of the currently existing row
+    # and it is alive at version 3 given it is a re-insertion of the currently existing row
     # pk 1 is dead (cl of 2) given we mutated / updated away from it. E.g.,
     # set a = 2 where a = 1
     assert (changes == [ (b'\x01\t\x01', '-1', 2), (b'\x01\t\x03', '-1', 1),
