@@ -71,11 +71,12 @@ fn after_update(
     non_pks_new: &[*mut value],
     non_pks_old: &[*mut value],
 ) -> Result<ResultCode, String> {
-    let next_db_version = crate::db_version::next_db_version(db, ext_data)?;
+    let next_db_version: i64 = crate::db_version::peek_next_db_version(db, ext_data)?;
     let new_key = tbl_info
         .get_or_create_key_via_raw_values(db, pks_new)
         .map_err(|_| "failed geteting or creating lookaside key")?;
 
+    let mut changed = false;
     // Changing a primary key column to a new value is the same thing as deleting the row
     // previously identified by the primary key.
     if crate::compare_values::any_value_changed(pks_new, pks_old)? {
@@ -83,6 +84,7 @@ fn after_update(
             .get_or_create_key_via_raw_values(db, pks_old)
             .map_err(|_| "failed geteting or creating lookaside key")?;
         let next_seq = super::bump_seq(ext_data);
+        changed = true;
         // Record the delete of the row identified by the old primary keys
         after_update__mark_old_pk_row_deleted(db, tbl_info, old_key, next_db_version, next_seq)?;
         let next_seq = super::bump_seq(ext_data);
@@ -110,6 +112,7 @@ fn after_update(
         .zip(tbl_info.non_pks.iter())
     {
         if crsql_compare_sqlite_values(*new, *old) != 0 {
+            changed = true;
             let next_seq = super::bump_seq(ext_data);
             // we had a difference in new and old values
             // we need to track crdt metadata
@@ -122,6 +125,12 @@ fn after_update(
                 next_seq,
             )?;
         }
+    }
+
+    // actually set the db_version
+    if changed {
+        // TODO: assert this is same as next_db_version
+        crate::db_version::next_db_version(db, ext_data)?;
     }
 
     Ok(ResultCode::OK)
