@@ -12,7 +12,7 @@ pub const TBL_SCHEMA: &'static str = "crsql_master";
 // and, if we ever need it, we can track individual builds of a patch release
 // 00_05_01_01
 pub const CRSQLITE_VERSION: i32 = 17_00_00;
-pub const CRSQLITE_VERSION_STR: &'static str = "0.16.3";
+pub const CRSQLITE_VERSION_STR: &'static str = "0.17.0";
 pub const CRSQLITE_VERSION_0_15_0: i32 = 15_00_00;
 pub const CRSQLITE_VERSION_0_17_0: i32 = 17_00_00;
 

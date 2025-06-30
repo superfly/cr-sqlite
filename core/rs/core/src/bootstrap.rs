@@ -155,16 +155,7 @@ fn maybe_update_db_inner(
             recorded_version = stmt.column_int(0);
         }
     }
-
-    if recorded_version < consts::CRSQLITE_VERSION_0_15_0 && !is_blank_slate {
-        // todo: return an error message to the user that their version is
-        // not supported
-        let cstring = CString::new(format!("Opening a db created with cr-sqlite version {} is not supported. Upcoming release 0.15.0 is a breaking change.", recorded_version))?;
-        unsafe {
-            (*err_msg) = cstring.into_raw();
-            return Err(ResultCode::ERROR);
-        }
-    }
+    // libc_print::libc_println!("recorded_version: {}", recorded_version);
 
     if recorded_version < consts::CRSQLITE_VERSION_0_17_0 && !is_blank_slate {
         let cstring = CString::new(format!("Opening a db created with cr-sqlite version {} is not supported. Upcoming release 0.17.0 is a breaking change.", recorded_version))?;
