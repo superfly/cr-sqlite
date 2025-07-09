@@ -1,4 +1,3 @@
-use alloc::string::ToString;
 use core::ffi::{c_char, c_int};
 
 use crate::{consts, tableinfo::TableInfo};
@@ -208,6 +207,8 @@ pub fn create_clock_table(
       db_version INTEGER NOT NULL,
       site_id INTEGER NOT NULL DEFAULT 0,
       seq INTEGER NOT NULL,
+      ts TEXT NOT NULL DEFAULT '0',
+
       PRIMARY KEY (key, col_name)
     ) WITHOUT ROWID, STRICT",
         table_name = crate::util::escape_ident(table_name),

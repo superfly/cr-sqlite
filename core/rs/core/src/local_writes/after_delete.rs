@@ -1,4 +1,5 @@
 use alloc::string::String;
+use alloc::string::ToString;
 use core::ffi::c_int;
 use sqlite::sqlite3;
 use sqlite::value;
@@ -39,11 +40,12 @@ fn after_delete(
     tbl_info: &TableInfo,
     pks_old: &[*mut value],
 ) -> Result<ResultCode, String> {
+    let ts = unsafe { (*ext_data).timestamp.to_string() };
     let db_version = crate::db_version::next_db_version(db, ext_data)?;
     let seq = bump_seq(ext_data);
     let key = tbl_info
         .get_or_create_key_via_raw_values(db, pks_old)
-        .map_err(|_| "failed geteting or creating lookaside key")?;
+        .map_err(|_| "failed getting or creating lookaside key")?;
 
     let mark_locally_deleted_stmt_ref = tbl_info
         .get_mark_locally_deleted_stmt(db)
@@ -55,6 +57,7 @@ fn after_delete(
         .bind_int64(1, key)
         .and_then(|_| mark_locally_deleted_stmt.bind_int64(2, db_version))
         .and_then(|_| mark_locally_deleted_stmt.bind_int(3, seq))
+        .and_then(|_| mark_locally_deleted_stmt.bind_text(4, &ts, sqlite::Destructor::STATIC))
         .map_err(|_| "failed binding to mark locally deleted stmt")?;
     super::step_trigger_stmt(mark_locally_deleted_stmt)?;
 

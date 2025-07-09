@@ -179,7 +179,7 @@ def test_overwriting_keeps_track_of_true_db_version():
     assert db1.execute("SELECT db_version from crsql_db_versions where site_id = ?", (bytes(db2_site_id),)).fetchone()[0] == min_db_v + 1
 
     changes = db1.execute("SELECT * FROM crsql_changes").fetchall()
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 3, 1, db2_site_id, 1, 0)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 3, 1, db2_site_id, 1, 0, '0')])
 
     db1.execute("UPDATE foo SET b = 3;")
     db1.commit() # db_version = 3
@@ -188,7 +188,7 @@ def test_overwriting_keeps_track_of_true_db_version():
 
     changes = db1.execute("SELECT * FROM crsql_changes").fetchall()
 
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 3, 4, 3, db1_site_id, 1, 0)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 3, 4, 3, db1_site_id, 1, 0, '0')])
 
     db_versions_1 = db1.execute("SELECT * FROM crsql_db_versions").fetchall()
     db_versions_2 = db2.execute("SELECT * FROM crsql_db_versions").fetchall()

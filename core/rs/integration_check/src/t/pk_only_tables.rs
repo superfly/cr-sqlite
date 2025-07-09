@@ -20,9 +20,9 @@ fn sync_left_to_right(l: &dyn Connection, r: &dyn Connection, since: sqlite::int
 
     while stmt_l.step().expect("pulled change set") == ResultCode::ROW {
         let stmt_r = r
-            .prepare_v2("INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .prepare_v2("INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .expect("prepared insert changes");
-        for x in 0..9 {
+        for x in 0..10 {
             stmt_r
                 .bind_value(x + 1, stmt_l.column_value(x).expect("got changeset value"))
                 .expect("bound value");

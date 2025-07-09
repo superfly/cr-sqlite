@@ -162,6 +162,7 @@ fn set_winner_clock(
     insert_db_vrsn: sqlite::int64,
     insert_site_id: &[u8],
     insert_seq: sqlite::int64,
+    insert_ts: &str,
 ) -> Result<sqlite::int64, ResultCode> {
     // set the site_id ordinal
     // get the returned ordinal
@@ -224,7 +225,8 @@ fn set_winner_clock(
         .and_then(|_| match ordinal {
             Some(ordinal) => set_stmt.bind_int64(6, ordinal),
             None => set_stmt.bind_null(6),
-        });
+        })
+        .and_then(|_| set_stmt.bind_text(7, insert_ts, sqlite::Destructor::STATIC));
 
     if let Err(rc) = bind_result {
         reset_cached_stmt(set_stmt.stmt)?;
@@ -256,6 +258,7 @@ fn merge_sentinel_only_insert(
     remote_db_vsn: sqlite::int64,
     remote_site_id: &[u8],
     remote_seq: sqlite::int64,
+    remote_ts: &str,
 ) -> Result<sqlite::int64, ResultCode> {
     let merge_stmt_ref = tbl_info.get_merge_pk_only_insert_stmt(db)?;
     let merge_stmt = merge_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
@@ -302,6 +305,7 @@ fn merge_sentinel_only_insert(
             remote_db_vsn,
             remote_site_id,
             remote_seq,
+            remote_ts,
         );
     }
 
@@ -332,6 +336,7 @@ unsafe fn merge_delete(
     remote_db_vrsn: sqlite::int64,
     remote_site_id: &[u8],
     remote_seq: sqlite::int64,
+    remote_ts: &str,
 ) -> Result<sqlite::int64, ResultCode> {
     let delete_stmt_ref = tbl_info.get_merge_delete_stmt(db)?;
     let delete_stmt = delete_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
@@ -370,6 +375,7 @@ unsafe fn merge_delete(
         remote_db_vrsn,
         remote_site_id,
         remote_seq,
+        remote_ts,
     )?;
 
     // Drop clocks _after_ setting the winner clock so we don't lose track of the max db_version!!
@@ -477,6 +483,7 @@ unsafe fn merge_insert(
     let insert_site_id = args[2 + CrsqlChangesColumn::SiteId as usize];
     let insert_cl = args[2 + CrsqlChangesColumn::Cl as usize].int64();
     let insert_seq = args[2 + CrsqlChangesColumn::Seq as usize].int64();
+    let insert_ts = args[2 + CrsqlChangesColumn::Ts as usize].text();
 
     if insert_site_id.bytes() > crate::consts::SITE_ID_LEN {
         let err = CString::new("crsql - site id exceeded max length")?;
@@ -545,6 +552,7 @@ unsafe fn merge_insert(
                 insert_db_vrsn,
                 insert_site_id,
                 insert_seq,
+                insert_ts,
             );
             match merge_result {
                 Err(rc) => {
@@ -582,6 +590,7 @@ unsafe fn merge_insert(
                 insert_db_vrsn,
                 insert_site_id,
                 insert_seq,
+                insert_ts,
             );
             match merge_result {
                 Err(rc) => {
@@ -619,6 +628,7 @@ unsafe fn merge_insert(
                 insert_db_vrsn,
                 insert_site_id,
                 insert_seq,
+                insert_ts,
             )?;
             (*(*tab).pExtData).rowsImpacted += 1;
         }
@@ -686,6 +696,7 @@ unsafe fn merge_insert(
             insert_db_vrsn,
             insert_site_id,
             insert_seq,
+            insert_ts,
         );
         match merge_result {
             Err(rc) => {

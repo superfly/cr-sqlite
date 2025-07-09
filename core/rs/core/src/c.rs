@@ -23,6 +23,7 @@ pub enum CrsqlChangesColumn {
     SiteId = 6,
     Cl = 7,
     Seq = 8,
+    Ts = 9,
 }
 
 #[derive(FromPrimitive, PartialEq, Debug)]
@@ -36,6 +37,7 @@ pub enum ClockUnionColumn {
     RowId = 6,
     Seq = 7,
     Cl = 8,
+    Ts = 9,
 }
 
 #[derive(FromPrimitive, PartialEq, Debug)]
@@ -70,6 +72,7 @@ pub struct crsql_ExtData {
     pub pSelectSiteIdOrdinalStmt: *mut sqlite::stmt,
     pub pSelectClockTablesStmt: *mut sqlite::stmt,
     pub mergeEqualValues: ::core::ffi::c_int,
+    pub timestamp: ::core::ffi::c_ulonglong,
 }
 
 #[repr(C)]

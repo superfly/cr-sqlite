@@ -47,7 +47,8 @@ fn test_ensure_table_infos_are_up_to_date() {
       col_version,
       db_version,
       site_id,
-      seq
+      seq,
+      ts
     )",
     )
     .expect("made foo clock");
@@ -82,7 +83,8 @@ fn test_ensure_table_infos_are_up_to_date() {
       col_version,
       db_version,
       site_id,
-      seq
+      seq,
+      ts
     )",
     )
     .expect("made boo clock");

@@ -10,7 +10,7 @@ def sync_left_to_right(l, r, since):
         "SELECT * FROM crsql_changes WHERE db_version > ? AND site_id IS NOT ?", (since, r_site_id))
     for change in changes:
         r.execute(
-            "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
+            "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
     r.commit()
 
 
