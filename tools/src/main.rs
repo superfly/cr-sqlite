@@ -369,9 +369,15 @@ fn random_str() -> String {
 }
 
 fn insert(conn: &mut Connection, pfx: &str, count: usize, offset: usize) {
-    let tx = conn.transaction().unwrap();
 
     for i in 0..count {
+        let tx = conn.transaction().unwrap();
+        let sql = format!("SELECT crsql_set_ts('{i}')");
+        // if pfx == "" {
+        //     // println!("setting ts");
+        //     tx.query_row(&sql, (), |row| row.get::<_, String>(0))
+        //         .unwrap();
+        // }
         tx.execute(
             &format!("INSERT INTO {pfx}user VALUES (?, ?)"),
             (i + offset, random_str()),
@@ -392,9 +398,9 @@ fn insert(conn: &mut Connection, pfx: &str, count: usize, offset: usize) {
             (i + offset, "text", i + offset, random_str()),
         )
         .unwrap();
+        tx.commit().unwrap();
     }
 
-    tx.commit().unwrap();
 }
 
 // def update(pfx, count, offset):
@@ -409,6 +415,12 @@ fn insert(conn: &mut Connection, pfx: &str, count: usize, offset: usize) {
 fn update(conn: &mut Connection, pfx: &str, count: usize, offset: usize) {
     let tx = conn.transaction().unwrap();
     for i in 0..count {
+        let sql = format!("SELECT crsql_set_ts('{i}')");
+        if pfx == "" {
+            // println!("setting ts");
+            tx.query_row(&sql, (), |row| row.get::<_, String>(0))
+                .unwrap();
+        }
         tx.execute(
             &format!("UPDATE {pfx}user SET name = ? WHERE id = ?"),
             (random_str(), i + offset),
@@ -439,6 +451,8 @@ fn single_stmt_insert(conn: &mut Connection, pfx: &str, count: usize, offset: us
         .map(|i| format!("({}, '{}', {}, '{}')", i + offset, "text", i, random_str()))
         .collect::<Vec<_>>();
     let tx = conn.transaction().unwrap();
+    // tx.query_row("SELECT crsql_set_ts('18446744073709551615')", (), |row| row.get::<_, String>(0))
+    //     .unwrap();
     tx.execute_batch(&format!(
         "INSERT INTO {pfx}component VALUES {values}",
         values = values.join(", ")
