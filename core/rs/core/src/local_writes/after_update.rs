@@ -162,7 +162,7 @@ fn after_update__mark_old_pk_row_deleted(
         .and_then(|_| mark_locally_deleted_stmt.bind_text(4, ts, sqlite::Destructor::STATIC))
         // .and_then(|_| mark_locally_deleted_stmt.bind_int64(4, db_version))
         .or_else(|_| Err("failed binding to mark_locally_deleted_stmt"))?;
-    super::step_trigger_stmt(mark_locally_deleted_stmt)?;
+    super::step_trigger_stmt(mark_locally_deleted_stmt)
 }
 
 #[allow(non_snake_case)]
@@ -190,7 +190,7 @@ fn after_update__move_non_pk_col(
         .and_then(|_| move_non_pk_col_stmt.bind_int64(5, old_key))
         .and_then(|_| move_non_pk_col_stmt.bind_text(6, col_name, sqlite::Destructor::STATIC))
         .or_else(|_| Err("failed binding to move_non_pk_col_stmt"))?;
-    super::step_trigger_stmt(move_non_pk_col_stmt)?;
+    super::step_trigger_stmt(move_non_pk_col_stmt)
 }
 
 // TODO: in the future we can keep sentinel information in the lookaside
@@ -214,7 +214,7 @@ fn after_update__move_non_sentinels(
         // where they have the old key
         .and_then(|_| move_non_sentinels_stmt.bind_int64(2, old_key))
         .or_else(|_| Err("failed to bind pks to move_non_sentinels_stmt"))?;
-    super::step_trigger_stmt(move_non_sentinels_stmt)?;
+    super::step_trigger_stmt(move_non_sentinels_stmt)
 }
 
 #[cfg(test)]
