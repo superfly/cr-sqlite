@@ -1,6 +1,5 @@
 use core::ffi::c_void;
 use core::mem;
-use core::ptr;
 
 use crate::alloc::string::ToString;
 use crate::alloc::{boxed::Box, vec::Vec};

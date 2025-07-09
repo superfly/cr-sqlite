@@ -29,5 +29,6 @@ pub unsafe extern "C" fn crsql_rollback_hook(user_data: *mut c_void) -> *const c
 pub unsafe fn commit_or_rollback_reset(ext_data: *mut crsql_ExtData) {
     (*ext_data).pendingDbVersion = -1;
     (*ext_data).seq = 0;
+    (*ext_data).timestamp = 0;
     (*ext_data).updatedTableInfosThisTx = 0;
 }

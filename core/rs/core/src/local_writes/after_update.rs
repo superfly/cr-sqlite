@@ -2,6 +2,7 @@ use core::ffi::c_int;
 
 use alloc::format;
 use alloc::string::String;
+use alloc::string::ToString;
 use sqlite::{sqlite3, value, Context, ResultCode};
 use sqlite_nostd as sqlite;
 
@@ -71,10 +72,11 @@ fn after_update(
     non_pks_new: &[*mut value],
     non_pks_old: &[*mut value],
 ) -> Result<ResultCode, String> {
-    let next_db_version: i64 = crate::db_version::peek_next_db_version(db, ext_data)?;
+    let ts = unsafe { (*ext_data).timestamp.to_string() };
+    let next_db_version = crate::db_version::peek_next_db_version(db, ext_data)?;
     let new_key = tbl_info
         .get_or_create_key_via_raw_values(db, pks_new)
-        .map_err(|_| "failed geteting or creating lookaside key")?;
+        .map_err(|_| "failed getting or creating lookaside key")?;
 
     let mut changed = false;
     // Changing a primary key column to a new value is the same thing as deleting the row
@@ -86,10 +88,10 @@ fn after_update(
         let next_seq = super::bump_seq(ext_data);
         changed = true;
         // Record the delete of the row identified by the old primary keys
-        after_update__mark_old_pk_row_deleted(db, tbl_info, old_key, next_db_version, next_seq)?;
+        after_update__mark_old_pk_row_deleted(db, tbl_info, old_key, next_db_version, next_seq, &ts)?;
         let next_seq = super::bump_seq(ext_data);
         // todo: we don't need to this, if there's no existing row (cl is assumed to be 1).
-        super::mark_new_pk_row_created(db, tbl_info, new_key, next_db_version, next_seq)?;
+        super::mark_new_pk_row_created(db, tbl_info, new_key, next_db_version, next_seq, &ts)?;
         for col in tbl_info.non_pks.iter() {
             let next_seq = super::bump_seq(ext_data);
             after_update__move_non_pk_col(
@@ -99,6 +101,7 @@ fn after_update(
                 old_key,
                 &col.name,
                 next_db_version,
+                &ts,
                 next_seq,
             )?;
         }
@@ -123,6 +126,7 @@ fn after_update(
                 col_info,
                 next_db_version,
                 next_seq,
+                &ts,
             )?;
         }
     }
@@ -143,6 +147,7 @@ fn after_update__mark_old_pk_row_deleted(
     old_key: sqlite::int64,
     db_version: sqlite::int64,
     seq: i32,
+    ts: &str,
 ) -> Result<ResultCode, String> {
     let mark_locally_deleted_stmt_ref = tbl_info
         .get_mark_locally_deleted_stmt(db)
@@ -154,6 +159,7 @@ fn after_update__mark_old_pk_row_deleted(
         .bind_int64(1, old_key)
         .and_then(|_| mark_locally_deleted_stmt.bind_int64(2, db_version))
         .and_then(|_| mark_locally_deleted_stmt.bind_int(3, seq))
+        .and_then(|_| mark_locally_deleted_stmt.bind_text(4, ts, sqlite::Destructor::STATIC))
         // .and_then(|_| mark_locally_deleted_stmt.bind_int64(4, db_version))
         .or_else(|_| Err("failed binding to mark_locally_deleted_stmt"))?;
     super::step_trigger_stmt(mark_locally_deleted_stmt)
@@ -167,6 +173,7 @@ fn after_update__move_non_pk_col(
     old_key: sqlite::int64,
     col_name: &str,
     db_version: sqlite::int64,
+    ts: &str,
     seq: i32,
 ) -> Result<ResultCode, String> {
     let move_non_pk_col_stmt_ref = tbl_info
@@ -179,8 +186,9 @@ fn after_update__move_non_pk_col(
         .bind_int64(1, new_key)
         .and_then(|_| move_non_pk_col_stmt.bind_int64(2, db_version))
         .and_then(|_| move_non_pk_col_stmt.bind_int(3, seq))
-        .and_then(|_| move_non_pk_col_stmt.bind_int64(4, old_key))
-        .and_then(|_| move_non_pk_col_stmt.bind_text(5, col_name, sqlite::Destructor::STATIC))
+        .and_then(|_| move_non_pk_col_stmt.bind_text(4, ts, sqlite::Destructor::STATIC))
+        .and_then(|_| move_non_pk_col_stmt.bind_int64(5, old_key))
+        .and_then(|_| move_non_pk_col_stmt.bind_text(6, col_name, sqlite::Destructor::STATIC))
         .or_else(|_| Err("failed binding to move_non_pk_col_stmt"))?;
     super::step_trigger_stmt(move_non_pk_col_stmt)
 }

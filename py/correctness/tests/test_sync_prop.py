@@ -247,7 +247,7 @@ def sync_left_to_right(l, r, since_map, since_is_rowid):
         else:
             ret[change[0]] = change[5]
         r.execute(
-            "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
+            "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
 
     r.commit()
     return ret

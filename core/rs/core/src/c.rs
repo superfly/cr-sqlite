@@ -23,6 +23,7 @@ pub enum CrsqlChangesColumn {
     SiteId = 6,
     Cl = 7,
     Seq = 8,
+    Ts = 9,
 }
 
 #[derive(FromPrimitive, PartialEq, Debug)]
@@ -36,6 +37,7 @@ pub enum ClockUnionColumn {
     RowId = 6,
     Seq = 7,
     Cl = 8,
+    Ts = 9,
 }
 
 #[derive(FromPrimitive, PartialEq, Debug)]
@@ -70,6 +72,7 @@ pub struct crsql_ExtData {
     pub pSelectSiteIdOrdinalStmt: *mut sqlite::stmt,
     pub pSelectClockTablesStmt: *mut sqlite::stmt,
     pub mergeEqualValues: ::core::ffi::c_int,
+    pub timestamp: ::core::ffi::c_ulonglong,
 }
 
 #[repr(C)]
@@ -265,7 +268,7 @@ fn bindgen_test_layout_crsql_ExtData() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::core::mem::size_of::<crsql_ExtData>(),
-        152usize,
+        160usize,
         concat!("Size of: ", stringify!(crsql_ExtData))
     );
     assert_eq!(
@@ -483,6 +486,16 @@ fn bindgen_test_layout_crsql_ExtData() {
             stringify!(crsql_ExtData),
             "::",
             stringify!(mergeEqualValues)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).timestamp) as usize - ptr as usize },
+        152usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_ExtData),
+            "::",
+            stringify!(timestamp)
         )
     );
 }
