@@ -46,80 +46,78 @@ fn main() {
     )
     .unwrap();
 
-    let mut trials = 10;
-    let mut batch_size = 10000;
+    let mut trials = 100;
+    let mut batch_size = 1000;
+
+    let mut count = 10;
 
     // conn.trace(Some(|sql| println!("{sql}")));
 
     // inserts
     let mut times = Vec::new();
-    let start = Instant::now();
-    for i in 0..trials {
+    for i in 0..count {
         let start = Instant::now();
-        insert(&mut conn, "v", batch_size, batch_size * i, use_ts);
-        let elapsed = start.elapsed();
-        times.push(elapsed);
-        // println!("insert #{i} done in {elapsed:?}");
+        for i in 0..trials {
+            let start = Instant::now();
+            insert(&mut conn, "v", batch_size, batch_size * i, use_ts);
+            let elapsed = start.elapsed();
+            // println!("insert #{i} done in {elapsed:?}");
+        }
+        times.push(start.elapsed());
     }
     let avg_time = times.iter().sum::<Duration>() / times.len() as u32;
     let max_time = times.iter().max().unwrap();
     let min_time = times.iter().min().unwrap();
-    println!("insert (vanilla) total time: {:?}", start.elapsed());
-    println!("avg time: {:?}", avg_time);
-    println!("max time: {:?}", max_time);
-    println!("min time: {:?}", min_time);
+    println!("insert (vanilla) avg time: {:?}, max: {:?}, min: {:?}", avg_time, max_time, min_time);
 
     let mut times = Vec::new();
-    let start = Instant::now();
-    for i in 0..trials {
+    for i in 0..count {
         let start = Instant::now();
-        insert(&mut conn, "", batch_size, batch_size * i, use_ts);
-        let elapsed = start.elapsed();
-        times.push(elapsed);
-        // println!("insert #{i} done in {elapsed:?}");
+        for i in 0..trials {
+            let start = Instant::now();
+            insert(&mut conn, "", batch_size, batch_size * i, use_ts);
+            let elapsed = start.elapsed();
+            // println!("insert #{i} done in {elapsed:?}");
+        }
+        times.push(start.elapsed());
     }
-    println!("insert total time: {:?}", start.elapsed());
     let avg_time = times.iter().sum::<Duration>() / times.len() as u32;
     let max_time = times.iter().max().unwrap();
     let min_time = times.iter().min().unwrap();
-    println!("avg time: {:?}", avg_time);
-    println!("max time: {:?}", max_time);
-    println!("min time: {:?}", min_time);
+    println!("insert avg time: {:?}, max: {:?}, min: {:?}", avg_time, max_time, min_time);
 
     // updates
-    let start = Instant::now();
     let mut times = Vec::new();
-    for i in 0..trials {
+    for i in 0..count {
         let start = Instant::now();
-        update(&mut conn, "v", batch_size, batch_size * i, use_ts);
-        let elapsed = start.elapsed();
-        times.push(elapsed);
+        for i in 0..trials {
+            let start = Instant::now();
+            update(&mut conn, "v", batch_size, batch_size * i, use_ts);
+            let elapsed = start.elapsed();
+        }
+        times.push(start.elapsed());
         // println!("update #{i} done in {elapsed:?}");
     }
-    println!("update (vanilla) total time: {:?}", start.elapsed());
     let avg_time = times.iter().sum::<Duration>() / times.len() as u32;
     let max_time = times.iter().max().unwrap();
     let min_time = times.iter().min().unwrap();
-    println!("avg time: {:?}", avg_time);
-    println!("max time: {:?}", max_time);
-    println!("min time: {:?}", min_time);
+    println!("update (vanilla) avg time: {:?}, max: {:?}, min: {:?}", avg_time, max_time, min_time);
 
-    let start = Instant::now();
     let mut times = Vec::new();
-    for i in 0..trials {
+    for i in 0..count {
         let start = Instant::now();
-        update(&mut conn, "", batch_size, batch_size * i, use_ts);
-        let elapsed = start.elapsed();
-        times.push(elapsed);
+        for i in 0..trials {
+            let start = Instant::now();
+            update(&mut conn, "", batch_size, batch_size * i, use_ts);
+            let elapsed = start.elapsed();
+        }
+        times.push(start.elapsed());
         // println!("update #{i} done in {elapsed:?}");
     }
-    println!("update total time: {:?}", start.elapsed());
     let avg_time = times.iter().sum::<Duration>() / times.len() as u32;
     let max_time = times.iter().max().unwrap();
     let min_time = times.iter().min().unwrap();
-    println!("avg time: {:?}", avg_time);
-    println!("max time: {:?}", max_time);
-    println!("min time: {:?}", min_time);
+    println!("update avg time: {:?}, max: {:?}, min: {:?}", avg_time, max_time, min_time);
 
     // // single insert
     // let start = Instant::now();
