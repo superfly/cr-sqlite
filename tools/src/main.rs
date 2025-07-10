@@ -49,18 +49,18 @@ fn main() {
     let mut trials = 100;
     let mut batch_size = 1000;
 
-    let mut count = 10;
+    let mut count = 5;
 
     // conn.trace(Some(|sql| println!("{sql}")));
 
     // inserts
     let mut times = Vec::new();
-    for i in 0..count {
+    for j in 0..count {
         let start = Instant::now();
         for i in 0..trials {
-            let start = Instant::now();
-            insert(&mut conn, "v", batch_size, batch_size * i, use_ts);
-            let elapsed = start.elapsed();
+            // let start = Instant::now();
+            insert(&mut conn, "v", batch_size, batch_size * ( i + (j * trials)), use_ts);
+            // let elapsed = start.elapsed();
             // println!("insert #{i} done in {elapsed:?}");
         }
         times.push(start.elapsed());
@@ -71,11 +71,11 @@ fn main() {
     println!("insert (vanilla) avg time: {:?}, max: {:?}, min: {:?}", avg_time, max_time, min_time);
 
     let mut times = Vec::new();
-    for i in 0..count {
+    for j in 0..count {
         let start = Instant::now();
         for i in 0..trials {
             let start = Instant::now();
-            insert(&mut conn, "", batch_size, batch_size * i, use_ts);
+            insert(&mut conn, "", batch_size, batch_size * ( i + (j * trials)), use_ts);
             let elapsed = start.elapsed();
             // println!("insert #{i} done in {elapsed:?}");
         }
@@ -88,11 +88,11 @@ fn main() {
 
     // updates
     let mut times = Vec::new();
-    for i in 0..count {
+    for j in 0..count {
         let start = Instant::now();
         for i in 0..trials {
             let start = Instant::now();
-            update(&mut conn, "v", batch_size, batch_size * i, use_ts);
+            update(&mut conn, "v", batch_size, batch_size * ( i + (j * trials)), use_ts);
             let elapsed = start.elapsed();
         }
         times.push(start.elapsed());
@@ -104,11 +104,11 @@ fn main() {
     println!("update (vanilla) avg time: {:?}, max: {:?}, min: {:?}", avg_time, max_time, min_time);
 
     let mut times = Vec::new();
-    for i in 0..count {
+    for j in 0..count {
         let start = Instant::now();
         for i in 0..trials {
             let start = Instant::now();
-            update(&mut conn, "", batch_size, batch_size * i, use_ts);
+            update(&mut conn, "", batch_size, batch_size * ( i + (j * trials)), use_ts);
             let elapsed = start.elapsed();
         }
         times.push(start.elapsed());
@@ -411,7 +411,7 @@ fn insert(conn: &mut Connection, pfx: &str, count: usize, offset: usize, use_ts:
     for i in 0..count {
         let tx = conn.transaction().unwrap();
         if use_ts && pfx == "" {
-            let sql = format!("SELECT crsql_set_ts('{i}')");
+            let sql = format!("SELECT crsql_set_ts('{}')", i + offset);
             tx.query_row(&sql, (), |row| row.get::<_, String>(0))
                 .unwrap();
         }
@@ -453,7 +453,7 @@ fn update(conn: &mut Connection, pfx: &str, count: usize, offset: usize, use_ts:
     let tx = conn.transaction().unwrap();
     for i in 0..count {
         if use_ts && pfx == "" {
-            let sql = format!("SELECT crsql_set_ts('{i}')");
+            let sql = format!("SELECT crsql_set_ts('{}')", i + offset);
             tx.query_row(&sql, (), |row| row.get::<_, String>(0))
                 .unwrap();
         }
