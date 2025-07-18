@@ -12,7 +12,7 @@ def sync_left_to_right(l, r, since):
     for change in changes:
         ret = change[5]
         r.execute(
-            "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
+            "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
 
     r.commit()
     return ret

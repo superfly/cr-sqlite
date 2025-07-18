@@ -47,6 +47,7 @@ struct crsql_ExtData {
   sqlite3_stmt *pSelectClockTablesStmt;
 
   int mergeEqualValues;
+  unsigned long long timestamp;
 };
 
 crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer);

@@ -1,4 +1,5 @@
 use alloc::string::String;
+use alloc::string::ToString;
 use core::ffi::c_int;
 use sqlite::sqlite3;
 use sqlite::value;
@@ -39,6 +40,8 @@ fn after_insert(
     tbl_info: &TableInfo,
     pks_new: &[*mut value],
 ) -> Result<ResultCode, String> {
+    let ts = unsafe { (*ext_data).timestamp.to_string() };
+
     let db_version = crate::db_version::next_db_version(db, ext_data)?;
     let (create_record_existed, key_new) = tbl_info
         .get_or_create_key_for_insert(db, pks_new)
@@ -46,14 +49,14 @@ fn after_insert(
     if tbl_info.non_pks.is_empty() {
         let seq = bump_seq(ext_data);
         // just a sentinel record
-        return super::mark_new_pk_row_created(db, tbl_info, key_new, db_version, seq);
+        return super::mark_new_pk_row_created(db, tbl_info, key_new, db_version, seq, &ts);
     } else if create_record_existed {
         // update the create record since it already exists.
         let seq = bump_seq(ext_data);
-        update_create_record(db, tbl_info, key_new, db_version, seq)?;
+        update_create_record(db, tbl_info, key_new, db_version, seq, &ts)?;
     }
 
-    super::mark_locally_inserted(db, ext_data, tbl_info, key_new, db_version)?;
+    super::mark_locally_inserted(db, ext_data, tbl_info, key_new, db_version, &ts)?;
 
     Ok(ResultCode::OK)
 }
@@ -64,6 +67,7 @@ fn update_create_record(
     new_key: sqlite::int64,
     db_version: sqlite::int64,
     seq: i32,
+    ts: &str,
 ) -> Result<ResultCode, String> {
     let update_create_record_stmt_ref = tbl_info
         .get_maybe_mark_locally_reinserted_stmt(db)
@@ -75,10 +79,11 @@ fn update_create_record(
     update_create_record_stmt
         .bind_int64(1, db_version)
         .and_then(|_| update_create_record_stmt.bind_int(2, seq))
-        .and_then(|_| update_create_record_stmt.bind_int64(3, new_key))
+        .and_then(|_| update_create_record_stmt.bind_text(3, ts, sqlite::Destructor::STATIC))
+        .and_then(|_| update_create_record_stmt.bind_int64(4, new_key))
         .and_then(|_| {
             update_create_record_stmt.bind_text(
-                4,
+                5,
                 crate::c::INSERT_SENTINEL,
                 sqlite::Destructor::STATIC,
             )

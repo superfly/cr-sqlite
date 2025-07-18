@@ -49,6 +49,7 @@ mod util;
 
 use alloc::borrow::Cow;
 use alloc::format;
+use alloc::string::ToString;
 use core::ffi::c_char;
 use core::mem;
 use core::ptr::null_mut;
@@ -362,6 +363,40 @@ pub extern "C" fn sqlite3_crsqlcore_init(
             None,
         )
         .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
+    let rc = db
+    .create_function_v2(
+        "crsql_set_ts",
+        -1,
+        sqlite::UTF8 | sqlite::DETERMINISTIC,
+        Some(ext_data as *mut c_void),
+        Some(x_crsql_set_ts),
+        None,
+        None,
+        None,
+    )
+    .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
+    let rc = db
+    .create_function_v2(
+        "crsql_get_ts",
+        -1,
+        sqlite::UTF8 | sqlite::DETERMINISTIC,
+        Some(ext_data as *mut c_void),
+        Some(x_crsql_get_ts),
+        None,
+        None,
+        None,
+    )
+    .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
@@ -754,6 +789,47 @@ unsafe extern "C" fn x_crsql_increment_and_get_seq(
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
     ctx.result_int((*ext_data).seq);
     (*ext_data).seq += 1;
+}
+
+/**
+ * Set the timestamp for the current transaction.
+ */
+unsafe extern "C" fn x_crsql_set_ts(
+    ctx: *mut sqlite::context,
+    argc: i32,
+    argv: *mut *mut sqlite::value,
+) {
+    if argc == 0 {
+        ctx.result_error(
+            "Wrong number of args provided to crsql_begin_alter. Provide the
+          schema name and table name or just the table name.",
+        );
+        return;
+    }
+
+    let args = sqlite::args!(argc, argv);
+    let ts = args[0].text();
+    // we expect a string that we can parse as a u64
+    let ts_u64 = match ts.parse::<u64>() {
+        Ok(ts_u64) => ts_u64,
+        Err(_) => {
+            ctx.result_error("Timestamp cannot be parsed as a valid u64");
+            return;
+        }
+    };
+    let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+    (*ext_data).timestamp = ts_u64;
+    ctx.result_text_static("OK");
+}
+
+unsafe extern "C" fn x_crsql_get_ts(
+    ctx: *mut sqlite::context,
+    _argc: i32,
+    _argv: *mut *mut sqlite::value,
+) {
+    let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+    let ts = (*ext_data).timestamp.to_string();
+    ctx.result_text_transient(&ts);
 }
 
 /**

@@ -33,7 +33,8 @@ fn crsql_changes_query_for_table(table_info: &TableInfo) -> Result<String, Resul
           site_tbl.site_id as site_id,
           t1.key,
           t1.seq as seq,
-          COALESCE(t2.col_version, 1) as cl
+          COALESCE(t2.col_version, 1) as cl,
+          t1.ts as ts
       FROM \"{table_name_ident}__crsql_clock\" AS t1
       JOIN \"{table_name_ident}__crsql_pks\" AS pk_tbl ON t1.key = pk_tbl.__crsql_key
       LEFT JOIN crsql_site_id AS site_tbl ON t1.site_id = site_tbl.ordinal
@@ -60,7 +61,7 @@ pub fn changes_union_query(
     // Manually null-terminate the string so we don't have to copy it to create a CString.
     // We can just extract the raw bytes of the Rust string.
     Ok(format!(
-      "SELECT tbl, pks, cid, col_vrsn, db_vrsn, site_id, key, seq, cl FROM ({unions}) {idx_str}\0",
+      "SELECT tbl, pks, cid, col_vrsn, db_vrsn, site_id, key, seq, cl, ts FROM ({unions}) {idx_str}\0",
       unions = sub_queries.join(" UNION ALL "),
       idx_str = idx_str,
     ))

@@ -57,7 +57,7 @@ int syncLeftToRight(sqlite3 *db1, sqlite3 *db2, sqlite3_int64 since) {
   rc += sqlite3_bind_value(pStmtRead, 1, sqlite3_column_value(pStmt, 0));
   assert(rc == SQLITE_OK);
   rc += sqlite3_prepare_v2(
-      db2, "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      db2, "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       -1, &pStmtWrite, 0);
   assert(rc == SQLITE_OK);
   // printf("err: %s\n", err);
@@ -450,7 +450,7 @@ static const void *getSiteId(sqlite3 *db) {
     return NULL;
   }
 
-  
+
   sqlite3_step(pStmt);
   const void *site_id = sqlite3_column_blob(pStmt, 0);
   sqlite3_finalize(pStmt);
@@ -520,7 +520,7 @@ static void testLamportCondition() {
   // assert(site_id2 != NULL);
 
   sqlite3_int64 db2_db1v = getSiteDbVersion(db2, site_id1);
-  
+
   printf("db1v: %lld\n", db1v);
   printf("db2_db1v: %lld\n", db2_db1v);
   assert(db1v == db2_db1v);

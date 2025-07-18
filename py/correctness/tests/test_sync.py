@@ -22,7 +22,7 @@ def sync_left_to_right(l, r, since):
         "SELECT * FROM crsql_changes WHERE db_version > ?", (since,))
     for change in changes:
         r.execute(
-            "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
+            "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
     r.commit()
 
 
@@ -84,24 +84,24 @@ def test_changes_since():
     # siteid = dbs[0].execute("select crsql_site_id()").fetchone()[0]
     siteid = None
     expected = [
-        ('user', b'\x01\t\x01', 'name', 'Javi', 1, 1, site_id, 1, 0),
-        ('deck', b'\x01\t\x01', 'owner_id', 1, 1, 1, site_id, 1, 1),
-        ('deck', b'\x01\t\x01', 'title', 'Preso', 1, 1, site_id, 1, 2),
-        ('slide', b'\x01\t\x01', 'deck_id', 1, 1, 1, site_id, 1, 3),
-        ('slide', b'\x01\t\x01', 'order', 0, 1, 1, site_id, 1, 4),
-        ('component', b'\x01\t\x01', 'type', 'text', 1, 1, site_id, 1, 5),
-        ('component', b'\x01\t\x01', 'slide_id', 1, 1, 1, site_id, 1, 6),
-        ('component', b'\x01\t\x01', 'content', 'wootwoot', 1, 1, site_id, 1, 7),
-        ('component', b'\x01\t\x02', 'type', 'text', 1, 1, site_id, 1, 8),
-        ('component', b'\x01\t\x02', 'slide_id', 1, 1, 1, site_id, 1, 9),
-        ('component', b'\x01\t\x02', 'content', 'toottoot', 1, 1, site_id, 1, 10),
-        ('component', b'\x01\t\x03', 'type', 'text', 1, 1, site_id, 1, 11),
-        ('component', b'\x01\t\x03', 'slide_id', 1, 1, 1, site_id, 1, 12),
-        ('component', b'\x01\t\x03', 'content', 'footfoot', 1, 1, site_id, 1, 13),
-        ('slide', b'\x01\t\x02', 'deck_id', 1, 1, 1, site_id, 1, 14),
-        ('slide', b'\x01\t\x02', 'order', 1, 1, 1, site_id, 1, 15),
-        ('slide', b'\x01\t\x03', 'deck_id', 1, 1, 1, site_id, 1, 16),
-        ('slide', b'\x01\t\x03', 'order', 2, 1, 1, site_id, 1, 17)
+        ('user', b'\x01\t\x01', 'name', 'Javi', 1, 1, site_id, 1, 0, '0'),
+        ('deck', b'\x01\t\x01', 'owner_id', 1, 1, 1, site_id, 1, 1, '0'),
+        ('deck', b'\x01\t\x01', 'title', 'Preso', 1, 1, site_id, 1, 2, '0'),
+        ('slide', b'\x01\t\x01', 'deck_id', 1, 1, 1, site_id, 1, 3, '0'),
+        ('slide', b'\x01\t\x01', 'order', 0, 1, 1, site_id, 1, 4, '0'),
+        ('component', b'\x01\t\x01', 'type', 'text', 1, 1, site_id, 1, 5, '0'),
+        ('component', b'\x01\t\x01', 'slide_id', 1, 1, 1, site_id, 1, 6, '0'),
+        ('component', b'\x01\t\x01', 'content', 'wootwoot', 1, 1, site_id, 1, 7, '0'),
+        ('component', b'\x01\t\x02', 'type', 'text', 1, 1, site_id, 1, 8, '0'),
+        ('component', b'\x01\t\x02', 'slide_id', 1, 1, 1, site_id, 1, 9, '0'),
+        ('component', b'\x01\t\x02', 'content', 'toottoot', 1, 1, site_id, 1, 10, '0'),
+        ('component', b'\x01\t\x03', 'type', 'text', 1, 1, site_id, 1, 11, '0'),
+        ('component', b'\x01\t\x03', 'slide_id', 1, 1, 1, site_id, 1, 12, '0'),
+        ('component', b'\x01\t\x03', 'content', 'footfoot', 1, 1, site_id, 1, 13, '0'),
+        ('slide', b'\x01\t\x02', 'deck_id', 1, 1, 1, site_id, 1, 14, '0'),
+        ('slide', b'\x01\t\x02', 'order', 1, 1, 1, site_id, 1, 15, '0'),
+        ('slide', b'\x01\t\x03', 'deck_id', 1, 1, 1, site_id, 1, 16, '0'),
+        ('slide', b'\x01\t\x03', 'order', 2, 1, 1, site_id, 1, 17, '0')
     ]
 
     assert (rows == expected)
@@ -110,8 +110,8 @@ def test_changes_since():
 
     rows = get_changes_since(dbs[0], 1, 'FF')
 
-    assert (rows == [('user', b'\x01\x09\x01', 'name', "Maestro", 2, 2, site_id, 1, 0),
-                     ('deck', b'\x01\x09\x01', 'title', "Presto", 2, 2, site_id, 1, 1)])
+    assert (rows == [('user', b'\x01\x09\x01', 'name', "Maestro", 2, 2, site_id, 1, 0, '0'),
+                     ('deck', b'\x01\x09\x01', 'title', "Presto", 2, 2, site_id, 1, 1, '0')])
 
 
 def test_delete():
@@ -126,7 +126,7 @@ def test_delete():
     site_id = get_site_id(db)
     # Deletes are marked with a sentinel id
     assert (rows == [('component', b'\x01\x09\x01',
-            '-1', None, 2, 2, site_id, 2, 0)])
+            '-1', None, 2, 2, site_id, 2, 0, '0')])
 
     db.execute("DELETE FROM component")
     db.execute("DELETE FROM deck")
@@ -136,14 +136,14 @@ def test_delete():
     rows = get_changes_since(db, 0, 'FF')
 
     # TODO: should deletes not get a proper version? Would be better for ordering and chunking replications
-    assert (rows == [('user', b'\x01\t\x01', 'name', 'Javi', 1, 1, site_id, 1, 0),
-                     ('component', b'\x01\t\x01', '-1', None, 2, 2, site_id, 2, 0),
-                     ('component', b'\x01\t\x02', '-1', None, 2, 3, site_id, 2, 0),
-                     ('component', b'\x01\t\x03', '-1', None, 2, 3, site_id, 2, 1),
-                     ('deck', b'\x01\t\x01', '-1', None, 2, 3, site_id, 2, 2),
-                     ('slide', b'\x01\t\x01', '-1', None, 2, 3, site_id, 2, 3),
-                     ('slide', b'\x01\t\x02', '-1', None, 2, 3, site_id, 2, 4),
-                     ('slide', b'\x01\t\x03', '-1', None, 2, 3, site_id, 2, 5)])
+    assert (rows == [('user', b'\x01\t\x01', 'name', 'Javi', 1, 1, site_id, 1, 0, '0'),
+                     ('component', b'\x01\t\x01', '-1', None, 2, 2, site_id, 2, 0, '0'),
+                     ('component', b'\x01\t\x02', '-1', None, 2, 3, site_id, 2, 0, '0'),
+                     ('component', b'\x01\t\x03', '-1', None, 2, 3, site_id, 2, 1, '0'),
+                     ('deck', b'\x01\t\x01', '-1', None, 2, 3, site_id, 2, 2, '0'),
+                     ('slide', b'\x01\t\x01', '-1', None, 2, 3, site_id, 2, 3, '0'),
+                     ('slide', b'\x01\t\x02', '-1', None, 2, 3, site_id, 2, 4, '0'),
+                     ('slide', b'\x01\t\x03', '-1', None, 2, 3, site_id, 2, 5, '0')])
 
     # test insert
 
@@ -182,7 +182,7 @@ def test_merging_on_defaults():
     changes = db1.execute("SELECT * FROM crsql_changes").fetchall()
     # w the same db_version as db2
     site_id = get_site_id(db2)
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 1, 1, site_id, 1, 0)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 1, 1, site_id, 1, 0, '0')])
 
     close(db1)
     close(db2)
@@ -196,7 +196,7 @@ def test_merging_on_defaults():
     # db1 into db2
     # db2 should still win w. no db version change since no write happened
     site_id = get_site_id(db2)
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 1, 1, site_id, 1, 0)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 1, 1, site_id, 1, 0, '0')])
 
     # test merging from thing without records (db1) to thing with records (db2)
 
@@ -236,7 +236,7 @@ def test_merging_larger_backfilled_default():
     # db version is pushed since 4 wins the col_version tie
     # col version stays since 1 is the max of winner and loser.
     site_id = get_site_id(db1)
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 4, 1, 1, site_id, 1, 0)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 4, 1, 1, site_id, 1, 0, '0')])
 
 
 def test_merging_larger():
@@ -269,13 +269,13 @@ def test_db_version_moves_as_expected_post_alter():
 
     changes = db.execute("SELECT * FROM crsql_changes").fetchall()
     site_id = get_site_id(db)
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 1, 1, site_id, 1, 0),
-                        ('foo', b'\x01\t\x02', 'b', 3, 1, 2, site_id, 1, 0),
-                        ('foo', b'\x01\t\x02', 'c', 4, 1, 2, site_id, 1, 1),
-                        ('foo', b'\x01\t\x03', 'b', 4, 1, 3, site_id, 1, 0),
-                        ('foo', b'\x01\t\x03', 'c', 5, 1, 3, site_id, 1, 1),
-                        ('foo', b'\x01\t\x04', 'b', 4, 1, 4, site_id, 1, 0),
-                        ('foo', b'\x01\t\x04', 'c', 5, 1, 4, site_id, 1, 1)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 1, 1, site_id, 1, 0, '0'),
+                        ('foo', b'\x01\t\x02', 'b', 3, 1, 2, site_id, 1, 0, '0'),
+                        ('foo', b'\x01\t\x02', 'c', 4, 1, 2, site_id, 1, 1, '0'),
+                        ('foo', b'\x01\t\x03', 'b', 4, 1, 3, site_id, 1, 0, '0'),
+                        ('foo', b'\x01\t\x03', 'c', 5, 1, 3, site_id, 1, 1, '0'),
+                        ('foo', b'\x01\t\x04', 'b', 4, 1, 4, site_id, 1, 0, '0'),
+                        ('foo', b'\x01\t\x04', 'c', 5, 1, 4, site_id, 1, 1, '0')])
 
 
 # DB1 has a row with no clock records (added during schema modification)
@@ -324,8 +324,8 @@ def test_merging_on_defaults2():
     site_id1 = get_site_id(db1)
     site_id2 = get_site_id(db2)
 
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 4, 1, 1, site_id1, 1, 0),
-                        ('foo', b'\x01\t\x01', 'c', 3, 1, 1, site_id2, 1, 1)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 4, 1, 1, site_id1, 1, 0, '0'),
+                        ('foo', b'\x01\t\x01', 'c', 3, 1, 1, site_id2, 1, 1, '0')])
 
     close(db1)
     close(db2)
@@ -338,13 +338,13 @@ def test_merging_on_defaults2():
     sync_left_to_right(db1, db2, 0)
 
     changes = db2.execute("SELECT * FROM crsql_changes").fetchall()
-    assert (changes == [ 
+    assert (changes == [
         # update db_version to db1's own since b lost on db2.
         # b had the value 2 on db2.
-        ('foo', b'\x01\t\x01', 'b', 4, 1, 1, site_id1, 1, 0),
+        ('foo', b'\x01\t\x01', 'b', 4, 1, 1, site_id1, 1, 0, '0'),
         # db2 c 3 wins given columns with no value after an alter
         # do no merging
-        ('foo', b'\x01\t\x01', 'c', 3, 1, 1, site_id2, 1, 1)])
+        ('foo', b'\x01\t\x01', 'c', 3, 1, 1, site_id2, 1, 1, '0')])
 
 
 def create_basic_db():
@@ -372,14 +372,14 @@ def test_merge_same():
     changes = db2.execute("SELECT * FROM crsql_changes").fetchall()
     # all at base version
     site_id = get_site_id(db2)
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 1, 1, site_id, 1, 0)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 1, 1, site_id, 1, 0, '0')])
 
     (db1, db2) = make_dbs()
     sync_left_to_right(db2, db1, 0)
     changes = db2.execute("SELECT * FROM crsql_changes").fetchall()
     # all at base version
     site_id = get_site_id(db2)
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 1, 1, site_id, 1, 0)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 1, 1, site_id, 1, 0, '0')])
 
 def test_merge_same_w_tie_breaker():
     db1 = create_basic_db()
@@ -437,14 +437,14 @@ def test_merge_matching_clocks_lesser_value():
     changes = db2.execute("SELECT * FROM crsql_changes").fetchall()
     site_id = get_site_id(db2)
     # no change since incoming is lesser
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 1, 1, site_id, 1, 0)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 1, 1, site_id, 1, 0, '0')])
 
     (db1, db2) = make_dbs()
     sync_left_to_right(db2, db1, 0)
     changes = db1.execute("SELECT * FROM crsql_changes").fetchall()
     # change since incoming is greater
     site_id = get_site_id(db2)
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 1, 1, site_id, 1, 0)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 1, 1, site_id, 1, 0, '0')])
 
 
 def test_merge_larger_clock_larger_value():
@@ -465,13 +465,13 @@ def test_merge_larger_clock_larger_value():
     sync_left_to_right(db1, db2, 0)
     changes = db2.execute("SELECT * FROM crsql_changes").fetchall()
     site_id = get_site_id(db1)
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 3, 2, 2, site_id, 1, 0)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 3, 2, 2, site_id, 1, 0, '0')])
 
     (db1, db2) = make_dbs()
     sync_left_to_right(db2, db1, 0)
     changes = db1.execute("SELECT * FROM crsql_changes").fetchall()
     site_id = get_site_id(db1)
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 3, 2, 2, site_id, 1, 0)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 3, 2, 2, site_id, 1, 0, '0')])
 
 
 def test_merge_larger_clock_smaller_value():
@@ -492,13 +492,13 @@ def test_merge_larger_clock_smaller_value():
     sync_left_to_right(db1, db2, 0)
     changes = db2.execute("SELECT * FROM crsql_changes").fetchall()
     site_id = get_site_id(db1)
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 0, 2, 2, site_id, 1, 0)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 0, 2, 2, site_id, 1, 0, '0')])
 
     (db1, db2) = make_dbs()
     sync_left_to_right(db2, db1, 0)
     changes = db1.execute("SELECT * FROM crsql_changes").fetchall()
     site_id = get_site_id(db1)
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 0, 2, 2, site_id, 1, 0)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 0, 2, 2, site_id, 1, 0, '0')])
 
 
 def test_merge_larger_clock_same_value():
@@ -519,13 +519,13 @@ def test_merge_larger_clock_same_value():
     sync_left_to_right(db1, db2, 0)
     site_id = get_site_id(db1)
     changes = db2.execute("SELECT * FROM crsql_changes").fetchall()
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 2, 2, site_id, 1, 0)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 2, 2, site_id, 1, 0, '0')])
 
     (db1, db2) = make_dbs()
     sync_left_to_right(db2, db1, 0)
     site_id = get_site_id(db1)
     changes = db1.execute("SELECT * FROM crsql_changes").fetchall()
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 2, 2, site_id, 1, 0)])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 2, 2, site_id, 1, 0, '0')])
 
 # Row exists but col added thus no defaults backfilled
 

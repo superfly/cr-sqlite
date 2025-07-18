@@ -51,7 +51,7 @@ unsafe fn compact_post_alter(
         SELECT name FROM pragma_table_info('{table_name}')
           WHERE pk > 0 AND name NOT IN
             (SELECT name FROM pragma_index_info('{table_name}__crsql_pks_pks'))
-          UNION SELECT name FROM pragma_index_info('{table_name}__crsql_pks_pks') WHERE name NOT IN 
+          UNION SELECT name FROM pragma_index_info('{table_name}__crsql_pks_pks') WHERE name NOT IN
             (SELECT name FROM pragma_table_info('{table_name}') WHERE pk > 0) AND name != 'col_name'
         );",
         table_name = crate::util::escape_ident_as_value(tbl_name_str),
