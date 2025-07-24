@@ -88,7 +88,14 @@ fn after_update(
         let next_seq = super::bump_seq(ext_data);
         changed = true;
         // Record the delete of the row identified by the old primary keys
-        after_update__mark_old_pk_row_deleted(db, tbl_info, old_key, next_db_version, next_seq, &ts)?;
+        after_update__mark_old_pk_row_deleted(
+            db,
+            tbl_info,
+            old_key,
+            next_db_version,
+            next_seq,
+            &ts,
+        )?;
         let next_seq = super::bump_seq(ext_data);
         // todo: we don't need to this, if there's no existing row (cl is assumed to be 1).
         super::mark_new_pk_row_created(db, tbl_info, new_key, next_db_version, next_seq, &ts)?;

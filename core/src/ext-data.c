@@ -55,10 +55,10 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer) {
   // printf("instantiating pSetDbVersionStmt... current rc: %d\n", rc);
   rc += sqlite3_prepare_v3(
       db,
-      "INSERT OR REPLACE INTO crsql_db_versions (site_id, db_version) VALUES "
+      "INSERT INTO crsql_db_versions (site_id, db_version) VALUES "
       "(?, ?)  ON "
-      "CONFLICT (site_id) DO UPDATE SET db_version = max(excluded.db_version, "
-      "crsql_db_versions.db_version) RETURNING db_version",
+      "CONFLICT (site_id) DO UPDATE SET db_version = excluded.db_version "
+      "WHERE crsql_db_versions.db_version < excluded.db_version RETURNING db_version",
       -1, SQLITE_PREPARE_PERSISTENT, &(pExtData->pSetDbVersionStmt), 0);
 
   // printf("instantiated pSetDbVersionStmt, rc: %d\n", rc);

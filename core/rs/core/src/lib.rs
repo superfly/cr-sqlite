@@ -63,6 +63,7 @@ use core::ffi::{c_int, c_void, CStr};
 use create_crr::create_crr;
 use db_version::{
     crsql_fill_db_version_if_needed, crsql_next_db_version, crsql_peek_next_db_version,
+    insert_db_version,
 };
 use is_crr::*;
 use local_writes::after_delete::x_crsql_after_delete;
@@ -369,34 +370,51 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     }
 
     let rc = db
-    .create_function_v2(
-        "crsql_set_ts",
-        -1,
-        sqlite::UTF8 | sqlite::DETERMINISTIC,
-        Some(ext_data as *mut c_void),
-        Some(x_crsql_set_ts),
-        None,
-        None,
-        None,
-    )
-    .unwrap_or(ResultCode::ERROR);
+        .create_function_v2(
+            "crsql_set_ts",
+            -1,
+            sqlite::UTF8 | sqlite::DETERMINISTIC,
+            Some(ext_data as *mut c_void),
+            Some(x_crsql_set_ts),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
     let rc = db
-    .create_function_v2(
-        "crsql_get_ts",
-        -1,
-        sqlite::UTF8 | sqlite::DETERMINISTIC,
-        Some(ext_data as *mut c_void),
-        Some(x_crsql_get_ts),
-        None,
-        None,
-        None,
-    )
-    .unwrap_or(ResultCode::ERROR);
+        .create_function_v2(
+            "crsql_set_db_version",
+            -1,
+            sqlite::UTF8 | sqlite::DETERMINISTIC,
+            Some(ext_data as *mut c_void),
+            Some(x_crsql_set_db_version),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
+    let rc = db
+        .create_function_v2(
+            "crsql_get_ts",
+            -1,
+            sqlite::UTF8 | sqlite::DETERMINISTIC,
+            Some(ext_data as *mut c_void),
+            Some(x_crsql_get_ts),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
@@ -885,6 +903,40 @@ unsafe extern "C" fn x_crsql_next_db_version(
 
 /**
  * Return the next version of the database for use in inserts/updates/deletes
+ *
+ * `select crsql_set_db_version()`
+ *
+ * This is used to set the db version for a particular site_id.
+ * This is useful for exposing a way for the application to set a db_version
+ * that might not get passed to crsqlite.
+ */
+unsafe extern "C" fn x_crsql_set_db_version(
+    ctx: *mut sqlite::context,
+    argc: i32,
+    argv: *mut *mut sqlite::value,
+) {
+    if argc < 2 {
+        ctx.result_error(
+            "Wrong number of args provided to crsql_set_db_version. Provide the
+        site id and db version.",
+        );
+        return;
+    }
+
+    let args = sqlite::args!(argc, argv);
+    let (site_id, db_version) = (args[0].blob(), args[1].int64());
+    let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+
+    let ret = insert_db_version(ext_data, site_id, db_version);
+    if ret.is_err() {
+        ctx.result_error("Unable to set the db version");
+        return;
+    }
+    ctx.result_text_static("OK");
+}
+
+/**
+ * Return the next version of the database for use in inserts/updates/deletes
  * without updating the the database or value in ext_data.
  *
  * `select crsql_peek_next_db_version()`
@@ -897,7 +949,6 @@ unsafe extern "C" fn x_crsql_peek_next_db_version(
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
     let db = ctx.db_handle();
     let mut err_msg = null_mut();
-
 
     let ret = crsql_peek_next_db_version(db, ext_data, &mut err_msg as *mut _);
     if ret < 0 {

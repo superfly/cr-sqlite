@@ -170,7 +170,13 @@ fn mark_locally_inserted(
                     })
                     .and_then(|_| combo_insert_clock_stmt.bind_int64(offset + 3, db_version))
                     .and_then(|_| combo_insert_clock_stmt.bind_int(offset + 4, seq))
-                    .and_then(|_| combo_insert_clock_stmt.bind_text(offset + 5, ts, sqlite::Destructor::STATIC))
+                    .and_then(|_| {
+                        combo_insert_clock_stmt.bind_text(
+                            offset + 5,
+                            ts,
+                            sqlite::Destructor::STATIC,
+                        )
+                    })
                     .map_err(|code| {
                         format!("failed binding to combo_insert_clock_stmt, code: {code}")
                     })?;
