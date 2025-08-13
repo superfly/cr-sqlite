@@ -129,6 +129,19 @@ def test_empty_update_doesnt_change_db_version():
     db1_db_version = db1.execute("SELECT crsql_db_version()").fetchone()[0]
     assert (db1_db_version == 3)
 
+    # all columns included in update is saved, if any column is changed;
+    db1.execute("UPDATE foo SET a = 10, b = 11 WHERE id = 1")
+    db1.commit()
+
+    db1_db_version = db1.execute("SELECT crsql_db_version()").fetchone()[0]
+    assert (db1_db_version == 4)
+
+    db1_changes = db1.execute("SELECT * FROM crsql_changes").fetchall()
+    assert (db1_changes == [('foo', b'\x01\t\x02', 'a', 5, 1, 2, db1_site_id, 1, 0, '0'),
+                ('foo', b'\x01\t\x02', 'b', 6, 1, 2, db1_site_id, 1, 1, '0'),
+                ('foo', b'\x01\t\x01', 'a', 10, 3, 4, db1_site_id, 1, 0, '0'),
+                ('foo', b'\x01\t\x01', 'b', 11, 3, 4, db1_site_id, 1, 1, '0')])
+
 
 def test_ts_is_inserted():
     def create_db():

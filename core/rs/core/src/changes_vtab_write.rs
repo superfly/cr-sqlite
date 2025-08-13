@@ -196,7 +196,7 @@ fn set_winner_clock(
                     );
 
                     if let Err(rc) = bind_result {
-                        reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt);
+                        reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
                         return Err(rc);
                     }
 

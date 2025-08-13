@@ -114,15 +114,21 @@ fn after_update(
         }
     }
 
-    // now for each non_pk_col we need to do an insert
-    // where new value is not old value
-    for ((new, old), col_info) in non_pks_new
+    // check if no non pk col changed and we can skip the insert.
+    let non_pks_changed = non_pks_new
         .iter()
         .zip(non_pks_old.iter())
-        .zip(tbl_info.non_pks.iter())
-    {
-        if crsql_compare_sqlite_values(*new, *old) != 0 {
-            changed = true;
+        .any(|(new, old)| {
+            crsql_compare_sqlite_values(*new, *old) != 0
+        });
+
+    libc_print::libc_println!("non_pks_changed: {}", non_pks_changed);
+    if non_pks_changed {
+        changed = true;
+
+        for (new, col_info) in non_pks_new.iter().zip(tbl_info.non_pks.iter()) {
+            libc_print::libc_println!("non_pks_changed: {}", col_info.name);
+
             let next_seq = super::bump_seq(ext_data);
             // we had a difference in new and old values
             // we need to track crdt metadata
