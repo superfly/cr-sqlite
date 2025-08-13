@@ -122,13 +122,10 @@ fn after_update(
             crsql_compare_sqlite_values(*new, *old) != 0
         });
 
-    libc_print::libc_println!("non_pks_changed: {}", non_pks_changed);
     if non_pks_changed {
         changed = true;
 
         for (new, col_info) in non_pks_new.iter().zip(tbl_info.non_pks.iter()) {
-            libc_print::libc_println!("non_pks_changed: {}", col_info.name);
-
             let next_seq = super::bump_seq(ext_data);
             // we had a difference in new and old values
             // we need to track crdt metadata
