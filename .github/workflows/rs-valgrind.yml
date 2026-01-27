@@ -29,9 +29,15 @@ jobs:
       - name: Test Fractindex
         run: |
           cd core/rs/fractindex-core
-          cargo valgrind test --features=loadable_extension
+          # Uncomment if u need to generate valgrind suppressions
+          # cargo test --features=loadable_extension
+          # find target/debug/deps/ -type f -executable -name "crsql*" -exec valgrind --leak-check=full --gen-suppressions=all {} \;
+          VALGRINDFLAGS="--suppressions=$GITHUB_WORKSPACE/core/valgrind.supp" cargo valgrind test --features=loadable_extension
 
       - name: Test Core
         run: |
           cd core/rs/core
-          cargo valgrind test --features=loadable_extension
+          # Uncomment if u need to generate valgrind suppressions
+          # cargo test --features=loadable_extension
+          # find target/debug/deps/ -type f -executable -name "crsql*" -exec valgrind --leak-check=full --gen-suppressions=all {} \;
+          VALGRINDFLAGS="--suppressions=$GITHUB_WORKSPACE/core/valgrind.supp" cargo valgrind test --features=loadable_extension 

@@ -211,6 +211,7 @@ $(TARGET_DBG_LOADABLE): $(dbg_prefix) $(ext_files) $(sqlite3.c) $(rs_lib_dbg_loa
 
 # Build a SQLite CLI that pre-loads cr-sqlite.
 # Useful for debugging.
+# With DSQLITE_THREADSAFE!=0, The tests will crash on windows.
 $(TARGET_SQLITE3): $(prefix) $(TARGET_SQLITE3_EXTRA_C) $(rs_lib_dbg_static_cpy) $(shell.c) $(ext_files)
 	$(CC) -g \
 	-DSQLITE_THREADSAFE=0 \
@@ -238,6 +239,7 @@ $(TARGET_STATIC): $(prefix) $(ext_files) $(sqlite3.c) $(rs_lib_static_cpy)
 # Build a normal SQLite CLI that does not include cr-sqlite.
 # cr-sqlite can be laoded in via the `.load` pragma.
 # Useful for debugging.
+# With DSQLITE_THREADSAFE!=0, The tests will crash on windows.
 $(TARGET_SQLITE3_VANILLA): $(prefix) $(shell.c) $(sqlite3.c)
 	$(CC) -g \
 	$(DEFINE_SQLITE_PATH) \
@@ -250,6 +252,7 @@ $(TARGET_SQLITE3_EXTRA_C): $(prefix) $(sqlite3.c) src/core_init.c
 	cat $(sqlite3.c) src/core_init.c > $@
 
 # run tests
+# With DSQLITE_THREADSAFE!=0, The tests will crash on windows.
 $(TARGET_TEST): $(prefix) $(TARGET_SQLITE3_EXTRA_C) src/tests.c src/*.test.c $(ext_files) $(rs_lib_dbg_static_cpy)
 	$(CC) -g -Wall \
 	-DSQLITE_THREADSAFE=0 \
@@ -260,6 +263,7 @@ $(TARGET_TEST): $(prefix) $(TARGET_SQLITE3_EXTRA_C) src/tests.c src/*.test.c $(e
 	$(TARGET_SQLITE3_EXTRA_C) src/tests.c src/*.test.c $(ext_files) $(rs_lib_dbg_static_cpy) \
 	$(LDLIBS) -o $@
 
+# With DSQLITE_THREADSAFE!=0, The tests will crash on windows.
 $(TARGET_TEST_ASAN): $(prefix) $(TARGET_SQLITE3_EXTRA_C) src/tests.c src/*.test.c $(ext_files) $(rs_lib_dbg_static_cpy)
 	$(CC) -fsanitize=address -g -fno-omit-frame-pointer -Wall \
 	-DSQLITE_THREADSAFE=0 \
@@ -270,6 +274,7 @@ $(TARGET_TEST_ASAN): $(prefix) $(TARGET_SQLITE3_EXTRA_C) src/tests.c src/*.test.
 	$(TARGET_SQLITE3_EXTRA_C) src/tests.c src/*.test.c $(ext_files) $(rs_lib_dbg_static_cpy) \
 	$(LDLIBS) -o $@
 
+# With DSQLITE_THREADSAFE!=0, The tests will crash on windows.
 $(TARGET_FUZZ): $(prefix) $(TARGET_SQLITE3_EXTRA_C) src/fuzzer.cc $(ext_files)
 	clang -fsanitize=fuzzer \
 	-DSQLITE_THREADSAFE=0 \
