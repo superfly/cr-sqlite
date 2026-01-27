@@ -13,6 +13,7 @@ crate-type = ["staticlib"]
 [dependencies]
 crsql_bundle = {path="../bundle"}
 
+
 [profile.dev]
 panic = "abort"
 
