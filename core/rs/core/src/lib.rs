@@ -29,6 +29,7 @@ pub mod db_version;
 mod db_version;
 mod debug;
 mod ext_data;
+mod force_update;
 mod is_crr;
 mod local_writes;
 #[cfg(feature = "test")]
@@ -686,6 +687,40 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         return null_mut();
     }
 
+    let rc = db
+        .create_function_v2(
+            "crsql_enable_force_update_mode",
+            0,
+            sqlite::UTF8,
+            Some(ext_data as *mut c_void),
+            Some(x_crsql_enable_force_update_mode),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(sqlite::ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
+    let rc = db
+        .create_function_v2(
+            "crsql_disable_force_update_mode",
+            0,
+            sqlite::UTF8,
+            Some(ext_data as *mut c_void),
+            Some(x_crsql_disable_force_update_mode),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(sqlite::ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
     return ext_data as *mut c_void;
 }
 
@@ -1233,6 +1268,50 @@ unsafe extern "C" fn x_crsql_sync_bit(
     *sync_bit_ptr = new_value;
 
     ctx.result_int(*sync_bit_ptr);
+}
+
+/**
+ * Enable force update mode. All writes within the transaction will be treated
+ * as delete+recreate with higher CL values to force the update to win.
+ * 
+ * MUST be called within a transaction. Will fail if called outside a transaction.
+ * Force update mode is automatically disabled when the transaction commits or rolls back.
+ *
+ * `select crsql_enable_force_update_mode()`
+ */
+unsafe extern "C" fn x_crsql_enable_force_update_mode(
+    ctx: *mut sqlite::context,
+    _argc: i32,
+    _argv: *mut *mut sqlite::value,
+) {
+    let db = ctx.db_handle();
+    
+    // Check if we're in a transaction
+    let in_transaction = sqlite_nostd::get_autocommit(db) == 0;
+    
+    if !in_transaction {
+        ctx.result_error("force update mode can only be enabled within a transaction. Use BEGIN before enabling.");
+        return;
+    }
+    
+    let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+    (*ext_data).forceUpdateMode = 1;
+    ctx.result_text_static("force update mode enabled");
+}
+
+/**
+ * Disable force update mode. Writes will behave normally.
+ *
+ * `select crsql_disable_force_update_mode()`
+ */
+unsafe extern "C" fn x_crsql_disable_force_update_mode(
+    ctx: *mut sqlite::context,
+    _argc: i32,
+    _argv: *mut *mut sqlite::value,
+) {
+    let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+    (*ext_data).forceUpdateMode = 0;
+    ctx.result_text_static("force update mode disabled");
 }
 
 #[no_mangle]

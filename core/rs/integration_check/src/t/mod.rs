@@ -1,5 +1,6 @@
 pub mod automigrate;
 pub mod backfill;
+pub mod force_update_mode;
 pub mod fract;
 pub mod pack_columns;
 pub mod pk_only_tables;

@@ -8,6 +8,7 @@ use sqlite_nostd as sqlite;
 
 use crate::compare_values::crsql_compare_sqlite_values;
 use crate::{c::crsql_ExtData, tableinfo::TableInfo};
+use crate::force_update;
 
 use super::trigger_fn_preamble;
 
@@ -78,6 +79,20 @@ fn after_update(
         .get_or_create_key_via_raw_values(db, pks_new)
         .map_err(|_| "failed getting or creating lookaside key")?;
 
+    // Force update mode: treat all updates as delete + recreate
+    if force_update::is_force_update_mode_enabled(ext_data) {
+        return handle_force_update(
+            db,
+            ext_data,
+            tbl_info,
+            pks_new,
+            pks_old,
+            new_key,
+            next_db_version,
+            &ts,
+        );
+    }
+
     let mut changed = false;
     // Changing a primary key column to a new value is the same thing as deleting the row
     // previously identified by the primary key.
@@ -146,6 +161,67 @@ fn after_update(
         tbl_info.set_cl(old_key, cl);
     }
 
+    Ok(ResultCode::OK)
+}
+
+/// Handle update in force update mode by treating it as delete + recreate
+fn handle_force_update(
+    db: *mut sqlite3,
+    ext_data: *mut crsql_ExtData,
+    tbl_info: &mut TableInfo,
+    pks_new: &[*mut value],
+    pks_old: &[*mut value],
+    new_key: sqlite::int64,
+    next_db_version: i64,
+    ts: &str,
+) -> Result<ResultCode, String> {
+    // Get current CL for the row
+    let current_cl = force_update::get_current_cl_for_key(db, tbl_info, new_key)?;
+    
+    // Check if primary key changed
+    let pk_changed = crate::compare_values::any_value_changed(pks_new, pks_old)?;
+    
+    if pk_changed {
+        // Handle PK change: delete old, create new
+        let old_key = tbl_info
+            .get_or_create_key_via_raw_values(db, pks_old)
+            .map_err(|_| "failed getting or creating lookaside key for old pks")?;
+        
+        let old_cl = force_update::get_current_cl_for_key(db, tbl_info, old_key)?;
+        let delete_cl = force_update::get_forced_delete_cl(old_cl);
+        
+        let next_seq = super::bump_seq(ext_data);
+        let cl = super::mark_locally_deleted(db, tbl_info, old_key, next_db_version, next_seq, ts)?;
+        tbl_info.set_cl(old_key, cl);
+        
+        // Create new row with forced CL
+        let new_cl = force_update::get_forced_cl(0); // New row starts at CL 1
+        let next_seq = super::bump_seq(ext_data);
+        let cl = super::mark_new_pk_row_created(db, tbl_info, new_key, next_db_version, next_seq, ts)?;
+        tbl_info.set_cl(new_key, cl);
+        
+        // Mark all non-pk columns as inserted
+        super::mark_locally_inserted(db, ext_data, tbl_info, new_key, next_db_version, ts)?;
+    } else {
+        // No PK change: force delete + recreate at same key
+        let delete_cl = force_update::get_forced_delete_cl(current_cl);
+        let next_seq = super::bump_seq(ext_data);
+        let cl = super::mark_locally_deleted(db, tbl_info, new_key, next_db_version, next_seq, ts)?;
+        tbl_info.set_cl(new_key, cl);
+        
+        // Recreate with forced CL
+        let create_cl = force_update::get_forced_cl(delete_cl);
+        let next_seq = super::bump_seq(ext_data);
+        let cl = super::mark_new_pk_row_created(db, tbl_info, new_key, next_db_version, next_seq, ts)?;
+        tbl_info.set_cl(new_key, cl);
+        
+        // Mark all non-pk columns as inserted
+        super::mark_locally_inserted(db, ext_data, tbl_info, new_key, next_db_version, ts)?;
+    }
+    
+    // Actually bump the db_version since we made changes
+    crate::db_version::next_db_version(db, ext_data)?;
+    
     Ok(ResultCode::OK)
 }
 

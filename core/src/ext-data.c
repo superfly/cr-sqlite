@@ -91,6 +91,7 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
 
   // set defaults!
   pExtData->mergeEqualValues = 0;
+  pExtData->forceUpdateMode = 0;
 
   while (sqlite3_step(pStmt) == SQLITE_ROW) {
     const unsigned char *name = sqlite3_column_text(pStmt, 0);

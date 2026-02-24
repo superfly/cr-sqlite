@@ -49,6 +49,14 @@ struct crsql_ExtData {
   int mergeEqualValues;
   unsigned long long timestamp;
   void *ordinalMap;
+  // Enables force update mode for all changes in the current transaction
+  // This forces all changes to be treated as a DELETE+INSERT pair
+  // This is implemented by setting the causal length (CL) of the row to a higher value
+  // than the currently highest CL for the given row, ensuring updates win in conflict resolution
+  // Only use this if the database is in an inconsistent state and you want to force some rows to be updated
+  // REGARDLESS of their current state across all replicas.
+  // For ex. this can be used in a repair scenario after cr-sqlite triggers went missing due to accidental schema changes
+  int forceUpdateMode;
 };
 
 crsql_ExtData *crsql_newExtData(sqlite3 *db);

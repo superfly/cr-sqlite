@@ -34,6 +34,8 @@ pub unsafe fn commit_or_rollback_reset(ext_data: *mut crsql_ExtData) {
     (*ext_data).seq = 0;
     (*ext_data).timestamp = 0;
     (*ext_data).updatedTableInfosThisTx = 0;
+    // Disable force update mode on transaction end
+    (*ext_data).forceUpdateMode = 0;
 
     let mut ordinals: mem::ManuallyDrop<Box<BTreeMap<Vec<u8>, i64>>> = mem::ManuallyDrop::new(
         Box::from_raw((*ext_data).ordinalMap as *mut BTreeMap<Vec<u8>, i64>),
