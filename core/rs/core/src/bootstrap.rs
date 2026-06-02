@@ -237,11 +237,6 @@ pub fn create_clock_table(
 
     db.exec_safe(
         &format!(
-        "CREATE INDEX IF NOT EXISTS \"{table_name}__crsql_clock_dbv_idx\" ON \"{table_name}__crsql_clock\" (\"site_id\", \"db_version\")",
-        table_name = crate::util::escape_ident(table_name),
-        ))?;
-    db.exec_safe(
-        &format!(
         "CREATE TABLE IF NOT EXISTS \"{table_name}__crsql_pks\" (__crsql_key INTEGER PRIMARY KEY, {pk_list})",
         table_name = table_name,
         pk_list = pk_list,

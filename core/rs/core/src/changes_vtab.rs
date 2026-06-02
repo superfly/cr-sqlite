@@ -145,7 +145,6 @@ fn changes_best_index(
     // manual null-term since we'll pass to C
     str.push('\0');
 
-    // TODO: update your order by py test to explain query plans to ensure correct indices are selected
     // both constraints are present. Also to check that order by is consumed.
     if idx_num & 6 == 6 {
         unsafe {
