@@ -2,7 +2,6 @@ use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
 use core::{
     ffi::{c_int, c_void},
     mem,
-    ptr::null,
 };
 
 use sqlite_nostd::ResultCode;
@@ -23,10 +22,13 @@ pub unsafe extern "C" fn crsql_commit_hook(user_data: *mut c_void) -> c_int {
     ResultCode::OK as c_int
 }
 
+// SQLite's rollback-hook callback is `void(*)(void*)` (see sqlite3.h and the C decl in
+// crsqlite.c). Returning a value gave this function the wasm type `(i32)->i32`, which
+// mismatches the `(i32)->void` `call_indirect` in sqlite3RollbackAll and traps under the
+// staticlib WASM build. Return void to match.
 #[no_mangle]
-pub unsafe extern "C" fn crsql_rollback_hook(user_data: *mut c_void) -> *const c_void {
+pub unsafe extern "C" fn crsql_rollback_hook(user_data: *mut c_void) {
     commit_or_rollback_reset(user_data as *mut crsql_ExtData);
-    null()
 }
 
 pub unsafe fn commit_or_rollback_reset(ext_data: *mut crsql_ExtData) {
