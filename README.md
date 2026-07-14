@@ -1,288 +1,218 @@
-# cr-sqlite - Convergent, Replicated, SQLite
+# cr-sqlite (Fly.io Fork)
 
-[![c-tests](https://github.com/vlcn-io/cr-sqlite/actions/workflows/c-tests.yaml/badge.svg)](https://github.com/vlcn-io/cr-sqlite/actions/workflows/c-tests.yaml)
-[![c-valgrind](https://github.com/vlcn-io/cr-sqlite/actions/workflows/c-valgrind.yaml/badge.svg)](https://github.com/vlcn-io/cr-sqlite/actions/workflows/c-valgrind.yaml)
-[![py-tests](https://github.com/vlcn-io/cr-sqlite/actions/workflows/py-tests.yaml/badge.svg)](https://github.com/vlcn-io/cr-sqlite/actions/workflows/py-tests.yaml)
-[![rs-tests](https://github.com/vlcn-io/cr-sqlite/actions/workflows/rs-tests.yml/badge.svg)](https://github.com/vlcn-io/cr-sqlite/actions/workflows/rs-tests.yml)
+A [run-time loadable extension](https://www.sqlite.org/loadext.html) for [SQLite](https://www.sqlite.org/index.html) that adds multi-master replication via conflict-free replicated data types (CRDTs). This is a fork of [vlcn-io/cr-sqlite](https://github.com/vlcn-io/cr-sqlite), maintained by [Fly.io](https://fly.io) and used as the replication engine for [Corrosion](https://github.com/superfly/corrosion), a distributed SQLite database.
 
-A component of the [vulcan](https://vlcn.io) project.
+## Relationship to Upstream
 
-[![](https://dcbadge.vercel.app/api/server/AtdVY6zDW3)](https://discord.gg/AtdVY6zDW3)
+This fork diverges from upstream cr-sqlite v0.15.0 and introduces significant, breaking changes to the change bookkeeping model. The current version is **0.17.0**. Databases created with cr-sqlite < 0.17.0 are not supported and must be migrated.
 
-# Examples
+The core CRDT approach (history-free, last-write-wins per column, causal length sets) remains the same. The differences are in **how changes are tracked, timestamped, and replicated**.
 
-Example applications using cr-sqlite to sync state.
+## Key Changes from Upstream
 
-- Vite starter - [Example](https://vite-starter2.fly.dev/) | [Repository](https://github.com/vlcn-io/vite-starter)
-- TodoMVC - [Example](https://vlcn-live-examples.fly.dev/) | [Repository](https://github.com/vlcn-io/live-examples)
-- [Svelte Store](https://github.com/Azarattum/CRStore)
-- [Tutorials](https://vlcn.io/docs/cr-sqlite/networking/whole-crr-sync)
-- [WIP Local-First Presentation Editor](https://github.com/tantaman/strut)
-- Basic setup & sync via an [Observable Notebook](https://observablehq.com/@tantaman/cr-sqlite-basic-setup)
+### Per-Site DB Version Tracking
 
-# "It's like Git, for your data."
-
-CR-SQLite is a [run-time loadable extension](https://www.sqlite.org/loadext.html) for [SQLite](https://www.sqlite.org/index.html) and [libSQL](https://github.com/libsql/libsql). It allows merging different SQLite databases together that have taken independent writes.
-
-In other words, you can write to your SQLite database while offline. I can write to mine while offline. We can then both come online and merge our databases together, without conflict.
-
-**In technical terms:** cr-sqlite adds multi-master replication and partition tolerance to SQLite via conflict free replicated data types ([CRDTs](https://en.wikipedia.org/wiki/Conflict-free_replicated_data_type)) and/or causally ordered event logs.
-
-# When is this useful?
-
-1. Syncing data between devices
-2. Implementing realtime collaboration
-3. Offline editing
-4. Being resilient to network conditions
-5. Enabling instantaneous interactions
-
-All of the above involve a merging of independent edits problem. If your database can handle this for you, you don't need custom code in your application to handle those 5 cases.
-
-Discussions of these problems in the application space:
-
-- [Meta Muse](https://museapp.com/podcast/56-sync/)
-- [FB Messenger re-write](https://softwareengineeringdaily.com/2020/03/31/facebook-messenger-engineering-with-mohsen-agsen/)
-
-# Sponsors
-
-Companies:
-<a href="https://turso.tech"><img src="https://images.ctfassets.net/8fv5t5my8687/01j7yaLj77zqmYK62Y49g7/aee841e7bd176864aa5388448db0f8ef/iku-turquoise.svg" width="64" /></a> <a href="https://fly.io"><img src="https://fly.io/static/images/brand/brandmark.svg" height="64" /></a> <a href="https://reflect.app/"><img src="https://reflect.app/_next/image?url=%2Fsite%2Ficons%2F1024x1024.png&w=64&q=100" /></a><a href="https://expo.dev"><img src="https://avatars.githubusercontent.com/u/12504344?s=200&v=4" width="64" /></a> <a href="https://electric-sql.com"><img width="108" alt="Screenshot 2023-11-16 at 8 29 27 AM" src="https://github.com/vlcn-io/cr-sqlite/assets/1009003/5c0c8ab3-005a-4b03-ba0a-de7ed213e26d"></a>
-
-Individuals:
-[robinvasan](https://github.com/robinvasan) | [iansinnott](https://github.com/iansinnott) | [davefowler](https://github.com/davefowler) | [barbalex](https://github.com/barbalex) | [MohannadNaj](https://github.com/MohannadNaj)
-
-# Perf
-
-Perf data: https://github.com/vlcn-io/cr-sqlite/blob/main/py/perf/perf.ipynb
-
-- Currently inserts into CRRs are 2.5x slower than inserts into regular SQLite tables.
-- Reads are the same speed
-
-# Usage
-
-The full documentation site is available [here](https://vlcn.io/docs).
-
-`crsqlite` exposes three main APIs:
-
-- A function extension (`crsql_as_crr`) to upgrade existing tables to "crrs" or "conflict free replicated relations"
-  - `SELECT crsql_as_crr('table_name')`
-- A virtual table (`crsql_changes`) to ask the database for changesets or to apply changesets from another database
-  - `SELECT "table", "pk", "cid", "val", "col_version", "db_version", "site_id", cl, seq FROM crsql_changes WHERE db_version > x AND site_id = crsql_site_id()` -- to get local changes
-  - `SELECT "table", "pk", "cid", "val", "col_version", "db_version", "site_id", cl, seq FROM crsql_changes WHERE db_version > x AND site_id != some_site_id` -- to get all changes excluding those synced from some actor
-  - `INSERT INTO crsql_changes VALUES ([patches received from select on another peer])`
-- And `crsql_begin_alter('table_name')` & `crsql_alter_commit('table_name')` primitives to allow altering table definitions that have been upgraded to `crr`s.
-  - Until we move forward with extending the syntax of SQLite to be CRR aware, altering CRRs looks like:
-    ```sql
-    SELECT crsql_begin_alter('table_name');
-    -- 1 or more alterations to `table_name`
-    ALTER TABLE table_name ...;
-    SELECT crsql_commit_alter('table_name');
-    ```
-    A future version of cr-sqlite may extend the SQL syntax to make this more natural.
-
-Application code uses the function extension to enable crr support on tables.
-
-Networking code uses the `crsql_changes` virtual table to fetch and apply changes.
-
-Usage looks like:
+Upstream cr-sqlite maintains a single global `db_version` counter. This fork introduces a `crsql_db_versions` table that tracks the latest `db_version` seen from **each site** (actor):
 
 ```sql
--- load the extension if it is not statically linked
+CREATE TABLE crsql_db_versions (site_id BLOB NOT NULL PRIMARY KEY, db_version INTEGER NOT NULL);
+```
+
+Unlike upstream cr-sqlite, which provides some built-in peer tracking via `crsql_tracked_peers`, this fork expects the **application** to handle all bookkeeping — gap detection, seq tracking, and buffering — outside the extension. The extension only tracks the latest `db_version` seen per site in `crsql_db_versions`. Corrosion implements this bookkeeping with:
+- `__corro_bookkeeping_gaps` — tracks missing db_version ranges per peer
+- `__corro_seq_bookkeeping` — tracks which seq ranges have been received within each db_version
+- `__corro_buffered_changes` — buffers partial transactions (individual changes from a db_version whose seqs haven't all arrived yet) until the full transaction can be applied
+
+New SQL functions:
+
+- **`crsql_peek_next_db_version()`** — Returns the next db_version without incrementing it. Used to inspect what the next version will be before writes happen.
+- **`crsql_set_db_version(site_id, db_version)`** — Sets the db_version for a specific remote site. Used when applying changes from a peer to record how far we've synced from that peer, even if no changes won the merge.
+
+The `crsql_next_db_version()` function no longer accepts a `merging_version` argument (breaking change). The db_version is now committed to storage immediately when computed, rather than only at transaction commit.
+
+#### Important: seqs can disappear from a db_version
+
+`db_version`s are monotonic per peer, and site_id ordinal 0 is always the local node. The clock table uses `PRIMARY KEY (key, col_name)`, so when a newer write updates the same column of the same row, it **replaces** the old clock entry — the old `db_version` and `seq` for that column are gone.
+
+This means that when querying `crsql_changes WHERE db_version = X AND site_id = Y`, some seqs may be missing even though the version was fully written. For example, if db_version X originally produced seqs 0-10 for site_id Y, but a newer write superseded the value at (X, 5), querying for db_version X will return seqs 0-4 and 6-10 — seq 5 is gone because it got supersceded by a newer write (the extension is history-free, so old clock entries are not retained).
+
+Applications must treat a version as **complete** even when some seqs are missing, since those seqs were superseded by newer writes. In the extreme case, all seqs in a db_version can be missing — the version is effectively empty because every column it touched has since been overwritten. Corrosion handles this by sending metadata indicating whether a given version is fully complete (no missing seqs due to network fragmentation).
+
+### Timestamps (`ts` column)
+
+Every change record now carries a timestamp. A `ts TEXT NOT NULL DEFAULT '0'` column has been added to all `__crsql_clock` tables and to the `crsql_changes` virtual table. The timestamp is set per-transaction via a new SQL function:
+
+```sql
+SELECT crsql_set_ts('1719878400000');
+-- subsequent writes in this transaction will record this timestamp
+INSERT INTO foo VALUES (1, 'bar');
+```
+
+The timestamp is stored as a string representation of a `u64`. The value itself is an NTP64 timestamp — in Corrosion, this is the physical-time component extracted from a [Hybrid Logical Clock](https://www.cse.iitb.ac.in/~br/publications/2014-saurabh-mtech-thesis.pdf) (`uhlc::HLC`), which combines wall-clock time with a logical counter to maintain causal ordering while staying close to real time. This enables time-based retention policies — the Corrosion reaper uses `ts` to garbage-collect tombstones (delete sentinel rows) older than a configurable retention period.
+
+The current timestamp for a transaction can be read with `crsql_get_ts()`.
+
+### In-Memory Caching
+
+This fork introduces several in-memory caches to avoid repeated lookups during merges and local writes. All caches are scoped to a transaction and cleared on commit/rollback (including savepoint rollback via `xRollbackTo`).
+
+- **Site ordinal cache**: A `BTreeMap<site_id, ordinal>` on `ExtData` avoids repeated lookups to `crsql_site_id` during merge operations. Triggers on the `crsql_site_id` table keep this cache in sync when rows are inserted, updated, or deleted directly — a new `crsql_update_site_id(site_id, ordinal)` function updates the `BTreeMap` in-memory (it does not write to persistent storage; the `crsql_site_id` table is the source of truth). This allows external tooling (e.g., Corrosion's `corro-admin`) to manipulate site IDs directly in the table without reloading the extension.
+- **Causal length cache**: Causal lengths (cl) are cached per-transaction in a `BTreeMap` on each `TableInfo`, with a configurable max size (currently 1500 entries). This avoids repeated lookups to the clock table for the sentinel row during merges and local writes.
+- **Last db versions map**: A `BTreeMap<site_id, db_version>` on `ExtData` tracks the highest db_version inserted per site during merge transactions, avoiding redundant writes to `crsql_db_versions`.
+
+Proper SQLite commit and rollback hooks are registered to manage the cache lifecycle. On commit, `pendingDbVersion` becomes `dbVersion`. On rollback, all caches are cleared.
+
+### Clock Table Schema Changes
+
+The `__crsql_clock` table schema is now:
+
+```sql
+CREATE TABLE "table_name__crsql_clock" (
+  key INTEGER NOT NULL,
+  col_name TEXT NOT NULL,
+  col_version INTEGER NOT NULL,
+  db_version INTEGER NOT NULL,
+  site_id INTEGER NOT NULL DEFAULT 0,
+  seq INTEGER NOT NULL,
+  ts TEXT NOT NULL DEFAULT '0',
+  PRIMARY KEY (key, col_name)
+) WITHOUT ROWID, STRICT;
+```
+
+The db_version index has changed from `(db_version)` to `(site_id, db_version)` to optimize per-site change queries.
+
+### Optimized Local Write Path
+
+Local writes (insert/update/delete triggers) have been significantly reworked:
+
+- **Insert**: Uses a new `mark_locally_inserted` function that tries an `UPDATE` on clock rows first, then falls back to `INSERT` only for columns where the update was a no-op (detected via `sqlite3_changes64()`). A combo-insert fast path batches all column inserts into a single statement when none of the updates hit existing rows.
+- **Update**: Uses `peek_next_db_version()` to avoid incrementing the version if nothing actually changed. Only calls `next_db_version()` (which writes to storage) if at least one column value differed.
+- **Delete**: The `mark_locally_deleted` statement now returns the new causal length via `RETURNING`, which is cached in the cl cache.
+- **PK change**: When a primary key changes during an update, non-sentinel clock rows are moved from the old key to the new key via `UPDATE OR REPLACE`, preserving their col_version (so they can override values at downstream nodes).
+
+### Merge Write Path Changes
+
+- `set_winner_clock` now takes an `insert_ts` parameter and binds it to the clock table.
+- `zero_clocks_on_resurrect` no longer sets `db_version` during resurrect (only zeroes `col_version`).
+- `merge_sentinel_only_insert` now accepts and binds `remote_ts`.
+- After any merge (win or lose), `insert_db_version` is called to update `crsql_db_versions` for the remote site.
+- The merge code is restructured to handle all three cases (sentinel-only, resurrect, normal) in a unified path.
+
+### New SQL Functions
+
+| Function | Description |
+|---|---|
+| `crsql_set_ts(ts)` | Set the timestamp for the current transaction (string u64) |
+| `crsql_get_ts()` | Get the current transaction's timestamp |
+| `crsql_peek_next_db_version()` | Peek at the next db_version without incrementing |
+| `crsql_set_db_version(site_id, db_version)` | Set the db_version for a specific site |
+| `crsql_set_debug(enabled)` | Enable/disable debug logging |
+| `crsql_version()` | Return the cr-sqlite version integer (re-enabled; was commented out upstream) |
+
+### Other Changes
+
+- **Debug logging**: A `crsql_set_debug(1)` function enables `libc_print`-based debug output.
+- **ASAN support**: Added `make asan` target with proper Rust sanitizer flags.
+- **Config lifetime fix**: `crsql_config_set` now properly manages the statement lifetime to prevent use-after-free of returned values.
+- **`crsql_changes` schema**: The `crsql_changes` virtual table now includes a `ts` column (column index 9).
+
+## Usage
+
+```sql
+-- load the extension
 .load crsqlite
 .mode qbox
+
 -- create tables as normal
-create table foo (a primary key not null, b);
-create table baz (a primary key not null, b, c, d);
+CREATE TABLE foo (a PRIMARY KEY NOT NULL, b);
+CREATE TABLE baz (a PRIMARY KEY NOT NULL, b, c, d);
 
--- update those tables to be crrs / crdts
-select crsql_as_crr('foo');
-select crsql_as_crr('baz');
+-- upgrade tables to be CRRs (conflict-free replicated relations)
+SELECT crsql_as_crr('foo');
+SELECT crsql_as_crr('baz');
 
--- insert some data / interact with tables as normal
-insert into foo (a,b) values (1,2);
-insert into baz (a,b,c,d) values ('a', 'woo', 'doo', 'daa');
+-- optionally set a timestamp for this transaction
+SELECT crsql_set_ts('1719878400000');
 
--- ask for a record of what has changed
-select "table", "pk", "cid", "val", "col_version", "db_version", "site_id", "cl", "seq" from crsql_changes;
+-- insert data as normal
+INSERT INTO foo (a, b) VALUES (1, 2);
+INSERT INTO baz (a, b, c, d) VALUES ('a', 'woo', 'doo', 'daa');
 
-┌───────┬─────────────┬─────┬───────┬─────────────┬────────────┬──────────────────────────────────────┬────┬─────┐
-│ table │     pk      │ cid │  val  │ col_version │ db_version │ "site_id" │ cl │ seq │
-├───────┼─────────────┼─────┼───────┼─────────────┼────────────┼──────────────────────────────────────┼────┼─────┤
-│ 'foo' │ x'010901'   │ 'b' │ 2     │ 1           │ 1          │ x'049c48eadf4440d7944ed9ec88b13ea5'  │ 1  │ 0   │
-│ 'baz' │ x'010b0161' │ 'b' │ 'woo' │ 1           │ 2          │ x'049c48eadf4440d7944ed9ec88b13ea5'  │ 1  │ 0   │
-│ 'baz' │ x'010b0161' │ 'c' │ 'doo' │ 1           │ 2          │ x'049c48eadf4440d7944ed9ec88b13ea5'  │ 1  │ 1   │
-│ 'baz' │ x'010b0161' │ 'd' │ 'daa' │ 1           │ 2          │ x'049c48eadf4440d7944ed9ec88b13ea5'  │ 1  │ 2   │
-└───────┴─────────────┴─────┴───────┴─────────────┴────────────┴──────────────────────────────────────┴────┴─────┘
+-- fetch changes (note the ts column)
+SELECT "table", "pk", "cid", "val", "col_version", "db_version", "site_id", "cl", "seq", "ts"
+  FROM crsql_changes
+  WHERE db_version > 0 AND site_id = crsql_site_id();
 
--- merge changes from a peer
-insert into crsql_changes
-  ("table", "pk", "cid", "val", "col_version", "db_version", "site_id", "cl", "seq")
-  values
-  ('foo', x'010905', 'b', 'thing', 5, 5, X'7096E2D505314699A59C95FABA14ABB5', 1, 0);
-insert into crsql_changes ("table", "pk", "cid", "val", "col_version", "db_version", "site_id", "cl", "seq")
-  values
-  ('baz', x'010b0161', 'b', 123, 101, 233, X'7096E2D505314699A59C95FABA14ABB5', 1, 0);
+-- apply changes from a peer
+INSERT INTO crsql_changes
+  ("table", "pk", "cid", "val", "col_version", "db_version", "site_id", "cl", "seq", "ts")
+  VALUES
+  ('foo', x'010905', 'b', 'thing', 5, 5, X'7096E2D505314699A59C95FABA14ABB5', 1, 0, '1719878400000');
 
--- check that peer's changes were applied
-sqlite> select * from foo;
-┌───┬─────────┐
-│ a │    b    │
-├───┼─────────┤
-│ 1 │ 2       │
-│ 5 │ 'thing' │
-└───┴─────────┘
-
-select * from baz;
-┌─────┬─────┬───────┬───────┐
-│  a  │  b  │   c   │   d   │
-├─────┼─────┼───────┼───────┤
-│ 'a' │ 123 │ 'doo' │ 'daa' │
-└─────┴─────┴───────┴───────┘
-
--- tear down the extension before closing the connection
--- https://sqlite.org/forum/forumpost/c94f943821
-select crsql_finalize();
+-- tear down before closing the connection
+SELECT crsql_finalize();
 ```
 
-# Packages
-
-Pre-built binaries of the extension are available in the [releases section](https://github.com/vlcn-io/cr-sqlite/releases).
-
-These can be loaded into `sqlite` via the [`load_extension` command](https://www.sqlite.org/loadext.html#loading_an_extension) from any language (Python, NodeJS, C++, Rust, etc.) that has SQLite bindings.
-
-The entrypoint to the loadable extension is [`sqlite3_crsqlite_init` ](https://github.com/vlcn-io/cr-sqlite/blob/92df9b4f3a6bdf2bd7c5d9a76949496fa5dc88cf/core/src/crsqlite.c#L536) so you'll either need to provide that to `load_extension` or rename your binary to `crsqlite.[dylib/dll/so]`. See the linked sqlite [`load_extension` docs](https://www.sqlite.org/loadext.html#loading_an_extension).
-
-```
-load_extension(extension_path, 'sqlite3_crsqlite_init')
-```
-
-> Note: if you're using `cr-sqlite` as a run time loadable extension, loading the extension should be the _first_ operation you do after opening a connection to the database. The extension needs to be loaded on every connection you create.
-
-For a WASM build that works in the browser, see the [js](https://github.com/vlcn-io/js) directory.
-
-For UI integrations (e.g., React) see the [js](https://github.com/vlcn-io/js) directory.
-
-# How does it work?
-
-There are two approaches with very different tradeoffs. Both will eventually be supported by `cr-sqlite`. `v1` (and current releases) support the first approach. `v2` will support both approaches.
-
-## Approach 1: History-free CRDTs
-
-Approach 1 is characterized by the following properties:
-
-1. Keeps no history / only keeps the current state
-2. Automatically handles merge conflicts. No options for manual merging.
-3. Tables are Grow Only Sets or variants of Observe-Remove Sets
-4. Rows are maps of CRDTs. The column names being the keys, column values being a specific CRDT type
-5. Columns can be counter, fractional index or last write wins CRDTs.
-   1. multi-value registers, RGA and others to come in future iterations
-
-Tables which should be synced are defined as a composition of other types of CRDTs.
-
-Example table definition:
+### Altering CRR Tables
 
 ```sql
-CREATE CLSet post (
- id INTEGER PRIMARY KEY NOT NULL,
- views COUNTER,
- content PERITEXT,
- owner_id LWW INTEGER
-);
+SELECT crsql_begin_alter('table_name');
+-- 1 or more alterations
+ALTER TABLE table_name ...;
+SELECT crsql_commit_alter('table_name');
 ```
 
-> note: given that extensions can't extend the SQLite syntax this is notional. We are, however, extending the libSQL syntax so this will be available in that fork. In base SQLite you'd run the `select crsql_as_crr` function as seen earlier.
+## How It Is Used in Corrosion
 
-- CLSet - [causal length set](https://dl.acm.org/doi/pdf/10.1145/3380787.3393678)
-- COUNTER - [distributed counter](https://www.cs.utexas.edu/~rossbach/cs380p/papers/Counters.html)
-- PERITEXT - [collaborative text](https://www.inkandswitch.com/peritext/)
+[Corrosion](https://github.com/superfly/corrosion) is a distributed, eventually-consistent SQLite database. It embeds cr-sqlite as a loadable extension (with pre-built binaries bundled for darwin-aarch64, linux-x86_64, and linux-aarch64) and builds a full clustering layer on top:
 
-Under approach 1, merging two tables works roughly like so:
+- **Actor identity**: Corrosion uses `crsql_site_id()` as the actor ID in its cluster. The `crsql_site_id` table (with ordinals) maps to Corrosion's actor tracking.
+- **Change extraction**: Corrosion queries `crsql_changes` filtered by `db_version` and `site_id` to extract changesets for broadcast to peers. It uses `crsql_peek_next_db_version()` to determine the version before writes are committed, then queries `MAX(seq)` and `MAX(ts)` to track the last sequence and timestamp per version.
+- **Change application**: Remote changesets are inserted into `crsql_changes` in bulk (via `unnest` for batch inserts). Corrosion uses `crsql_rows_impacted()` to verify that merges actually affected rows.
+- **Timestamps**: Corrosion uses a Hybrid Logical Clock (HLC) and calls `crsql_set_ts()` before each transaction to stamp changes with an NTP64 timestamp. This enables the reaper to garbage-collect tombstones based on age.
+- **Per-site version tracking**: Corrosion uses the `crsql_db_versions` table to track the latest `db_version` received from each peer. When processing incomplete or buffered changes, it calls `crsql_set_db_version(site_id, version)` to advance the tracked version even when no changes won the merge.
+- **Schema management**: Corrosion uses `crsql_as_crr()` to register tables and `crsql_begin_alter()` / `crsql_commit_alter()` for schema migrations. When migrating from older cr-sqlite versions that lacked the `(site_id, db_version)` index on clock tables, it creates `corro_{table}__crsql_clock_site_id_dbv` indexes.
+- **Buffered changes & gap tracking**: Corrosion handles two kinds of gaps. Missing **db_versions** from a peer are tracked in `__corro_bookkeeping_gaps`. Partial transactions (a db_version split across multiple messages with missing **seqs**) are buffered in `__corro_buffered_changes` (same schema as `crsql_changes`), with received seq ranges tracked in `__corro_seq_bookkeeping`. Once all seqs for a db_version are received, the changes are applied to `crsql_changes` in bulk.
+- **Reaper**: A background reaper process uses the `ts` column to find tombstones (delete sentinel rows where `col_name = -1 AND col_version % 2 = 0 AND ts < cutoff`) and cleans them up along with orphaned entries in `__crsql_clock` and `__crsql_pks`.
+- **Config**: Corrosion enables `crsql_config_set('merge-equal-values', 1)` to optimize merges where values are equal.
+- **Migration**: Corrosion includes a `crsqlite_v0_17_migration` that adds the `ts` column to existing clock tables and recreates indexes.
 
-1. Rows are identified by primary key
-2. Tables are unioned (and a delete log is consulted) such that both tables will have the same rows.
+## Building
 
-If a row was modified in multiple places, then we merge the row. Merging a row involves merging each column of that row according to the semantics of the CRDT for the column.
+You'll need Rust (nightly toolchain required).
 
-1. Last-write wins just picks the lastest write
-2. Counter CRDT sums the values
-3. Multi-value registers keep all conflicting values
-4. Fractional indices are taken as last write
-
-For more background see [this post](https://vlcn.io/blog/gentle-intro-to-crdts.html).
-
-Notes:
-
-- LWW, Fractional Index, Observe-Remove sets are available now.
-- Counter and rich-text CRDTs are still [being implemented](https://github.com/vlcn-io/cr-sqlite/issues/65).
-- Custom SQL syntax will be available in our libSQL integration. The SQLite extension requires a slightly different syntax than what is depicted above.
-
-## Approach 2: Causal Event Log
-
-> To be implemented in v2 of cr-sqlite
-
-Approach 2 has the following properties:
-
-1. A history of every modification that happens to the database is kept
-   1. This history can be garbage collected in certain network topologies
-2. Merge conflicts can be automatically handled (via CRDT style rules) or the developer can define their own conflict resolution plan.
-3. The developer can choose to fork the data on merge conflict rather than merging
-4. Forks can live indefinitely or a specific fork can be chosen and other forks dropped
-
-This is much more akin to git and event sourcing but with the drawback being that it is much more write heavy and much more space intensive.
-
-# Building
-
-For a stable version, build against a [release tag](https://github.com/vlcn-io/cr-sqlite/releases) as main may not be 100% stable.
-
-You'll need to install Rust.
-
-- Installing Rust: https://www.rust-lang.org/tools/install
-
-## [Run Time Loadable Extension](https://www.sqlite.org/loadext.html)
-
-Instructions on building a native library that can be loaded into SQLite in non-wasm environments.
+### Run Time Loadable Extension
 
 ```bash
-rustup toolchain install nightly # make sure you have the rust nightly toolchain
-git clone --recurse-submodules git@github.com:vlcn-io/cr-sqlite.git
+rustup toolchain install nightly
+git clone --recurse-submodules git@github.com:superfly/cr-sqlite.git
 cd cr-sqlite/core
 make loadable
 ```
 
-This will create a shared library at `dist/crsqlite.[lib extension]`
+This creates a shared library at `dist/crsqlite.[so|dylib|dll]`.
 
-[lib extension]:
+> Note: loading the extension should be the _first_ operation after opening a connection. The extension must be loaded on every connection.
 
-- Linux: `.so`
-- Darwin / OS X: `.dylib`
-- Windows: `.dll`
-
-## WASM
-
-For a WASM build that works in the browser, see the [js](https://github.com/vlcn-io/js) repository.
-
-## CLI
-
-Instructions on building a `sqlite3` CLI that has `cr-sqlite` statically linked and pre-loaded.
-
-In the `core` directory of the project, run:
+### CLI (statically linked sqlite3)
 
 ```bash
+cd core
 make sqlite3
 ```
 
-This will create a `sqlite3` binary at `dist/sqlite3`
+Creates `dist/sqlite3` with cr-sqlite statically linked and pre-loaded.
 
-## Tests
+### Tests
 
-core:
+C tests:
 
 ```bash
 cd core
 make test
 ```
 
-py integration tests:
+Python integration tests:
 
 ```bash
 cd core
@@ -291,16 +221,76 @@ cd ../py/correctness
 ./install-and-test.sh
 ```
 
-# JS APIs
+### Performance Benchmarking
 
-JS APIs for using `cr-sqlite` in the browser are not yet documented but exist in the [js repo](https://github.com/vlcn-io/js). You can also see examples of them in use here:
+A Rust-based benchmarking tool is in `tools/`:
 
-- [Observable Notebook](https://observablehq.com/@tantaman/cr-sqlite-basic-setup)
-- https://github.com/vlcn-io/live-examples
+```bash
+cd tools
+cargo run -- ../core/dist/crsqlite
+```
 
-# Research & Prior Art
+## API Reference
 
-cr-sqlite was inspired by and built on ideas from these papers:
+### Core Functions
+
+| Function | Description |
+|---|---|
+| `crsql_as_crr('table')` | Upgrade a table to a conflict-free replicated relation |
+| `crsql_as_table('table')` | Alias for `crsql_as_crr` |
+| `crsql_site_id()` | Return this database's 16-byte site ID |
+| `crsql_db_version()` | Return the current db_version |
+| `crsql_next_db_version()` | Return and persist the next db_version |
+| `crsql_peek_next_db_version()` | Peek at the next db_version without persisting |
+| `crsql_set_db_version(site_id, version)` | Set the db_version for a specific site |
+| `crsql_set_ts(ts)` | Set the timestamp for the current transaction |
+| `crsql_get_ts()` | Get the current transaction's timestamp |
+| `crsql_rows_impacted()` | Return rows impacted by the last merge insert |
+| `crsql_finalize()` | Tear down the extension (call before closing connection) |
+| `crsql_version()` | Return the cr-sqlite version integer |
+| `crsql_config_set(name, value)` | Set a configuration option |
+| `crsql_set_debug(enabled)` | Enable/disable debug logging |
+
+### Schema Alter Functions
+
+| Function | Description |
+|---|---|
+| `crsql_begin_alter('table')` | Begin an alter session on a CRR table |
+| `crsql_commit_alter('table')` | Commit alterations to a CRR table |
+
+### Virtual Tables
+
+- **`crsql_changes`** — Query and apply changesets. Columns: `table, pk, cid, val, col_version, db_version, site_id, cl, seq, ts`
+- **`crsql_site_id`** — Maps site IDs to ordinals (ordinal 0 is the local site)
+
+### Internal Tables (per CRR table)
+
+- **`{table}__crsql_clock`** — Per-column clock metadata (col_version, db_version, site_id, seq, ts)
+- **`{table}__crsql_pks`** — Maps primary key values to integer keys for clock table lookups
+
+### Global Tables
+
+- **`crsql_db_versions`** — Per-site db_version tracking
+- **`crsql_master`** — Extension metadata and config key-value store
+- **`crsql_tracked_peers`** — Peer tracking table (site_id, version, seq, tag, event). Created by the extension but bookkeeping is expected to be handled by the application.
+
+## How It Works
+
+CR-SQLite uses history-free CRDTs based on [causal length sets](https://dl.acm.org/doi/pdf/10.1145/3380787.3393678). Each table upgraded to a CRR gets:
+
+1. **Clock tables** (`__crsql_clock`) that track per-column version metadata (col_version, db_version, site_id, seq, ts)
+2. **PK lookaside tables** (`__crsql_pks`) that map composite primary keys to integer keys for efficient clock table joins
+3. **Triggers** (insert, update, delete) that automatically record changes to the clock tables
+
+Merging works by comparing column versions and causal lengths. For each incoming change:
+- If the incoming `col_version` is greater than the local one, the change wins
+- If versions are equal, the column values are compared
+- If values are equal, the `site_id` is used as a tiebreaker
+- Deletes are tracked via sentinel rows (tombstones) with even `col_version` values; the causal length determines whether a delete or a create wins
+
+The `crsql_changes` virtual table provides a unified view across all CRR clock tables, allowing you to extract and apply changesets without knowing the underlying schema.
+
+## Research & Prior Art
 
 - [Towards a General Database Management System of Conflict-Free Replicated Relations](https://munin.uit.no/bitstream/handle/10037/22344/thesis.pdf?sequence=2)
 - [Conflict-Free Replicated Relations for Multi-Synchronous Database Management at Edge](https://hal.inria.fr/hal-02983557/document)
