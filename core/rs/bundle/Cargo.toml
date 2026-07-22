@@ -16,6 +16,7 @@ crate-type = ["rlib"]
 crsql_fractindex_core = {path="../fractindex-core"}
 crsql_core = { path="../core" }
 sqlite_nostd = { path="../sqlite-rs-embedded/sqlite_nostd" }
+stable_trap = { path="../sqlite-rs-embedded/stable_trap" }
 libc-print = "*"
 
 [profile.dev]

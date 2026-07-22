@@ -1,6 +1,4 @@
 #![no_std]
-#![feature(core_intrinsics)]
-#![feature(lang_items)]
 
 extern crate alloc;
 
@@ -26,7 +24,7 @@ static ALLOCATOR: SQLite3Allocator = SQLite3Allocator {};
 #[cfg(not(feature = "test"))]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    core::intrinsics::abort()
+    stable_trap::abort()
 }
 
 // Print panic info for tests
@@ -34,17 +32,21 @@ fn panic(_info: &PanicInfo) -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("PANIC!: {}", info);
-    core::intrinsics::abort();
+    stable_trap::abort()
 }
 
+// Otherwise we would need to use nightly features
 #[cfg(not(target_family = "wasm"))]
-#[lang = "eh_personality"]
-extern "C" fn eh_personality() {}
+#[no_mangle]
+extern "C" fn rust_eh_personality() {}
+#[cfg(target_arch = "arm")]
+#[no_mangle]
+extern "C" fn _rust_eh_personality() {}
 
 #[cfg(target_family = "wasm")]
 #[no_mangle]
 pub fn __rust_alloc_error_handler(_: Layout) -> ! {
-    core::intrinsics::abort()
+    stable_trap::abort()
 }
 
 #[no_mangle]

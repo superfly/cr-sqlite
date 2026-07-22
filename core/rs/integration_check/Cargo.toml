@@ -11,6 +11,12 @@ license = "Apache-2.0"
 name = "crsql_integration_check"
 crate-type = ["staticlib"]
 
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
 [dependencies]
 sqlite_nostd = { path="../sqlite-rs-embedded/sqlite_nostd", features=["static", "omit_load_extension"] }
 crsql_bundle = { path="../bundle", features=["static", "omit_load_extension", "test"] }
