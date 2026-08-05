@@ -70,21 +70,27 @@ fn automigrate_impl(
 
     let result = sqlite::open(strlit!(":memory:"));
     if let Ok(mem_db) = result {
-        if let Err(_) = mem_db.exec_safe(&stripped_schema) {
-            let mem_db_err_msg = mem_db.errmsg()?;
-            ctx.result_error(&mem_db_err_msg);
+        if let Err(e) = mem_db.exec_safe(&stripped_schema) {
+            let mem_db_err_msg = mem_db.errmsg().unwrap_or_else(|_| format!("exec failed: {:?}", e));
+            ctx.result_error(&format!("automigrate: mem_db exec stripped_schema failed: {}", mem_db_err_msg));
             ctx.result_error_code(mem_db.errcode());
             cleanup(mem_db)?;
             return Err(ResultCode::OK);
         }
-        local_db.exec_safe("SAVEPOINT automigrate_tables;")?;
+        if let Err(e) = local_db.exec_safe("SAVEPOINT automigrate_tables;") {
+            let errmsg = local_db.errmsg().unwrap_or_else(|_| format!("SAVEPOINT failed: {:?}", e));
+            ctx.result_error(&format!("automigrate: SAVEPOINT failed: {}", errmsg));
+            cleanup(mem_db)?;
+            return Err(ResultCode::OK);
+        }
+        local_db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
 
         let migrate_result = migrate_to(local_db, &mem_db);
 
-        if let Err(_) = migrate_result {
-            local_db.exec_safe("ROLLBACK")?;
-            let mem_db_err_msg = mem_db.errmsg()?;
-            ctx.result_error(&mem_db_err_msg);
+        if let Err(e) = migrate_result {
+            let _ = local_db.exec_safe("ROLLBACK");
+            let mem_db_err_msg = mem_db.errmsg().unwrap_or_else(|_| format!("migrate_to failed: {:?}", e));
+            ctx.result_error(&format!("automigrate: migrate_to failed: {}", mem_db_err_msg));
             ctx.result_error_code(mem_db.errcode());
             cleanup(mem_db)?;
             return Err(ResultCode::OK);
@@ -93,9 +99,20 @@ fn automigrate_impl(
         }
 
         if !desired_schema.is_empty() {
-            local_db.exec_safe(desired_schema)?;
+            let schema_with_ts = format!("SELECT crsql_set_ts('1700000000');\n{}", desired_schema);
+            if let Err(e) = local_db.exec_safe(&schema_with_ts) {
+                let errmsg = local_db.errmsg().unwrap_or_else(|_| format!("exec failed: {:?}", e));
+                ctx.result_error(&format!("automigrate: exec desired_schema failed: {}", errmsg));
+                let _ = local_db.exec_safe("ROLLBACK");
+                return Err(ResultCode::OK);
+            }
         }
-        local_db.exec_safe("RELEASE automigrate_tables")
+        if let Err(e) = local_db.exec_safe("RELEASE automigrate_tables") {
+            let errmsg = local_db.errmsg().unwrap_or_else(|_| format!("RELEASE failed: {:?}", e));
+            ctx.result_error(&format!("automigrate: RELEASE failed: {}", errmsg));
+            return Err(ResultCode::OK);
+        }
+        Ok(ResultCode::OK)
     } else {
         ctx.result_error("could not open the temporary migration db");
         ctx.result_error_code(ResultCode::CANTOPEN);
@@ -161,6 +178,7 @@ fn strip_crr_statements(schema: &str) -> String {
         .filter(|line| {
             !line.to_lowercase().contains("crsql_as_crr")
                 && !line.to_lowercase().contains("crsql_fract_as_ordered")
+                && !line.to_lowercase().contains("crsql_set_ts")
         })
         .collect::<Vec<_>>()
         .join("\n")

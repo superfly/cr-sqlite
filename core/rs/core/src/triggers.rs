@@ -1,5 +1,6 @@
 extern crate alloc;
 use alloc::format;
+use alloc::string::String;
 use sqlite::Connection;
 
 use core::ffi::c_char;
@@ -24,14 +25,21 @@ fn create_insert_trigger(
     table_info: &TableInfo,
     _err: *mut *mut c_char,
 ) -> Result<ResultCode, ResultCode> {
+    let rowid_expr = if table_info.uses_rowid_key {
+        let alias = crate::util::escape_ident(&table_info.rowid_alias);
+        format!(", NEW.\"{alias}\"")
+    } else {
+        String::new()
+    };
     let create_trigger_sql = format!(
         "CREATE TRIGGER IF NOT EXISTS \"{table_name}__crsql_itrig\"
       AFTER INSERT ON \"{table_name}\" WHEN crsql_internal_sync_bit() = 0
       BEGIN
-        VALUES (crsql_after_insert('{table_name}', {pk_new_list}));
+        VALUES (crsql_after_insert('{table_name}', {pk_new_list}{rowid_expr}));
       END;",
         table_name = crate::util::escape_ident_as_value(&table_info.tbl_name),
-        pk_new_list = crate::util::as_identifier_list(&table_info.pks, Some("NEW."))?
+        pk_new_list = crate::util::as_identifier_list(&table_info.pks, Some("NEW."))?,
+        rowid_expr = rowid_expr
     );
 
     db.exec_safe(&create_trigger_sql)
@@ -48,21 +56,30 @@ fn create_update_trigger(
     let pk_new_list = crate::util::as_identifier_list(pk_columns, Some("NEW."))?;
     let pk_old_list = crate::util::as_identifier_list(pk_columns, Some("OLD."))?;
 
+    let rowid_expr = if table_info.uses_rowid_key {
+        let alias = crate::util::escape_ident(&table_info.rowid_alias);
+        format!(", NEW.\"{alias}\"")
+    } else {
+        String::new()
+    };
+
     let trigger_body = if non_pk_columns.is_empty() {
         format!(
-            "VALUES (crsql_after_update('{table_name}', {pk_new_list}, {pk_old_list}))",
+            "VALUES (crsql_after_update('{table_name}', {pk_new_list}, {pk_old_list}{rowid_expr}))",
             table_name = crate::util::escape_ident_as_value(table_name),
             pk_new_list = pk_new_list,
             pk_old_list = pk_old_list,
+            rowid_expr = rowid_expr,
         )
     } else {
         format!(
-        "VALUES (crsql_after_update('{table_name}', {pk_new_list}, {pk_old_list}, {non_pk_new_list}, {non_pk_old_list}))",
+        "VALUES (crsql_after_update('{table_name}', {pk_new_list}, {pk_old_list}, {non_pk_new_list}, {non_pk_old_list}{rowid_expr}))",
         table_name = crate::util::escape_ident_as_value(table_name),
         pk_new_list = pk_new_list,
         pk_old_list = pk_old_list,
         non_pk_new_list = crate::util::as_identifier_list(non_pk_columns, Some("NEW."))?,
-        non_pk_old_list = crate::util::as_identifier_list(non_pk_columns, Some("OLD."))?
+        non_pk_old_list = crate::util::as_identifier_list(non_pk_columns, Some("OLD."))?,
+        rowid_expr = rowid_expr
       )
     };
     db.exec_safe(&format!(

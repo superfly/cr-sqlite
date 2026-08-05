@@ -184,6 +184,14 @@ fn maybe_update_db_inner(
             return Err(ResultCode::ERROR);
         }
     }
+    // TODO(0.19): Disallow opening 0.17 DBs (recorded_version < CRSQLITE_VERSION_0_18_0).
+    // Only accept fully migrated 0.18 DBs (all CRRs migrated to V2 metadata, no V1 tables).
+    // 0.19 will drop V1 metadata + V1 wire format entirely, so any DB still on V1
+    // metadata must be migrated on 0.18 before upgrading.
+
+    // Validate compile-time format constants against stored values.
+    // If stored: refuse to operate if they differ. If not stored: store them.
+    validate_or_store_compile_constants(db, err_msg)?;
 
     // write the db version if we migrated to a new one or we are a blank slate db
     if recorded_version < consts::CRSQLITE_VERSION || is_blank_slate {
@@ -193,6 +201,50 @@ fn maybe_update_db_inner(
         stmt.step()?;
     }
 
+    Ok(ResultCode::OK)
+}
+
+/// Compile-time constants that affect on-disk data format.
+/// Stored in crsql_master on first load and validated on subsequent loads.
+const COMPILE_CONST_KEYS: &[(&str, i32)] = &[
+    ("crsql_col_id_bits", consts::CRSQL_COL_ID_BITS as i32),
+    ("crsql_pk_hash_size", consts::PK_HASH_SIZE as i32),
+    ("crsql_site_id_len", consts::SITE_ID_LEN),
+];
+
+fn validate_or_store_compile_constants(
+    db: *mut sqlite3,
+    err_msg: *mut *mut c_char,
+) -> Result<ResultCode, ResultCode> {
+    for (key, compile_val) in COMPILE_CONST_KEYS {
+        let stmt = db.prepare_v2(&format!(
+            "SELECT value FROM crsql_master WHERE key = '{}'",
+            key
+        ))?;
+        let step_result = stmt.step()?;
+        if step_result == ResultCode::ROW {
+            let stored_val = stmt.column_int(0);
+            if stored_val != *compile_val {
+                let cstring = CString::new(format!(
+                    "cr-sqlite compile-time constant mismatch: '{}' was compiled as {} but the database expects {}. \
+                    The on-disk data format is incompatible with this build of the extension.",
+                    key, compile_val, stored_val
+                ))?;
+                unsafe {
+                    (*err_msg) = cstring.into_raw();
+                }
+                return Err(ResultCode::ERROR);
+            }
+        } else {
+            // Key not stored yet (blank slate or upgrading from 0.17): store the compile-time value
+            let stmt = db.prepare_v2(&format!(
+                "INSERT OR REPLACE INTO crsql_master VALUES ('{}', ?)",
+                key
+            ))?;
+            stmt.bind_int(1, *compile_val)?;
+            stmt.step()?;
+        }
+    }
     Ok(ResultCode::OK)
 }
 

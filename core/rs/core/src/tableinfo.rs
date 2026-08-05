@@ -2,6 +2,7 @@ use crate::alloc::string::ToString;
 use crate::c::crsql_ExtData;
 use crate::c::crsql_fetchPragmaSchemaVersion;
 use crate::c::TABLE_INFO_SCHEMA_VERSION;
+use crate::consts;
 use crate::pack_columns::bind_package_to_stmt;
 use crate::pack_columns::ColumnValue;
 use crate::stmt_cache::reset_cached_stmt;
@@ -30,10 +31,31 @@ use sqlite_nostd::StrRef;
 
 // TODO: make this configurable with a crsql_config_set.
 const MAX_CL_CACHE_SIZE: usize = 1500;
+
+/// Which metadata schema version is active for a table.
+/// Set at TableInfo creation time based on config flags and which tables physically exist.
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub enum SchemaVersion {
+    V1,
+    V2,
+    V2AndV1,
+}
+
 pub struct TableInfo {
     pub tbl_name: String,
     pub pks: Vec<ColumnInfo>,
     pub non_pks: Vec<ColumnInfo>,
+    pub schema_version: SchemaVersion,
+    /// True when the main table is a rowid table with accessible rowid.
+    /// V2 uses __crsql_key = main_table.rowid and fetches PK values from
+    /// the main table via SELECT pk_cols WHERE rowid = ?.
+    /// See design doc §3 "__crsql_key Assignment (Rowid Reuse)".
+    pub uses_rowid_key: bool,
+    /// The column name to use as the rowid alias for JOINs/ad-hoc queries.
+    /// For INTEGER PRIMARY KEY tables: the PK column name (e.g. "id").
+    /// For plain rowid tables: "rowid" (or first unshadowed built-in alias).
+    /// Only valid when uses_rowid_key is true.
+    pub rowid_alias: String,
 
     // Lookaside --
     // insert returning?
@@ -763,6 +785,7 @@ impl Drop for TableInfo {
 pub struct ColumnInfo {
     pub cid: i32,
     pub name: String,
+    pub col_type: String,
     // > 0 if it is a primary key columns
     // the value refers to the position in the `PRIMARY KEY (cols...)` statement
     pub pk: i32,
@@ -937,13 +960,40 @@ fn pull_all_table_infos(
         }
     }
 
+    // Also discover V2-only CRR tables (mode 3 creates no V1 clock tables)
+    let v2_stmt = db.prepare_v2(
+        "SELECT tbl_name FROM sqlite_master WHERE type='table' AND tbl_name LIKE '%__crsql_v2_clock'",
+    )?;
+    loop {
+        match v2_stmt.step() {
+            Ok(ResultCode::ROW) => {
+                clock_table_names.push(v2_stmt.column_text(0)?.to_string());
+            }
+            Ok(ResultCode::DONE) => {
+                break;
+            }
+            Ok(rc) | Err(rc) => {
+                return Err(rc);
+            }
+        }
+    }
+
+    let mut seen = alloc::collections::BTreeSet::new();
     let mut ret = vec![];
     for name in clock_table_names {
-        ret.push(pull_table_info(
-            db,
-            &name[0..(name.len() - "__crsql_clock".len())],
-            err,
-        )?)
+        // Strip either __crsql_clock (V1) or __crsql_v2_clock (V2) suffix
+        let base_name = if name.ends_with("__crsql_v2_clock") {
+            name[0..(name.len() - "__crsql_v2_clock".len())].to_string()
+        } else if name.ends_with("__crsql_clock") {
+            name[0..(name.len() - "__crsql_clock".len())].to_string()
+        } else {
+            continue;
+        };
+        if seen.contains(base_name.as_str()) {
+            continue;
+        }
+        seen.insert(base_name.clone());
+        ret.push(pull_table_info(db, &base_name, err)?);
     }
 
     Ok(ret)
@@ -973,7 +1023,7 @@ pub fn pull_table_info(
     };
 
     let sql = format!(
-        "SELECT \"cid\", \"name\", \"pk\"
+        "SELECT \"cid\", \"name\", \"type\", \"pk\"
          FROM pragma_table_info('{table}') ORDER BY cid ASC"
     );
     let column_infos = match db.prepare_v2(&sql) {
@@ -983,8 +1033,9 @@ pub fn pull_table_info(
             while stmt.step()? == ResultCode::ROW {
                 cols.push(ColumnInfo {
                     name: stmt.column_text(1)?.to_string(),
+                    col_type: stmt.column_text(2)?.to_string(),
                     cid: stmt.column_int(0),
-                    pk: stmt.column_int(2),
+                    pk: stmt.column_int(3),
                     curr_value_stmt: RefCell::new(None),
                     merge_insert_stmt: RefCell::new(None),
                     row_patch_data_stmt: RefCell::new(None),
@@ -1003,13 +1054,123 @@ pub fn pull_table_info(
         }
     };
 
+    // Check alias shadowing before partition consumes column_infos
+    let has_rowid_col = column_infos.iter().any(|c| c.name == "rowid");
+    let has_oid_col = column_infos.iter().any(|c| c.name == "oid");
+    let has_rowid_under_col = column_infos.iter().any(|c| c.name == "_rowid_");
+    let all_aliases_shadowed = has_rowid_col && has_oid_col && has_rowid_under_col;
+
     let (mut pks, non_pks): (Vec<_>, Vec<_>) = column_infos.into_iter().partition(|x| x.pk > 0);
     pks.sort_by_key(|x| x.pk);
+
+    // Detect rowid key optimization per design doc §3:
+    // 1. INTEGER PRIMARY KEY exists (pk > 0 AND type = 'INTEGER') → it IS the rowid alias.
+    // 2. No INTEGER PRIMARY KEY, but none of rowid/oid/_rowid_ are shadowed → rowid accessible.
+    // 3. All three aliases shadowed AND no INTEGER PRIMARY KEY → auto-increment fallback.
+    let integer_pk = pks.iter().find(|pk| {
+        let type_sql = format!(
+            "SELECT type FROM pragma_table_info('{table}') WHERE name = '{pk_name}'",
+            table = crate::util::escape_ident_as_value(table),
+            pk_name = crate::util::escape_ident_as_value(&pk.name),
+        );
+        db.prepare_v2(&type_sql).and_then(|stmt| {
+            stmt.step()?;
+            Ok(stmt.column_text(0)?.to_string() == "INTEGER")
+        }).unwrap_or(false)
+    });
+
+    // Determine the rowid alias to use for ad-hoc queries
+    let rowid_alias = if let Some(pk) = integer_pk {
+        // Case 1: INTEGER PRIMARY KEY — the PK column IS the rowid alias
+        pk.name.clone()
+    } else if !all_aliases_shadowed {
+        // Case 2: pick first unshadowed built-in alias
+        if !has_rowid_col {
+            "rowid".to_string()
+        } else if !has_oid_col {
+            "oid".to_string()
+        } else {
+            "_rowid_".to_string()
+        }
+    } else {
+        // Case 3: fallback — no alias
+        String::new()
+    };
+
+    let rowid_accessible = integer_pk.is_some() || !all_aliases_shadowed;
+
+    // Verify rowid is actually accessible (table is not WITHOUT ROWID)
+    let mut uses_rowid_key = if integer_pk.is_some() {
+        // INTEGER PRIMARY KEY: the PK column IS the rowid alias.
+        // Verify it's accessible (table is not WITHOUT ROWID).
+        db.prepare_v2(&format!(
+            "SELECT \"{alias}\" FROM \"{escaped}\" LIMIT 0",
+            alias = crate::util::escape_ident(&rowid_alias),
+            escaped = crate::util::escape_ident(table),
+        )).is_ok()
+    } else {
+        // No INTEGER PRIMARY KEY — the PK is NOT the rowid.
+        // We can still use the hidden rowid as __crsql_key, but we must store PK columns separately.
+        false
+    };
+
+    // Detect V2 metadata tables
+    let has_v2 = crate::bootstrap_v2::has_v2_tables(db, table).unwrap_or(false);
+
+    // If v2_pks table exists, infer uses_rowid_key from its schema.
+    // Rowid-key v2_pks has 3 columns: __crsql_key, hashed_pk, cl.
+    // Non-rowid v2_pks has 3 + N PK columns.
+    // This is the persisted source of truth for the without_rowid decision.
+    if has_v2 {
+        let v2_pks_name = format!("{}{}", crate::util::escape_ident_as_value(table), consts::V2_PKS_SUFFIX);
+        let pks_count_stmt = db.prepare_v2(&format!(
+            "SELECT count(*) FROM pragma_table_info('{name}')",
+            name = v2_pks_name,
+        ));
+        if let Ok(stmt) = pks_count_stmt {
+            if stmt.step().unwrap_or(ResultCode::DONE) == ResultCode::ROW {
+                let col_count = stmt.column_int(0);
+                // 3 columns = __crsql_key + hashed_pk + cl = rowid-key
+                // >3 columns = has PK columns = non-rowid
+                uses_rowid_key = col_count == 3;
+            }
+        }
+    } else {
+        // v2_pks doesn't exist yet — check crsql_master for without_rowid flag
+        // persisted by create_crr when the without_rowid option was used.
+        let without_rowid_key = format!("without_rowid_{}\0", table);
+        let stmt = db.prepare_v2("SELECT value FROM crsql_master WHERE key = ?\0");
+        if let Ok(stmt) = stmt {
+            if stmt.bind_text(1, &without_rowid_key, sqlite::Destructor::TRANSIENT).is_ok() {
+                if stmt.step().unwrap_or(ResultCode::DONE) == ResultCode::ROW {
+                    uses_rowid_key = false;
+                }
+            }
+        }
+    }
+    let has_v1 = {
+        let stmt = db.prepare_v2(&format!(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND tbl_name = '{escaped}{suffix}'",
+            escaped = crate::util::escape_ident_as_value(table),
+            suffix = "__crsql_clock"
+        ))?;
+        stmt.step()? == ResultCode::ROW
+    };
+    let schema_version = if has_v2 && has_v1 {
+        SchemaVersion::V2AndV1
+    } else if has_v2 {
+        SchemaVersion::V2
+    } else {
+        SchemaVersion::V1
+    };
 
     Ok(TableInfo {
         tbl_name: table.to_string(),
         pks,
         non_pks,
+        schema_version,
+        uses_rowid_key,
+        rowid_alias,
         set_winner_clock_stmt: RefCell::new(None),
         local_cl_stmt: RefCell::new(None),
         col_version_stmt: RefCell::new(None),

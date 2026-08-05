@@ -3,11 +3,13 @@ use core::ffi::c_int;
 use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
+use alloc::vec::Vec;
 use sqlite::{sqlite3, value, Context, ResultCode};
 use sqlite_nostd as sqlite;
+use sqlite_nostd::Value;
 
 use crate::compare_values::crsql_compare_sqlite_values;
-use crate::{c::crsql_ExtData, tableinfo::TableInfo};
+use crate::{c::crsql_ExtData, tableinfo::{TableInfo, SchemaVersion}, config, consts};
 
 use super::trigger_fn_preamble;
 
@@ -17,8 +19,9 @@ pub unsafe extern "C" fn x_crsql_after_update(
     argv: *mut *mut sqlite::value,
 ) {
     let result = trigger_fn_preamble(ctx, argc, argv, |table_info, values, ext_data| {
-        let (pks_new, pks_old, non_pks_new, non_pks_old) =
-            partition_values(values, 1, table_info.pks.len(), table_info.non_pks.len())?;
+        let has_rowid = table_info.uses_rowid_key;
+        let (pks_new, pks_old, non_pks_new, non_pks_old, rowid_val) =
+            partition_values(values, 1, table_info.pks.len(), table_info.non_pks.len(), has_rowid)?;
 
         after_update(
             ctx.db_handle(),
@@ -28,6 +31,7 @@ pub unsafe extern "C" fn x_crsql_after_update(
             pks_old,
             non_pks_new,
             non_pks_old,
+            rowid_val,
         )
     });
 
@@ -46,8 +50,9 @@ fn partition_values<T>(
     offset: usize,
     num_pks: usize,
     num_non_pks: usize,
-) -> Result<(&[T], &[T], &[T], &[T]), String> {
-    let expected_len = offset + num_pks * 2 + num_non_pks * 2;
+    has_rowid: bool,
+) -> Result<(&[T], &[T], &[T], &[T], Option<&T>), String> {
+    let expected_len = offset + num_pks * 2 + num_non_pks * 2 + if has_rowid { 1 } else { 0 };
     if values.len() != expected_len {
         return Err(format!(
             "expected {} values, got {}",
@@ -55,11 +60,14 @@ fn partition_values<T>(
             values.len()
         ));
     }
+    let core_end = offset + num_pks * 2 + num_non_pks * 2;
+    let rowid_val = if has_rowid { Some(&values[core_end]) } else { None };
     Ok((
         &values[offset..num_pks + offset],
         &values[num_pks + offset..num_pks * 2 + offset],
         &values[num_pks * 2 + offset..num_pks * 2 + num_non_pks + offset],
-        &values[num_pks * 2 + num_non_pks + offset..],
+        &values[num_pks * 2 + num_non_pks + offset..core_end],
+        rowid_val,
     ))
 }
 
@@ -71,7 +79,93 @@ fn after_update(
     pks_old: &[*mut value],
     non_pks_new: &[*mut value],
     non_pks_old: &[*mut value],
+    rowid_val: Option<&*mut value>,
 ) -> Result<ResultCode, String> {
+    // Enforce rowid range for rowid-key tables
+    if let Some(rowid) = rowid_val {
+        let rowid = (*rowid).int64();
+        if rowid < 0 || rowid >= consts::MAX_ROWID_KEY {
+            return Err(format!(
+                "rowid out of cr-sqlite safe range [0, {})",
+                consts::MAX_ROWID_KEY
+            ));
+        }
+    }
+
+    let mwv = unsafe { (*ext_data).metadataWriteVersion };
+
+    // Mode 3 (V2-only): write to V2 only, even if V1 tables still exist during cleanup
+    if mwv == config::METADATA_VERSION_V2 {
+        let mut changed_indices = Vec::new();
+        for (i, (new, old)) in non_pks_new.iter().zip(non_pks_old.iter()).enumerate() {
+            if crsql_compare_sqlite_values(*new, *old) != 0 {
+                changed_indices.push(i);
+            }
+        }
+        if crate::compare_values::any_value_changed(pks_new, pks_old)? {
+            super::v2::v2_after_delete(db, ext_data, tbl_info, pks_old)?;
+            super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new)?;
+            return Ok(ResultCode::OK);
+        }
+        return super::v2::v2_after_update(db, ext_data, tbl_info, pks_new, &changed_indices);
+    }
+
+    // Mode 1 (V1-only): write to V1 only, even if V2 tables still exist from rollback
+    let mut v2_ran = false;
+    let saved_seq = unsafe { (*ext_data).seq };
+    if mwv == config::METADATA_VERSION_V1 {
+        // fall through to V1 write logic below, skipping V2
+    } else {
+        // V2-only schema: just write to V2 tables
+        if tbl_info.schema_version == SchemaVersion::V2 {
+            // Compute changed column indices
+            let mut changed_indices = Vec::new();
+            for (i, (new, old)) in non_pks_new.iter().zip(non_pks_old.iter()).enumerate() {
+                if crsql_compare_sqlite_values(*new, *old) != 0 {
+                    changed_indices.push(i);
+                }
+            }
+            // Also handle PK changes as delete+insert in V2
+            if crate::compare_values::any_value_changed(pks_new, pks_old)? {
+                // PK changed: do delete of old + insert of new
+                super::v2::v2_after_delete(db, ext_data, tbl_info, pks_old)?;
+                super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new)?;
+                return Ok(ResultCode::OK);
+            }
+            return super::v2::v2_after_update(db, ext_data, tbl_info, pks_new, &changed_indices);
+        }
+
+        // V2AndV1 mode: write to V2 tables first, then fall through to V1
+        if tbl_info.schema_version == SchemaVersion::V2AndV1 {
+            let mut changed_indices = Vec::new();
+            for (i, (new, old)) in non_pks_new.iter().zip(non_pks_old.iter()).enumerate() {
+                if crsql_compare_sqlite_values(*new, *old) != 0 {
+                    changed_indices.push(i);
+                }
+            }
+            if crate::compare_values::any_value_changed(pks_new, pks_old)? {
+                // Hydrate both old and new PKs before delete+insert
+                unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_old) }
+                    .map_err(|_| "V1 to V2 hydration failed".to_string())?;
+                unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_new) }
+                    .map_err(|_| "V1 to V2 hydration failed".to_string())?;
+                super::v2::v2_after_delete(db, ext_data, tbl_info, pks_old)?;
+                super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new)?;
+            } else {
+                // Hydrate the row being updated
+                unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_new) }
+                    .map_err(|_| "V1 to V2 hydration failed".to_string())?;
+                super::v2::v2_after_update(db, ext_data, tbl_info, pks_new, &changed_indices)?;
+            }
+            v2_ran = true;
+        }
+    }
+
+    // Restore seq so V1 reuses the same values V2 just bumped.
+    if v2_ran {
+        unsafe { (*ext_data).seq = saved_seq; }
+    }
+
     let ts = unsafe { (*ext_data).timestamp.to_string() };
     let next_db_version = crate::db_version::peek_next_db_version(db, ext_data)?;
     let new_key = tbl_info
@@ -191,39 +285,43 @@ mod tests {
         ];
 
         assert_eq!(
-            partition_values(&values1, 1, 1, 1),
+            partition_values(&values1, 1, 1, 1, false),
             Ok((
                 &["pk.new"] as &[&str],
                 &["pk.old"] as &[&str],
                 &["c.new"] as &[&str],
-                &["c.old"] as &[&str]
+                &["c.old"] as &[&str],
+                None
             ))
         );
         assert_eq!(
-            partition_values(&values2, 1, 1, 0),
+            partition_values(&values2, 1, 1, 0, false),
             Ok((
                 &["pk.new"] as &[&str],
                 &["pk.old"] as &[&str],
                 &[] as &[&str],
-                &[] as &[&str]
+                &[] as &[&str],
+                None
             ))
         );
         assert_eq!(
-            partition_values(&values3, 1, 2, 0),
+            partition_values(&values3, 1, 2, 0, false),
             Ok((
                 &["pk1.new", "pk2.new"] as &[&str],
                 &["pk1.old", "pk2.old"] as &[&str],
                 &[] as &[&str],
-                &[] as &[&str]
+                &[] as &[&str],
+                None
             ))
         );
         assert_eq!(
-            partition_values(&values4, 1, 2, 2),
+            partition_values(&values4, 1, 2, 2, false),
             Ok((
                 &["pk1.new", "pk2.new"] as &[&str],
                 &["pk1.old", "pk2.old"] as &[&str],
                 &["c.new", "d.new"] as &[&str],
-                &["c.old", "d.old"] as &[&str]
+                &["c.old", "d.old"] as &[&str],
+                None
             ))
         );
     }
