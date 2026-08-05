@@ -346,6 +346,7 @@ fn test_leak_condition() {
 
     c1.exec_safe("CREATE TABLE foo (a not null, b not null, primary key (a, b));")
         .expect("made foo");
+    c1.exec_safe("SELECT crsql_set_ts('1700000000')").expect("set ts");
     c1.exec_safe("SELECT crsql_as_crr('foo')")
         .expect("made foo a crr");
     c1.exec_safe("INSERT INTO foo VALUES (1, 2)")

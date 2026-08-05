@@ -11,10 +11,17 @@ fn idempotent() {
       CREATE TABLE IF NOT EXISTS item (id integer primary key not null, data any) strict;
       CREATE TABLE IF NOT EXISTS container (id integer primary key, contained integer);
       CREATE INDEX IF NOT EXISTS container_contained ON container (contained);
+      SELECT crsql_set_ts('1700000000');
+      SELECT crsql_as_crr('item');
+  ";
+    let migrate_schema = "
+      CREATE TABLE IF NOT EXISTS item (id integer primary key not null, data any) strict;
+      CREATE TABLE IF NOT EXISTS container (id integer primary key, contained integer);
+      CREATE INDEX IF NOT EXISTS container_contained ON container (contained);
       SELECT crsql_as_crr('item');
   ";
     db.db.exec_safe(schema).expect("schema made");
-    invoke_automigrate(&db.db, schema).expect("migrated");
+    invoke_automigrate(&db.db, migrate_schema).expect("migrated");
 
     assert!(expect_tables(&db.db, vec!["item", "container"]).expect("compared tables"));
     assert!(
@@ -369,6 +376,7 @@ fn to_empty_from_something() -> Result<(), ResultCode> {
     db.db.exec_safe("CREATE TABLE bar (a, b, c);")?;
     db.db
         .exec_safe("CREATE TABLE item (id1 not null, id2 not null, x, primary key (id1, id2));")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('item')")?;
     db.db
         .exec_safe("SELECT crsql_automigrate('', 'SELECT crsql_finalize();')")?;

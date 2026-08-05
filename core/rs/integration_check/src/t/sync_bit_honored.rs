@@ -7,6 +7,7 @@ fn sync_bit_honored() -> Result<(), ResultCode> {
     let db = crate::opendb()?;
     let conn = &db.db;
     conn.exec_safe("CREATE TABLE foo (a primary key not null, b);")?;
+    conn.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     conn.exec_safe("SELECT crsql_as_crr('foo');")?;
     conn.exec_safe("SELECT crsql_internal_sync_bit(1)")?;
     conn.exec_safe("INSERT INTO foo VALUES (1, 2);")?;
