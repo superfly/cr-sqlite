@@ -21,6 +21,7 @@ static void testManyPkTable() {
   rc = sqlite3_exec(
       db, "CREATE TABLE foo (a not null, b not null, c, primary key (a, b));",
       0, 0, 0);
+  rc += sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db, "SELECT crsql_as_crr('foo');", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc += sqlite3_exec(db, "INSERT INTO foo VALUES (4,5,6);", 0, 0, 0);
@@ -67,6 +68,7 @@ static void testFilters() {
 
   rc = sqlite3_exec(db, "CREATE TABLE foo (a primary key not null, b);", 0, 0,
                     0);
+  rc += sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db, "SELECT crsql_as_crr('foo');", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc += sqlite3_exec(db, "INSERT INTO foo VALUES (1,2);", 0, 0, 0);

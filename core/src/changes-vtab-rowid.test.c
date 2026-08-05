@@ -57,6 +57,7 @@ static void testRowidsForReads() {
 
   rc = sqlite3_exec(db, "CREATE TABLE foo (a primary key not null, b);", 0, 0,
                     0);
+  rc += sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db, "SELECT crsql_as_crr('foo');", 0, 0, 0);
   assert(rc == SQLITE_OK);
   sqlite3_exec(db, "INSERT INTO foo VALUES (1,2);", 0, 0, 0);
@@ -74,12 +75,14 @@ static void testRowidsForReads() {
 
   rc =
       sqlite3_exec(db, "CREATE TABLE bar (a primary key not null, b)", 0, 0, 0);
+  rc += sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db, "SELECT crsql_as_crr('bar');", 0, 0, 0);
   rc += sqlite3_exec(db, "INSERT INTO bar VALUES (1,2);", 0, 0, 0);
   rc += sqlite3_exec(db, "INSERT INTO bar VALUES (2,3);", 0, 0, 0);
 
   rc +=
       sqlite3_exec(db, "CREATE TABLE baz (a primary key not null, b)", 0, 0, 0);
+  rc += sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db, "SELECT crsql_as_crr('baz');", 0, 0, 0);
   rc += sqlite3_exec(db, "INSERT INTO baz VALUES (1,2);", 0, 0, 0);
   rc += sqlite3_exec(db, "INSERT INTO baz VALUES (2,3);", 0, 0, 0);
