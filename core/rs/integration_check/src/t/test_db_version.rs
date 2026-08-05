@@ -48,6 +48,8 @@ fn test_fetch_db_version_from_storage() -> Result<ResultCode, String> {
     // create some schemas
     db.exec_safe("CREATE TABLE foo (a primary key not null, b);")
         .expect("made foo");
+    db.exec_safe("SELECT crsql_set_ts('1700000000')")
+        .expect("set ts");
     db.exec_safe("SELECT crsql_as_crr('foo');")
         .expect("made foo crr");
     test_exports::db_version::fetch_db_version_from_storage(raw_db, ext_data)?;
@@ -62,6 +64,8 @@ fn test_fetch_db_version_from_storage() -> Result<ResultCode, String> {
 
     db.exec_safe("CREATE TABLE bar (a primary key not null, b);")
         .expect("created bar");
+    db.exec_safe("SELECT crsql_set_ts('1700000000')")
+        .expect("set ts");
     db.exec_safe("SELECT crsql_as_crr('bar');")
         .expect("bar as crr");
     db.exec_safe("INSERT INTO bar VALUES (1, 2)")
@@ -123,9 +127,11 @@ fn test_get_or_set_site_ordinal() -> Result<(), ResultCode> {
     db.db
         .exec_safe("CREATE TABLE foo (a primary key not null, b);")?;
 
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
 
     db.db.exec_safe("BEGIN TRANSACTION;")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
 
     let other_site_id = "other_site_id".as_bytes();
 
@@ -189,6 +195,7 @@ fn test_get_or_set_pk_cl() -> Result<(), ResultCode> {
     db.db
         .exec_safe("CREATE TABLE foo (a primary key not null, b);")?;
 
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
 
     let insert_foo_stmt = db.db.prepare_v2("INSERT INTO foo VALUES (?, ?);")?;
@@ -256,6 +263,7 @@ fn test_get_or_set_pk_cl() -> Result<(), ResultCode> {
     assert_eq!(-1, get_cache_cl(&get_cache_cl_stmt, "foo", key2)?);
 
     db.db.exec_safe("BEGIN TRANSACTION;")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SAVEPOINT test;")?;
 
     // new site_id in crsql_changes table
@@ -378,11 +386,13 @@ fn test_insert_db_version_cache() -> Result<(), ResultCode> {
     let db = &c.db;
     db.db
         .exec_safe("CREATE TABLE foo (a primary key not null, b);")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
 
     let remote_site = "remote_site".as_bytes();
 
     db.db.exec_safe("BEGIN TRANSACTION;")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
 
     // cache should be empty before any remote inserts
     assert_eq!(-1, get_cache_db_version(db.db, remote_site)?);
@@ -431,6 +441,7 @@ fn test_insert_db_version_cache() -> Result<(), ResultCode> {
     // new transaction: inserting a lower db_version (2) should be short-circuited
     // because we fetch the latest db_version from DB on cache miss
     db.db.exec_safe("BEGIN TRANSACTION;")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     let pk4: [u8; 3] = [1, 9, 4];
     let stmt4 = db.db.prepare_v2(
         "INSERT INTO crsql_changes VALUES ('foo', ?, 'b', 4, 1, 2, ?, 1, 0, 0);",
