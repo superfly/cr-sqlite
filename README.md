@@ -4,11 +4,13 @@ A [run-time loadable extension](https://www.sqlite.org/loadext.html) for [SQLite
 
 ## Relationship to Upstream
 
-This fork diverges from upstream cr-sqlite v0.15.0 and introduces significant, breaking changes to the change bookkeeping model. The current version is **0.17.0**. Databases created with cr-sqlite < 0.17.0 are not supported and must be migrated.
+This fork diverges from upstream cr-sqlite v0.15.0 and introduces significant, breaking changes to the change bookkeeping model and underlying data format. The current version is **0.18.0**. Databases created with cr-sqlite < 0.17.0 are not supported and must be migrated. Databases on 0.17.0 can incrementally migrate to the new V2 metadata format (see [Migration Guide](#migration-guide-017--018)).
+
+**0.19.0 will make V2 metadata + V2 wire format the default and remove V1 support entirely.**
 
 The core CRDT approach (history-free, last-write-wins per column, causal length sets) remains the same. The differences are in **how changes are tracked, timestamped, and replicated**.
 
-## Key Changes from Upstream
+## Key Changes in 0.17.0
 
 ### Per-Site DB Version Tracking
 
@@ -116,6 +118,131 @@ Local writes (insert/update/delete triggers) have been significantly reworked:
 - **Config lifetime fix**: `crsql_config_set` now properly manages the statement lifetime to prevent use-after-free of returned values.
 - **`crsql_changes` schema**: The `crsql_changes` virtual table now includes a `ts` column (column index 9).
 
+## What's New in 0.18.0
+
+0.18.0 introduces a new V2 metadata format and V2 wire format for change tracking. These are opt-in in 0.18.0 and will become the default (and only) format in 0.19.0. For full design details, see [`v2_metadata_design.md`](./v2_metadata_design.md).
+
+### Mandatory `crsql_set_ts()` Before All Write Operations
+
+Starting in 0.18.0, **`crsql_set_ts()` must be called in the same transaction** before any operation that writes to clock tables or metadata. This includes:
+
+- **`crsql_as_crr()`** — creating a new CRR
+- **`crsql_begin_alter()` / `crsql_commit_alter()`** — altering CRR schema
+- **`crsql_automigrate()`** — automated schema migrations
+- **`crsql_incremental_maintenance()`** — V1→V2 migration batches
+- **`INSERT`/`UPDATE`/`DELETE` on CRR tables** — local writes (via triggers)
+- **`INSERT INTO crsql_changes`** — applying remote changes (merges)
+
+If the timestamp is not set (or was reset by a prior transaction commit), these operations will fail with an error:
+
+```
+crsql_as_crr: timestamp not set — call crsql_set_ts() first
+```
+
+The timestamp is **transaction-scoped**: it is set via `crsql_set_ts()` and resets to 0 on transaction commit or rollback. This means `crsql_set_ts()` and the operation that needs it must run in the same transaction. In autocommit mode, `SELECT crsql_set_ts(...)` does not trigger a commit (it's a read-only function call), so a subsequent `SELECT crsql_as_crr(...)` in a separate `exec` call will still see the timestamp — but the `crsql_as_crr` call itself writes to the database, which triggers an auto-commit and resets the timestamp for the next operation.
+
+**Only plain `SELECT` queries from `crsql_changes`** (reading changes without merging) do not require a timestamp to be set.
+
+Example:
+
+```sql
+-- Set timestamp before each transaction that writes to CRRs
+SELECT crsql_set_ts('1719878400000');
+SELECT crsql_as_crr('foo');
+-- ts is now reset (crsql_as_crr triggered a commit)
+
+-- Must set again for the next write operation
+SELECT crsql_set_ts('1719878400000');
+INSERT INTO foo VALUES (1, 'bar');
+```
+
+### V2 Metadata Format
+
+The V1 metadata format uses two tables per CRR: `__crsql_clock` (with `key INTEGER, col_name TEXT` as composite primary key) and `__crsql_pks` (mapping PK blobs to integer keys). This works but suffers from performance degradation at scale: self-joins are needed to retrieve the causal length (`cl`) value, deletion tombstones in the clock table slow down update operations, and the `(crsql_key, col_name)` composite PK is less compact than V2's packed integer `cell_key`.
+
+V2 replaces this with a more compact schema:
+
+- **`{table}__crsql_v2_pks`** — Maps hashed PK values to a `pk_key` and stores the causal length (`cl`) directly. PK values are hashed with `xxh3_128` truncated to `PK_HASH_SIZE` bytes, primarily to limit the size of sentinel and tombstone entries which accumulate over time. This also helps when PKs are larger than `PK_HASH_SIZE` (e.g., large compound primary keys).
+- **`{table}__crsql_v2_clock`** — Uses a packed `cell_key = (pk_key << COL_ID_BITS) | col_id` as the primary key. Column names are mapped to small integer `col_id`s via `__crsql_v2_col_map`. Tracks per cell (column value) metadata.
+- **`{table}__crsql_v2_tombstones`** — Tracks deleted rows separately, keyed by `hashed_pk`, stores the deletion causal length (`cl`).
+- **`{table}__crsql_v2_tombstone_pks`** — Maps tombstone hashed PKs back to original PK column values (for V1 wire format compatibility). Once in V2-only mode entries from this table are no longer needed and can be cleaned up.
+
+A sentinel column (`col_id = 0`) replaces the old `-1` sentinel for PK-only tables and row existence tracking. If a column is later added to a previously PK-only table, it reuses `col_id = 0` for the new column.
+
+### V2 Wire Format
+
+The V1 wire format produces one `crsql_changes` row per column change. If a transaction updates 5 columns of a row in the same db_version, that's 5 change rows. The V2 wire format coalesces all column changes for a row within the same db_version into a single packed row:
+
+- `cid` — `\0`-separated packed column names (e.g., `"col1\0col2\0col3"`)
+- `cval` — packed column values (binary blob)
+- `col_vrsn` — per-column version numbers
+
+This speeds up processing of operations touching multiple columns at the same time, for example when inserting a new row into a table.
+
+### Hashed Primary Keys
+
+V2 hashes PK values with `xxh3_128` (truncated to `PK_HASH_SIZE` bytes, currently 10) and stores them as blobs. This is primarily to limit the size of tombstone entries, which accumulate over time. V2 also moves tombstones to a dedicated `v2_tombstones` table (separate from the clock table), reducing clock table bloat from row deletions.
+
+### Incremental Migration
+
+V2 migration is designed to be incremental — large tables can be migrated in batches without long lock times.
+
+**Prerequisites:**
+- SQLite 3.44.0 or later (see [Minimum SQLite Version](#minimum-sqlite-version))
+- Load the 0.18.0 extension — it will detect the existing 0.17.0 schema and continue operating in V1 mode. No data is lost or changed.
+
+```sql
+-- Step 1: Enable dual-write mode (new changes go to both V1 and V2 tables)
+SELECT crsql_config_set('metadata-write-version', 2);
+
+-- Step 2: Run incremental maintenance in batches until complete
+-- Returns remaining rows to migrate (0 = done, -1 = error)
+-- Adjust batch size based on table size and lock tolerance
+SELECT crsql_incremental_maintenance(1000);
+-- ... repeat until the function returns 0
+
+-- Step 3: Switch reads to V2
+-- The V1 tables still exist and are maintained but not read from
+-- This way you can check that everything works correctly with V2 before dropping V1
+SELECT crsql_config_set('metadata-use-version', 2);
+
+-- Optional: Enable V2 wire format for more compact change replication
+-- This packs all column changes per row per db_version into a single crsql_changes row and crsqlite_changes will return pk hashes instead of full PK values for tombstones. Requires migration to be complete and metadata-use-version set to 2 on ALL NODES in the cluster.
+-- Nodes with metadata-use-version set to 1 will emit an error if they receive V2 wire format changes.
+SELECT crsql_config_set('sync-log-version', 2);
+
+-- Step 4: Once confident, drop V1 tables by switching to V2-only mode
+-- This is IRREVERSIBLE. If something went wrong, roll back to 1 while still in dual-write mode (step 2).
+SELECT crsql_config_set('metadata-write-version', 3);
+
+-- Step 5: Run incremental maintenance again to clean up any remaining V1 data and tables
+SELECT crsql_incremental_maintenance(1000);
+-- ... repeat until the function returns 0
+```
+
+The `metadata-write-version` config has three levels:
+- **1** — V1 only (default, legacy)
+- **2** — Dual write (V1 + V2, migration in progress, creates V2 tables)
+- **3** — V2 only (V1 tables dropped, migration complete, irreversible)
+
+For small databases, you can migrate in one shot with a large batch size. For large production databases, use smaller batches and run periodically (e.g., in a background task) to avoid long lock times.
+
+### Rollback (from dual-write mode only)
+
+To roll back to V1 while still in dual-write mode (`metadata-write-version = 2`):
+
+```sql
+SELECT crsql_config_set('metadata-write-version', 1);
+```
+
+This automatically resets `metadata-use-version` and `sync-log-version` to 1 as well. V2 tables are dropped via `crsql_incremental_maintenance`. V1 data is still intact (it was kept in sync during dual-write). Rollback is not possible once `metadata-write-version = 3` has been set.
+
+> **Note**: Once 0.19.0 is released, V1 support will be removed and rollback will not be possible. Complete the migration before upgrading to 0.19.0.
+
+### Minimum SQLite Version
+
+0.18.0 requires **SQLite 3.44.0 or later** (for `ORDER BY` in aggregate functions). The extension checks at load time. If loading into an external SQLite, verify with `SELECT sqlite_version();`.
+
 ## Usage
 
 ```sql
@@ -128,10 +255,13 @@ CREATE TABLE foo (a PRIMARY KEY NOT NULL, b);
 CREATE TABLE baz (a PRIMARY KEY NOT NULL, b, c, d);
 
 -- upgrade tables to be CRRs (conflict-free replicated relations)
+-- crsql_set_ts must be called before crsql_as_crr in the same transaction
+SELECT crsql_set_ts('1719878400000');
 SELECT crsql_as_crr('foo');
+SELECT crsql_set_ts('1719878400000');
 SELECT crsql_as_crr('baz');
 
--- optionally set a timestamp for this transaction
+-- set a timestamp for this transaction's writes
 SELECT crsql_set_ts('1719878400000');
 
 -- insert data as normal
@@ -156,6 +286,7 @@ SELECT crsql_finalize();
 ### Altering CRR Tables
 
 ```sql
+SELECT crsql_set_ts('1719878400000');
 SELECT crsql_begin_alter('table_name');
 -- 1 or more alterations
 ALTER TABLE table_name ...;
@@ -265,8 +396,16 @@ cargo run -- ../core/dist/crsqlite
 
 ### Internal Tables (per CRR table)
 
+**V1 (0.17.0, deprecated — removed in 0.19.0):**
 - **`{table}__crsql_clock`** — Per-column clock metadata (col_version, db_version, site_id, seq, ts)
 - **`{table}__crsql_pks`** — Maps primary key values to integer keys for clock table lookups
+
+**V2 (0.18.0+):**
+- **`{table}__crsql_v2_pks`** — Maps hashed PK values to `pk_key` and stores causal length (`cl`). For tables with a rowid or single INTEGER PRIMARY KEY, PK columns are not stored separately — the integer key is the rowid of the `v2_pks` table itself.
+- **`{table}__crsql_v2_col_map`** — Maps column names to small integer `col_id`s
+- **`{table}__crsql_v2_clock`** — Per-cell clock metadata keyed by packed `cell_key = (pk_key << COL_ID_BITS) | col_id`
+- **`{table}__crsql_v2_tombstones`** — Deleted row tracking, keyed by `hashed_pk`, stores the deletion causal length (`cl`)
+- **`{table}__crsql_v2_tombstone_pks`** — Maps tombstone hashed PKs back to original PK column values (V1 wire compat). Can be pruned when V2 wire format is enabled.
 
 ### Global Tables
 
@@ -278,9 +417,8 @@ cargo run -- ../core/dist/crsqlite
 
 CR-SQLite uses history-free CRDTs based on [causal length sets](https://dl.acm.org/doi/pdf/10.1145/3380787.3393678). Each table upgraded to a CRR gets:
 
-1. **Clock tables** (`__crsql_clock`) that track per-column version metadata (col_version, db_version, site_id, seq, ts)
-2. **PK lookaside tables** (`__crsql_pks`) that map composite primary keys to integer keys for efficient clock table joins
-3. **Triggers** (insert, update, delete) that automatically record changes to the clock tables
+1. **Clock tables** that track per-column version metadata (col_version, db_version, site_id, seq, ts). In V1 these are `__crsql_clock` + `__crsql_pks`; in V2 these are `__crsql_v2_clock` (packed cell keys) + `__crsql_v2_pks` (hashed PKs with causal length) + `__crsql_v2_tombstones` (deleted rows) + `__crsql_v2_col_map` (column name → col_id mapping) + `__crsql_v2_tombstone_pks` (tombstone PK values for V1 wire compat).
+2. **Triggers** (insert, update, delete) that automatically record changes into the clock tables. The same triggers work for both V1 and V2 — the extension routes internally based on the configured metadata version.
 
 Merging works by comparing column versions and causal lengths. For each incoming change:
 - If the incoming `col_version` is greater than the local one, the change wins
