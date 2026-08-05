@@ -91,6 +91,9 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
 
   // set defaults!
   pExtData->mergeEqualValues = 0;
+  pExtData->metadataWriteVersion = 1;  // V1
+  pExtData->metadataUseVersion = 1;   // V1
+  pExtData->syncLogVersion = 1;      // V1
 
   while (sqlite3_step(pStmt) == SQLITE_ROW) {
     const unsigned char *name = sqlite3_column_text(pStmt, 0);
@@ -104,6 +107,18 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
         // broken setting...
         crsql_freeExtData(pExtData);
         return 0;
+      }
+    } else if (strcmp("metadata-write-version", (char *)name) == 0) {
+      if (colType == SQLITE_INTEGER) {
+        pExtData->metadataWriteVersion = sqlite3_column_int(pStmt, 1);
+      }
+    } else if (strcmp("metadata-use-version", (char *)name) == 0) {
+      if (colType == SQLITE_INTEGER) {
+        pExtData->metadataUseVersion = sqlite3_column_int(pStmt, 1);
+      }
+    } else if (strcmp("sync-log-version", (char *)name) == 0) {
+      if (colType == SQLITE_INTEGER) {
+        pExtData->syncLogVersion = sqlite3_column_int(pStmt, 1);
       }
     } else {
       // unhandled config setting

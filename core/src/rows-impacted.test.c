@@ -11,8 +11,8 @@ static sqlite3 *createDb() {
   int rc = SQLITE_OK;
   sqlite3 *db;
   rc = sqlite3_open(":memory:", &db);
-  rc +=
-      sqlite3_exec(db, "CREATE TABLE foo (a primary key not null, b)", 0, 0, 0);
+  rc += sqlite3_exec(db, "CREATE TABLE foo (a primary key not null, b)", 0, 0, 0);
+  rc += sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db, "SELECT crsql_as_crr('foo')", 0, 0, 0);
   assert(rc == SQLITE_OK);
   return db;
@@ -26,6 +26,7 @@ static void testSingleInsertSingleTx() {
   sqlite3_stmt *pStmt = 0;
 
   rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010901', 'b', "
                      "2, 1, 1, NULL, 1, 1, '0')",
@@ -57,6 +58,7 @@ static void testManyInsertsInATx() {
   sqlite3_stmt *pStmt = 0;
 
   rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010901', 'b', "
                      "2, 1, 1, NULL, 1, 1, '0')",
@@ -94,6 +96,7 @@ static void testMultipartInsertInTx() {
   sqlite3_stmt *pStmt = 0;
 
   rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010901', 'b', "
                      "2, 1, 1, NULL, 1, 1, '0'), "
@@ -126,6 +129,7 @@ static void testManyTxns() {
   sqlite3_stmt *pStmt = 0;
 
   rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010901', 'b', "
                      "2, 1, 1, NULL, 1, 1, '0')",
@@ -138,6 +142,7 @@ static void testManyTxns() {
   assert(rc == SQLITE_OK);
 
   rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010902', 'b', "
                      "2, 1, 1, NULL, 1, 1, '0')",
@@ -168,6 +173,7 @@ static void testManyTxns() {
 //   sqlite3_stmt *pStmt = 0;
 
 //   rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
+//   sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
 //   rc += sqlite3_prepare_v2(
 //       db,
 //       "INSERT INTO crsql_changes VALUES ('foo', 1, 'b', 2, 1, 1, NULL), "
@@ -196,6 +202,7 @@ static void testUpdateThatDoesNotChangeAnything() {
   rc = sqlite3_exec(db, "INSERT INTO foo VALUES (1, 2)", 0, 0, 0);
 
   rc += sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', "
                      "crsql_pack_columns(1), 'b', 2, 1, 1, NULL, 1, 1, '0')",
@@ -209,6 +216,7 @@ static void testUpdateThatDoesNotChangeAnything() {
 
   // now test value <
   rc += sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', "
                      "crsql_pack_columns(1), 'b', 0, 1, 1, NULL, 1, 1, '0')",
@@ -222,6 +230,7 @@ static void testUpdateThatDoesNotChangeAnything() {
 
   // now test clock <
   rc += sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', "
                      "crsql_pack_columns(1), 'b', 2, 0, 0, NULL, 1, 1, '0')",
@@ -248,6 +257,7 @@ static void testDeleteThatDoesNotChangeAnything() {
   rc = sqlite3_exec(db, "DELETE FROM foo", 0, 0, 0);
 
   rc += sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(
       db,
       "INSERT INTO crsql_changes VALUES ('foo', crsql_pack_columns(1), "
@@ -274,6 +284,7 @@ static void testDelete() {
   rc = sqlite3_exec(db, "INSERT INTO foo VALUES (1, 2)", 0, 0, 0);
 
   rc += sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010901', "
                      "'-1', NULL, 2, 2, NULL, 2, 1, '0')",  //__crsql_del
@@ -299,6 +310,7 @@ static void testCreateThatDoesNotChangeAnything() {
   rc = sqlite3_exec(db, "INSERT INTO foo VALUES (1, 2)", 0, 0, 0);
 
   rc += sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010901', 'b', "
                      "2, 1, 1, NULL, 1, 1, '0')",
@@ -324,6 +336,7 @@ static void testValueWin() {
   rc = sqlite3_exec(db, "INSERT INTO foo VALUES (1, 2)", 0, 0, 0);
 
   rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010901', 'b', "
                      "3, 1, 1, X'00000000000000000000000000000000', 1, 1, '0')",
@@ -349,6 +362,7 @@ static void testClockWin() {
   rc = sqlite3_exec(db, "INSERT INTO foo VALUES (1, 2)", 0, 0, 0);
 
   rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
   rc += sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010901', 'b', "
                      "2, 2, 2, NULL, 1, 1, '0')",
