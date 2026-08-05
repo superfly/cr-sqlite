@@ -18,6 +18,7 @@ use crate::tableinfo::{crsql_ensure_table_infos_are_up_to_date, ColumnInfo, Tabl
 pub mod after_delete;
 pub mod after_insert;
 pub mod after_update;
+pub mod v2;
 
 fn trigger_fn_preamble<F>(
     ctx: *mut sqlite::context,
@@ -111,7 +112,7 @@ fn mark_new_pk_row_created(
     result
 }
 
-fn bump_seq(ext_data: *mut crsql_ExtData) -> c_int {
+pub fn bump_seq(ext_data: *mut crsql_ExtData) -> c_int {
     unsafe {
         (*ext_data).seq += 1;
         (*ext_data).seq - 1

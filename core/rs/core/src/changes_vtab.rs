@@ -21,6 +21,7 @@ use sqlite_nostd::ResultCode;
 use crate::c::{
     crsql_Changes_cursor, crsql_Changes_vtab, ChangeRowType, ClockUnionColumn, CrsqlChangesColumn,
 };
+use crate::consts;
 use crate::changes_vtab_read::changes_union_query;
 use crate::pack_columns::bind_package_to_stmt;
 use crate::pack_columns::unpack_columns;
@@ -289,7 +290,9 @@ unsafe fn changes_filter(
         return Ok(ResultCode::OK);
     }
 
-    let sql = changes_union_query(&tbl_infos, idx_str)?;
+    let metadata_use_version = unsafe { (*(*tab).pExtData).metadataUseVersion };
+    let sync_log_version = unsafe { (*(*tab).pExtData).syncLogVersion };
+    let sql = changes_union_query(&tbl_infos, idx_str, metadata_use_version, sync_log_version)?;
 
     let stmt = db.prepare_v2(&sql)?;
     for (i, arg) in args.iter().enumerate() {
@@ -387,14 +390,27 @@ unsafe fn changes_next(
         return Err(ResultCode::ERROR);
     }
 
-    if cid == crate::c::DELETE_SENTINEL {
+    if cid == crate::c::DELETE_SENTINEL || cid == consts::V2_HASH_TOMBSTONE_CID {
         (*cursor).rowType = ChangeRowType::Delete as c_int;
         return Ok(ResultCode::OK);
     } else if cid == crate::c::INSERT_SENTINEL {
         (*cursor).rowType = ChangeRowType::PkOnly as c_int;
         return Ok(ResultCode::OK);
     } else {
+        let sync_log_version = (*(*(*cursor).pTab).pExtData).syncLogVersion;
+        if sync_log_version == crate::consts::SYNC_LOG_V2 {
+            // Packed (v2 sync-log) row: all update rows are packed in V2 wire format.
+            // cval is already in the query result (ClockUnionColumn::Cval), no lazy fetch needed.
+            (*cursor).rowType = ChangeRowType::PackedUpdate as c_int;
+            return Ok(ResultCode::OK);
+        }
         (*cursor).rowType = ChangeRowType::Update as c_int;
+    }
+
+    // V2 metadata fetches cval inline in the query — no lazy fetch needed.
+    let metadata_use_version = (*(*(*cursor).pTab).pExtData).metadataUseVersion;
+    if metadata_use_version == crate::consts::META_USE_V2 {
+        return Ok(ResultCode::OK);
     }
 
     let row_stmt_ref = tbl_info.get_row_patch_data_stmt((*(*cursor).pTab).db, cid)?;
@@ -457,20 +473,62 @@ fn column_impl(
             ctx.result_value(changes_stmt.column_value(ClockUnionColumn::Pks as i32));
         }
         Some(CrsqlChangesColumn::Cval) => unsafe {
-            if (*cursor).pRowStmt.is_null() {
-                ctx.result_null();
-            } else {
-                ctx.result_value((*cursor).pRowStmt.column_value(0));
+            let row_type = ChangeRowType::from_i32((*cursor).rowType);
+            match row_type {
+                Some(ChangeRowType::PackedUpdate) => {
+                    // Packed format: cval is in the query result directly.
+                    // Copy blob data to a local Vec before passing to result_blob_transient
+                    // to avoid use-after-free when other columns are read from the underlying stmt.
+                    let val = changes_stmt.column_value(ClockUnionColumn::Cval as i32);
+                    let blob_copy: Vec<u8> = val.blob().to_vec();
+                    ctx.result_blob_transient(&blob_copy);
+                }
+                Some(ChangeRowType::Update) => {
+                    // V2 metadata: cval is inline in the query (pRowStmt is null, lazy fetch skipped).
+                    // Use result_value to preserve the original type (text, int, float, blob).
+                    // V1 metadata: cval is fetched lazily via pRowStmt.
+                    if (*cursor).pRowStmt.is_null() {
+                        let val = changes_stmt.column_value(ClockUnionColumn::Cval as i32);
+                        ctx.result_value(val);
+                    } else {
+                        ctx.result_value((*cursor).pRowStmt.column_value(0));
+                    }
+                }
+                _ => {
+                    // V1 metadata: lazy fetch from main table via pRowStmt
+                    if (*cursor).pRowStmt.is_null() {
+                        ctx.result_null();
+                    } else {
+                        ctx.result_value((*cursor).pRowStmt.column_value(0));
+                    }
+                }
             }
         },
         Some(CrsqlChangesColumn::Cid) => unsafe {
             let row_type = ChangeRowType::from_i32((*cursor).rowType);
             match row_type {
                 Some(ChangeRowType::PkOnly) => ctx.result_text_static(crate::c::INSERT_SENTINEL),
-                Some(ChangeRowType::Delete) => ctx.result_text_static(crate::c::DELETE_SENTINEL),
+                Some(ChangeRowType::Delete) => {
+                    // Could be -1 (V1 delete sentinel) or -2 (V2 hash tombstone)
+                    ctx.result_value(changes_stmt.column_value(ClockUnionColumn::Cid as i32));
+                }
+                Some(ChangeRowType::PackedUpdate) => {
+                    // Packed format: cid is group_concat with char(0) separators, cast to blob.
+                    // Read as blob explicitly to preserve null-byte separators.
+                    let blob_copy: Vec<u8> = changes_stmt.column_blob(ClockUnionColumn::Cid as i32).to_vec();
+                    ctx.result_blob_transient(&blob_copy);
+                }
                 Some(ChangeRowType::Update) => {
+                    // V2 metadata: pRowStmt is null (no lazy fetch), cid is in the query result.
+                    // V1 metadata: pRowStmt is non-null if the row exists in the main table.
+                    //   If pRowStmt is null in V1, the row was deleted — return DELETE_SENTINEL.
                     if (*cursor).pRowStmt.is_null() {
-                        ctx.result_text_static(crate::c::DELETE_SENTINEL);
+                        let metadata_use_version = (*(*(*cursor).pTab).pExtData).metadataUseVersion;
+                        if metadata_use_version == crate::consts::META_USE_V2 {
+                            ctx.result_value(changes_stmt.column_value(ClockUnionColumn::Cid as i32));
+                        } else {
+                            ctx.result_text_static(crate::c::DELETE_SENTINEL);
+                        }
                     } else {
                         ctx.result_value(changes_stmt.column_value(ClockUnionColumn::Cid as i32));
                     }
@@ -478,8 +536,14 @@ fn column_impl(
                 None => return Err(ResultCode::ABORT),
             }
         },
-        Some(CrsqlChangesColumn::ColVrsn) => {
-            ctx.result_value(changes_stmt.column_value(ClockUnionColumn::ColVrsn as i32));
+        Some(CrsqlChangesColumn::ColVrsn) => unsafe {
+            let row_type = ChangeRowType::from_i32((*cursor).rowType);
+            if row_type == Some(ChangeRowType::PackedUpdate) {
+                let blob_copy: Vec<u8> = changes_stmt.column_blob(ClockUnionColumn::ColVrsn as i32).to_vec();
+                ctx.result_blob_transient(&blob_copy);
+            } else {
+                ctx.result_value(changes_stmt.column_value(ClockUnionColumn::ColVrsn as i32));
+            }
         }
         Some(CrsqlChangesColumn::DbVrsn) => {
             ctx.result_value(changes_stmt.column_value(ClockUnionColumn::DbVrsn as i32));
@@ -489,8 +553,14 @@ fn column_impl(
             // sholdn't matter..
             ctx.result_value(changes_stmt.column_value(ClockUnionColumn::SiteId as i32));
         }
-        Some(CrsqlChangesColumn::Seq) => {
-            ctx.result_value(changes_stmt.column_value(ClockUnionColumn::Seq as i32));
+        Some(CrsqlChangesColumn::Seq) => unsafe {
+            let row_type = ChangeRowType::from_i32((*cursor).rowType);
+            if row_type == Some(ChangeRowType::PackedUpdate) {
+                let blob_copy: Vec<u8> = changes_stmt.column_blob(ClockUnionColumn::Seq as i32).to_vec();
+                ctx.result_blob_transient(&blob_copy);
+            } else {
+                ctx.result_value(changes_stmt.column_value(ClockUnionColumn::Seq as i32));
+            }
         }
         Some(CrsqlChangesColumn::Cl) => {
             ctx.result_value(changes_stmt.column_value(ClockUnionColumn::Cl as i32))

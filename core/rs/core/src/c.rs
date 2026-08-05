@@ -38,13 +38,18 @@ pub enum ClockUnionColumn {
     Seq = 7,
     Cl = 8,
     Ts = 9,
+    Cval = 10,
 }
 
+// TODO(0.19): Remove ChangeRowType entirely once V1 wire format is dropped.
+// In V2-only mode, all rows are packed and the row type discrimination
+// (Update vs PackedUpdate, lazy cval fetch, etc.) is no longer needed.
 #[derive(FromPrimitive, PartialEq, Debug)]
 pub enum ChangeRowType {
     Update = 0,
     Delete = 1,
     PkOnly = 2,
+    PackedUpdate = 3,
 }
 
 #[repr(C)]
@@ -72,6 +77,9 @@ pub struct crsql_ExtData {
     pub pSelectSiteIdOrdinalStmt: *mut sqlite::stmt,
     pub pSelectClockTablesStmt: *mut sqlite::stmt,
     pub mergeEqualValues: ::core::ffi::c_int,
+    pub metadataWriteVersion: ::core::ffi::c_int,
+    pub metadataUseVersion: ::core::ffi::c_int,
+    pub syncLogVersion: ::core::ffi::c_int,
     pub timestamp: ::core::ffi::c_ulonglong,
     pub ordinalMap: *mut ::core::ffi::c_void,
     pub pVersionGuardStmt: *mut sqlite::stmt,
@@ -277,7 +285,7 @@ fn bindgen_test_layout_crsql_ExtData() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::core::mem::size_of::<crsql_ExtData>(),
-        184usize,
+        192usize,
         concat!("Size of: ", stringify!(crsql_ExtData))
     );
     assert_eq!(
@@ -498,8 +506,38 @@ fn bindgen_test_layout_crsql_ExtData() {
         )
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).timestamp) as usize - ptr as usize },
+        unsafe { ::core::ptr::addr_of!((*ptr).metadataWriteVersion) as usize - ptr as usize },
+        148usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_ExtData),
+            "::",
+            stringify!(metadataWriteVersion)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).metadataUseVersion) as usize - ptr as usize },
         152usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_ExtData),
+            "::",
+            stringify!(metadataUseVersion)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).syncLogVersion) as usize - ptr as usize },
+        156usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_ExtData),
+            "::",
+            stringify!(syncLogVersion)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).timestamp) as usize - ptr as usize },
+        160usize,
         concat!(
             "Offset of field: ",
             stringify!(crsql_ExtData),
@@ -509,7 +547,7 @@ fn bindgen_test_layout_crsql_ExtData() {
     );
     assert_eq!(
         unsafe { ::core::ptr::addr_of!((*ptr).ordinalMap) as usize - ptr as usize },
-        160usize,
+        168usize,
         concat!(
             "Offset of field: ",
             stringify!(crsql_ExtData),
@@ -519,12 +557,12 @@ fn bindgen_test_layout_crsql_ExtData() {
     );
     assert_eq!(
         unsafe { ::core::ptr::addr_of!((*ptr).pVersionGuardStmt) as usize - ptr as usize },
-        168usize,
+        176usize,
         "Offset of pVersionGuardStmt"
     );
     assert_eq!(
         unsafe { ::core::ptr::addr_of!((*ptr).versionGuardEnlisted) as usize - ptr as usize },
-        176usize,
+        184usize,
         "Offset of versionGuardEnlisted"
     );
 }
