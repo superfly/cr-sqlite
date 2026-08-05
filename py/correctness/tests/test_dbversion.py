@@ -16,6 +16,7 @@ def test_min_on_init():
 def test_increments_on_modification():
     c = connect(":memory:")
     c.execute("create table foo (id primary key not null, a)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('foo')")
     c.execute("insert into foo values (1, 2)")
     c.execute("commit")
@@ -39,6 +40,7 @@ def test_db_version_restored_from_disk():
 
     # close and re-open to check that we work with empty clock tables
     c.execute("create table foo (id primary key not null, a)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('foo')")
     c.close()
     c = connect(dbfile)
@@ -64,6 +66,7 @@ def test_db_version_restored_from_disk():
     # create a new db and sync with it
     c2 = connect(":memory:")
     c2.execute("CREATE TABLE foo (id primary key not null, a);")
+    c2.execute("SELECT crsql_set_ts('1700000000')")
     c2.execute("SELECT crsql_as_crr('foo');")
 
     sync_left_to_right(c, c2, 0)
@@ -92,6 +95,7 @@ def test_each_tx_gets_a_version():
     c = connect(":memory:")
 
     c.execute("create table foo (id primary key not null, a)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('foo')")
     c.execute("insert into foo values (1, 2)")
     c.execute("insert into foo values (2, 2)")
@@ -110,6 +114,7 @@ def test_rollback_does_not_move_db_version():
     c = connect(":memory:")
 
     c.execute("create table foo (id primary key not null, a)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('foo')")
 
     c.execute("insert into foo values (1, 2)")
@@ -139,6 +144,7 @@ def test_overwriting_keeps_track_of_true_db_version():
     def create_db():
         db1 = connect(":memory:")
         db1.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b DEFAULT 0);")
+        db1.execute("SELECT crsql_set_ts('1700000000')")
         db1.execute("SELECT crsql_as_crr('foo');")
         db1.commit()
         return db1

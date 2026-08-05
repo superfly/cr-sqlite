@@ -1214,16 +1214,24 @@ fn test_dual_write_seq_fuzz() -> Result<(), ResultCode> {
 fn test_compile_const_mismatch() -> Result<(), ResultCode> {
     libc_println!("=== test_compile_const_mismatch START ===");
 
-    let path = "/tmp/crsql_const_test.db\0";
+    let path = "crsql_const_test.db\0";
     let path_str = path.trim_end_matches('\0');
 
+    #[cfg(not(target_os = "windows"))]
     extern "C" {
         fn unlink(pathname: *const core::ffi::c_char) -> core::ffi::c_int;
+    }
+    #[cfg(target_os = "windows")]
+    extern "C" {
+        fn _unlink(pathname: *const core::ffi::c_char) -> core::ffi::c_int;
     }
 
     // Remove any leftover file from previous runs
     unsafe {
+        #[cfg(not(target_os = "windows"))]
         unlink(path.as_ptr() as *const core::ffi::c_char);
+        #[cfg(target_os = "windows")]
+        _unlink(path.as_ptr() as *const core::ffi::c_char);
     }
 
     // Create a fresh DB and initialize crsql
@@ -1285,7 +1293,10 @@ fn test_compile_const_mismatch() -> Result<(), ResultCode> {
 
     // Clean up
     unsafe {
+        #[cfg(not(target_os = "windows"))]
         unlink(path.as_ptr() as *const core::ffi::c_char);
+        #[cfg(target_os = "windows")]
+        _unlink(path.as_ptr() as *const core::ffi::c_char);
     }
 
     Ok(())

@@ -7,6 +7,7 @@ def connect(db_file, uri=False):
     c = sqlite3.connect(db_file, uri=uri)
     c.enable_load_extension(True)
     c.load_extension(extension)
+    c.execute("SELECT crsql_set_ts('1700000000')")
     return c
 
 
@@ -22,6 +23,7 @@ def sync_left_to_right(l, r, since):
     print("sync_left_to_right")
     changes = l.execute(
         "SELECT * FROM crsql_changes WHERE db_version > ?", (since,))
+    r.execute("SELECT crsql_set_ts('1700000000')")
     for change in changes:
         r.execute(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)

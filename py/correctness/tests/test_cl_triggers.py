@@ -22,6 +22,7 @@ def create_db(db_file=None):
         db_file = ":memory:"
     c = connect(db_file)
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
     return c
@@ -33,6 +34,7 @@ def sync_left_to_right(l, r, since):
     changes = l.execute(
         "SELECT * FROM crsql_changes WHERE db_version > ?", (since,))
     for change in changes:
+        r.execute("SELECT crsql_set_ts('1700000000')")
         r.execute(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
     r.commit()
@@ -43,6 +45,7 @@ def test_upsert_non_existing():
     c = connect(":memory:")
     c.execute(
         "CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL NOT NULL, b TEXT) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -63,6 +66,7 @@ def test_upsert_non_existing():
 def test_insert_delete_insert_delete():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -85,6 +89,7 @@ def test_insert_delete_insert_delete():
 def test_upsert_previously_existing():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -118,6 +123,7 @@ def test_upsert_previously_existing():
 def test_upsert_currently_existing():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -149,6 +155,7 @@ def test_upsert_currently_existing():
 def test_update_existing():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -173,6 +180,7 @@ def test_update_existing():
 def test_insert_existing():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -193,6 +201,7 @@ def test_insert_existing():
 def test_insert_or_ignore_existing():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -212,6 +221,7 @@ def test_insert_or_ignore_existing():
 def test_delete_existing():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -228,6 +238,7 @@ def test_delete_existing():
 def test_delete_previously_deleted():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -416,6 +427,7 @@ def test_change_primary_key_from_another_db():
 def test_change_primary_key_away_from_thing_with_large_length():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -439,6 +451,7 @@ def test_change_primary_key_away_from_thing_with_large_length():
 def test_insert_previously_existing():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 

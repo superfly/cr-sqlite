@@ -21,6 +21,7 @@ def sync_left_to_right(l, r, since):
     changes = l.execute(
         "SELECT * FROM crsql_changes WHERE db_version > ?", (since,))
     for change in changes:
+        r.execute("SELECT crsql_set_ts('1700000000')")
         r.execute(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
     r.commit()
@@ -33,9 +34,13 @@ def create_schema(c):
     c.execute(
         "CREATE TABLE component (id primary key not null, type, slide_id, content)")
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('user')")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('deck')")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('slide')")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('component')")
 
 
@@ -160,6 +165,7 @@ def test_merging_on_defaults():
         db1 = connect(":memory:")
         db1.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b DEFAULT 0);")
         db1.execute("INSERT INTO foo (a) VALUES (1);")
+        db1.execute("SELECT crsql_set_ts('1700000000')")
         db1.execute("SELECT crsql_as_crr('foo');")
         db1.commit()
         return db1
@@ -168,6 +174,7 @@ def test_merging_on_defaults():
         db2 = connect(":memory:")
         db2.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b DEFAULT 0);")
         db2.execute("INSERT INTO foo VALUES (1, 2);")
+        db2.execute("SELECT crsql_set_ts('1700000000')")
         db2.execute("SELECT crsql_as_crr('foo');")
         db2.commit()
         return db2
@@ -218,11 +225,13 @@ def test_merging_larger_backfilled_default():
         db1 = connect(":memory:")
         db1.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b DEFAULT 4);")
         db1.execute("INSERT INTO foo (a) VALUES (1);")
+        db1.execute("SELECT crsql_set_ts('1700000000')")
         db1.execute("SELECT crsql_as_crr('foo');")
         db1.commit()
 
         db2 = connect(":memory:")
         db2.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b DEFAULT 4);")
+        db2.execute("SELECT crsql_set_ts('1700000000')")
         db2.execute("SELECT crsql_as_crr('foo');")
         db2.commit()
         db2.execute("INSERT INTO foo (a,b) VALUES (1,2);")
@@ -249,14 +258,17 @@ def test_merging_larger():
 def test_db_version_moves_as_expected_post_alter():
     db = connect(":memory:")
     db.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b);")
+    db.execute("SELECT crsql_set_ts('1700000000')")
     db.execute("SELECT crsql_as_crr('foo');")
     db.commit()
 
     db.execute("INSERT INTO foo (a, b) VALUES (1, 2);")
     db.commit()
 
+    db.execute("SELECT crsql_set_ts('1700000000')")
     db.execute("SELECT crsql_begin_alter('foo');")
     db.execute("ALTER TABLE foo ADD COLUMN c;")
+    db.execute("SELECT crsql_set_ts('1700000000')")
     db.execute("SELECT crsql_commit_alter('foo');")
     db.commit()
 
@@ -285,16 +297,19 @@ def test_merging_on_defaults2():
     def create_db1():
         db1 = connect(":memory:")
         db1.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b DEFAULT 4);")
+        db1.execute("SELECT crsql_set_ts('1700000000')")
         db1.execute("SELECT crsql_as_crr('foo');")
         db1.commit()
 
         db1.execute("INSERT INTO foo (a) VALUES (1);")
         db1.commit()
 
+        db1.execute("SELECT crsql_set_ts('1700000000')")
         db1.execute("SELECT crsql_begin_alter('foo')")
         # Test with higher than incoming value and lower than incoming value
         # defaults
         db1.execute("ALTER TABLE foo ADD COLUMN c DEFAULT 0;")
+        db1.execute("SELECT crsql_set_ts('1700000000')")
         db1.execute("SELECT crsql_commit_alter('foo')")
         db1.commit()
         return db1
@@ -302,11 +317,14 @@ def test_merging_on_defaults2():
     def create_db2():
         db2 = connect(":memory:")
         db2.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b DEFAULT 4);")
+        db2.execute("SELECT crsql_set_ts('1700000000')")
         db2.execute("SELECT crsql_as_crr('foo');")
         db2.commit()
 
+        db2.execute("SELECT crsql_set_ts('1700000000')")
         db2.execute("SELECT crsql_begin_alter('foo')")
         db2.execute("ALTER TABLE foo ADD COLUMN c DEFAULT 0;")
+        db2.execute("SELECT crsql_set_ts('1700000000')")
         db2.execute("SELECT crsql_commit_alter('foo')")
         db2.commit()
 
@@ -350,6 +368,7 @@ def test_merging_on_defaults2():
 def create_basic_db():
     db = connect(":memory:")
     db.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b);")
+    db.execute("SELECT crsql_set_ts('1700000000')")
     db.execute("SELECT crsql_as_crr('foo');")
     db.commit()
     return db

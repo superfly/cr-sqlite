@@ -27,6 +27,7 @@ def make_simple_schema(count=-1):
     else:
         c = connect("test" + str(count) + ".db")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
     return c
@@ -35,6 +36,7 @@ def make_simple_schema(count=-1):
 def make_pko_schema():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
     return c
@@ -44,6 +46,7 @@ def sync_left_to_right(l, r, since):
     changes = l.execute(
         "SELECT * FROM crsql_changes WHERE db_version > ?", (since,))
     for change in changes:
+        r.execute("SELECT crsql_set_ts('1700000000')")
         r.execute(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
     r.commit()
@@ -53,6 +56,7 @@ def sync_left_to_right_exact_version(l, r, db_version):
     changes = l.execute(
         "SELECT * FROM crsql_changes WHERE db_version = ?", (db_version,))
     for change in changes:
+        r.execute("SELECT crsql_set_ts('1700000000')")
         r.execute(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
     r.commit()
@@ -62,6 +66,7 @@ def sync_left_to_right_include_siteid(l, r, since):
     changes = l.execute(
         "SELECT [table], pk, cid, val, col_version, db_version, site_id, cl, seq, ts FROM crsql_changes WHERE db_version > ?", (since,))
     for change in changes:
+        r.execute("SELECT crsql_set_ts('1700000000')")
         r.execute(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
     r.commit()
@@ -78,6 +83,7 @@ def sync_left_to_right_normal_delta_state(l, r, since):
     largest_version = 0
     for change in changes:
         max(largest_version, change[5])
+        r.execute("SELECT crsql_set_ts('1700000000')")
         r.execute(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
     r.commit()
@@ -90,6 +96,7 @@ def sync_left_to_right_single_vrsn(l, r, vrsn):
         "SELECT [table], pk, cid, val, col_version, db_version, site_id, cl, seq, ts FROM crsql_changes WHERE db_version = ? AND site_id IS NOT ?",
         (vrsn, r_siteid))
     for change in changes:
+        r.execute("SELECT crsql_set_ts('1700000000')")
         r.execute(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
     r.commit()
@@ -396,6 +403,7 @@ def test_resurrection_of_live_thing_via_sentinel():
     # only merge over the sentinal colun to c2
     sentinel_resurrect = c1.execute(
         "SELECT * FROM crsql_changes WHERE cid = '-1'").fetchone()
+    c2.execute("SELECT crsql_set_ts('1700000000')")
     c2.execute(
         "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", sentinel_resurrect)
     c2.commit()
@@ -411,6 +419,7 @@ def test_resurrection_of_live_thing_via_sentinel():
     # now lets finish getting changes from the other node
     changes = c1.execute(
         "SELECT * FROM crsql_changes WHERE cid != '-1'").fetchone()
+    c2.execute("SELECT crsql_set_ts('1700000000')")
     c2.execute(
         "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", changes)
     c2.commit()
@@ -456,6 +465,7 @@ def test_resurrection_of_live_thing_via_sentinel_multiple():
 
     c3_changes = c3.execute(
         "SELECT * FROM crsql_changes").fetchone()
+    c2.execute("SELECT crsql_set_ts('1700000000')")
     c2.execute(
         "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", c3_changes)
     c2.commit()
@@ -469,10 +479,12 @@ def test_resurrection_of_live_thing_via_sentinel_multiple():
     # only merge over the sentinal colun to c2
     sentinel_resurrect = c1.execute(
         "SELECT * FROM crsql_changes WHERE cid = '-1'").fetchone()
+    c2.execute("SELECT crsql_set_ts('1700000000')")
     c2.execute(
         "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", sentinel_resurrect)
     c2.commit()
 
+    c3.execute("SELECT crsql_set_ts('1700000000')")
     c3.execute(
         "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", sentinel_resurrect)
     c3.commit()
@@ -489,10 +501,12 @@ def test_resurrection_of_live_thing_via_sentinel_multiple():
     # now lets finish getting changes from the other node
     changes = c1.execute(
         "SELECT * FROM crsql_changes WHERE cid != '-1'").fetchone()
+    c2.execute("SELECT crsql_set_ts('1700000000')")
     c2.execute(
         "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", changes)
     c2.commit()
 
+    c3.execute("SELECT crsql_set_ts('1700000000')")
     c3.execute(
         "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", changes)
     c3.commit()
@@ -530,10 +544,12 @@ def test_resurrection_of_live_thing_via_sentinel_out_of_order():
     # only merge over the sentinal colun to c2
     sentinel_resurrect = c1.execute(
         "SELECT * FROM crsql_changes WHERE cid = '-1'").fetchone()
+    c2.execute("SELECT crsql_set_ts('1700000000')")
     c2.execute(
         "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", sentinel_resurrect)
     c2.commit()
 
+    c3.execute("SELECT crsql_set_ts('1700000000')")
     c3.execute(
         "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", sentinel_resurrect)
     c3.commit()
@@ -550,6 +566,7 @@ def test_resurrection_of_live_thing_via_sentinel_out_of_order():
 
     changes_c2 = c2.execute(
         "SELECT * FROM crsql_changes WHERE cid != '-1'").fetchone()
+    c3.execute("SELECT crsql_set_ts('1700000000')")
     c3.execute(
         "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", changes_c2)
     c3.commit()
@@ -561,10 +578,13 @@ def test_resurrection_of_live_thing_via_sentinel_out_of_order():
     # now lets finish getting changes from the other node
     changes = c1.execute(
         "SELECT * FROM crsql_changes WHERE cid != '-1'").fetchone()
+    c2.execute("SELECT crsql_set_ts('1700000000')")
     c2.execute(
         "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", changes)
     c2.commit()
 
+    c3.execute("SELECT crsql_set_ts('1700000000')")
+    c3.execute("SELECT crsql_set_ts('1700000000')")
     c3.execute("INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", changes)
     c3.commit()
 
@@ -595,6 +615,7 @@ def test_resurrection_of_live_thing_via_non_sentinel():
 
     non_sentinel_resurrect = c1.execute(
         "SELECT * FROM crsql_changes WHERE cid != '-1'").fetchone()
+    c2.execute("SELECT crsql_set_ts('1700000000')")
     c2.execute(
         "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", non_sentinel_resurrect)
     c2.commit()
@@ -630,6 +651,7 @@ def test_resurrection_of_dead_thing_via_sentinel():
 
     sentinel_resurrect = c1.execute(
         "SELECT * FROM crsql_changes WHERE cid = '-1'").fetchone()
+    c2.execute("SELECT crsql_set_ts('1700000000')")
     c2.execute(
         "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", sentinel_resurrect)
     c2.commit()
@@ -660,6 +682,7 @@ def test_resurrection_of_dead_thing_via_non_sentinel():
 
     sentinel_resurrect = c1.execute(
         "SELECT * FROM crsql_changes WHERE cid != '-1'").fetchone()
+    c2.execute("SELECT crsql_set_ts('1700000000')")
     c2.execute(
         "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", sentinel_resurrect)
     c2.commit()
@@ -709,6 +732,7 @@ def test_delete_via_sentinel():
 
     sentinel_delete = c1.execute(
         "SELECT * FROM crsql_changes WHERE cid = '-1'").fetchone()
+    c2.execute("SELECT crsql_set_ts('1700000000')")
     c2.execute(
         "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", sentinel_delete)
     c2.commit()
@@ -843,6 +867,7 @@ def run_step(conn, step):
 def create_hypothesis_schema(c):
     c.execute(
         "CREATE TABLE item (id PRIMARY KEY NOT NULL, width INTEGER, height INTEGER, name TEXT, description TEXT, weight INTEGER)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('item')")
 
 
@@ -1096,6 +1121,7 @@ def test_discord_report_corrosion():
     def make_schema():
         c = connect(":memory:")
         c.execute("CREATE TABLE foo (a primary key not null, b, c, d, e)")
+        c.execute("SELECT crsql_set_ts('1700000000')")
         c.execute("SELECT crsql_as_crr('foo')")
         c.commit()
         return c

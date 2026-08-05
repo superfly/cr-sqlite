@@ -10,6 +10,7 @@ from pprint import pprint
 def create_db():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
     return c
@@ -18,6 +19,7 @@ def create_db():
 def test_insert_row():
     # db version, seq, col version, site id, cl should all be from the insertion
     c = create_db()
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute(
         "INSERT INTO crsql_changes VALUES ('foo', x'010901', 'b', 1, 4, 4, x'1dc8d6bb7f8941088327d9439a7927a4', 3, 6, '0')")
     c.commit()
@@ -50,6 +52,7 @@ def test_update_row():
     c = create_db()
     c.execute("INSERT INTO foo VALUES (1, 2)")
     c.commit()
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute(
         "INSERT INTO crsql_changes VALUES ('foo', x'010901', 'b', 1, 4, 4, x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF', 3, 6, '0')")
     changes = c.execute("SELECT * FROM crsql_changes").fetchall()
@@ -80,6 +83,8 @@ def test_delete_row():
     c = create_db()
     c.execute("INSERT INTO foo VALUES (1, 2)")
     c.commit()
+    c.execute("SELECT crsql_set_ts('1700000000')")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("INSERT INTO crsql_changes VALUES ('foo', x'010901', '-1', 1, 4, 4, x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF', 4, 6, '0')")
     c.commit()
     changes = c.execute("SELECT * FROM crsql_changes").fetchall()
@@ -102,6 +107,7 @@ def test_custom_trigger():
                 INSERT INTO log (b) VALUES (1);
               END;""")
     c.commit()
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute(
         "INSERT INTO crsql_changes VALUES ('foo', x'010901', 'b', 1, 4, 4, x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF', 3, 6, '0')")
     c.commit()
@@ -121,6 +127,7 @@ def test_custom_trigger():
                 INSERT INTO log (b) VALUES (1);
               END;""")
     c.commit()
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute(
         "INSERT INTO crsql_changes VALUES ('foo', x'010902', 'b', 1, 4, 4, x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF', 3, 6, '0')")
     rows = c.execute("SELECT * FROM log").fetchall()
