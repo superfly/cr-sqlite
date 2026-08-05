@@ -50,6 +50,15 @@ pub struct TableInfo {
     /// V2 uses __crsql_key = main_table.rowid and fetches PK values from
     /// the main table via SELECT pk_cols WHERE rowid = ?.
     /// See design doc §3 "__crsql_key Assignment (Rowid Reuse)".
+    ///
+    /// IMPORTANT: This flag is about using the implicit SQLite rowid as
+    /// __crsql_key in v2_pks (3-column schema). It is NOT the same as
+    /// "INTEGER PRIMARY KEY" — that is a separate SQLite concept. Currently
+    /// this is only enabled for single INTEGER PRIMARY KEY tables where the
+    /// PK column IS the rowid alias, but the concept is independent and may
+    /// be extended to other rowid tables in the future. When this is true,
+    /// the rowid must be looked up from the base table via rowid_alias —
+    /// do NOT assume unpacked_pks[0] is the rowid.
     pub uses_rowid_key: bool,
     /// The column name to use as the rowid alias for JOINs/ad-hoc queries.
     /// For INTEGER PRIMARY KEY tables: the PK column name (e.g. "id").

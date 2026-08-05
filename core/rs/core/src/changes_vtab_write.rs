@@ -2,6 +2,7 @@ use alloc::boxed::Box;
 use alloc::ffi::CString;
 use alloc::format;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_int};
 use core::mem;
@@ -179,7 +180,7 @@ fn set_winner_clock(
     insert_db_vrsn: sqlite::int64,
     insert_site_id: &[u8],
     insert_seq: sqlite::int64,
-    insert_ts: &str,
+    insert_ts: sqlite::int64,
 ) -> Result<sqlite::int64, ResultCode> {
     // set the site_id ordinal
     // get the returned ordinal
@@ -207,7 +208,10 @@ fn set_winner_clock(
             Some(ordinal) => set_stmt.bind_int64(6, ordinal),
             None => set_stmt.bind_null(6),
         })
-        .and_then(|_| set_stmt.bind_text(7, insert_ts, sqlite::Destructor::STATIC));
+        .and_then(|_| {
+            let ts_str = format!("{}", insert_ts);
+            set_stmt.bind_text(7, &ts_str, sqlite::Destructor::TRANSIENT)
+        });
 
     if let Err(rc) = bind_result {
         reset_cached_stmt(set_stmt.stmt)?;
@@ -239,7 +243,7 @@ fn merge_sentinel_only_insert(
     remote_db_vsn: sqlite::int64,
     remote_site_id: &[u8],
     remote_seq: sqlite::int64,
-    remote_ts: &str,
+    remote_ts: sqlite::int64,
 ) -> Result<sqlite::int64, ResultCode> {
     let merge_stmt_ref = tbl_info.get_merge_pk_only_insert_stmt(db)?;
     let merge_stmt = merge_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
@@ -314,7 +318,7 @@ unsafe fn merge_delete(
     remote_db_vrsn: sqlite::int64,
     remote_site_id: &[u8],
     remote_seq: sqlite::int64,
-    remote_ts: &str,
+    remote_ts: sqlite::int64,
 ) -> Result<sqlite::int64, ResultCode> {
     let delete_stmt_ref = tbl_info.get_merge_delete_stmt(db)?;
     let delete_stmt = delete_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
@@ -424,6 +428,41 @@ fn get_local_cl(
     Ok(cl)
 }
 
+/// Post-merge processing shared by all V2 merge paths:
+/// 1. Update db_version tracking (if site_id is present)
+/// 2. Dual-write: copy V2 metadata to V1 metadata tables (if in dual-write mode)
+unsafe fn post_v2_merge(
+    db: *mut sqlite3,
+    ext_data: *mut crsql_ExtData,
+    tbl_info: &TableInfo,
+    unpacked_pks: Option<&Vec<ColumnValue>>,
+    hashed_pk: &[u8],
+    insert_site_id: &[u8],
+    insert_db_vrsn: sqlite::int64,
+) -> Result<(), ResultCode> {
+    // Update db_version tracking
+    if !insert_site_id.is_empty() {
+        let _ = insert_db_version(ext_data, insert_site_id, insert_db_vrsn);
+    }
+    // Dual-write: copy V2 metadata to V1 metadata tables
+    let mwv = unsafe { (*ext_data).metadataWriteVersion };
+    if mwv == config::METADATA_VERSION_V2_AND_V1 {
+        let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
+        let (v2_key_opt, v2_cl) =
+            v2_lookup_key_and_cl(db, &escaped, hashed_pk).unwrap_or((None, 0));
+        let _ = v2_to_v1_mirror_metadata(
+            db,
+            ext_data,
+            tbl_info,
+            unpacked_pks,
+            hashed_pk,
+            v2_key_opt,
+            v2_cl,
+        );
+    }
+    Ok(())
+}
+
 unsafe fn merge_insert(
     vtab: *mut sqlite::vtab,
     argc: c_int,
@@ -463,7 +502,7 @@ unsafe fn merge_insert(
     let insert_site_id = args[2 + CrsqlChangesColumn::SiteId as usize];
     let insert_cl = args[2 + CrsqlChangesColumn::Cl as usize].int64();
     let insert_seq_raw = args[2 + CrsqlChangesColumn::Seq as usize];
-    let insert_ts = args[2 + CrsqlChangesColumn::Ts as usize].text();
+    let insert_ts_raw = args[2 + CrsqlChangesColumn::Ts as usize].int64();
 
     if insert_site_id.bytes() > crate::consts::SITE_ID_LEN {
         let err = CString::new("crsql - site id exceeded max length")?;
@@ -531,32 +570,130 @@ unsafe fn merge_insert(
         return Err(ResultCode::ERROR);
     }
 
-    if is_v2_wire_packed {
-        // Packed row: unpack columns, col_versions, seqs, and cval
-        let col_names: Vec<&str> = insert_col.split('\0').collect();
-        let col_vrsns: Vec<i64> = insert_col_vrsn_raw.text().split('\0').map(|s| s.parse::<i64>().unwrap_or(0)).collect();
-        let seqs: Vec<i64> = insert_seq_raw.text().split('\0').map(|s| s.parse::<i64>().unwrap_or(0)).collect();
-        let unpacked_vals = unpack_columns(insert_val.blob())?;
+    // If incoming ts is 0, fall back to current set timestamp.
+    let insert_ts = if insert_ts_raw > 0 {
+        insert_ts_raw
+    } else {
+        unsafe { (*(*tab).pExtData).timestamp as i64 }
+    };
 
-        let n_cols = col_names.len();
-        if col_vrsns.len() != n_cols || seqs.len() != n_cols || unpacked_vals.len() != n_cols {
-            let err = CString::new(format!(
-                "crsql - V2 wire packed row has mismatched lengths: col_names={}, col_vrsns={}, seqs={}, vals={}",
-                n_cols, col_vrsns.len(), seqs.len(), unpacked_vals.len()
-            ))?;
-            *errmsg = err.into_raw();
-            return Err(ResultCode::ERROR);
-        }
+    // V1-only write mode: use the old V1 merge path
+    let mwv = unsafe { (*(*tab).pExtData).metadataWriteVersion };
+    if mwv == config::METADATA_VERSION_V1 {
+        return v1_merge_insert(
+            db,
+            (*tab).pExtData,
+            tbl_info,
+            insert_tbl,
+            insert_pks,
+            insert_col,
+            insert_col_vrsn_raw,
+            insert_val,
+            insert_db_vrsn,
+            insert_site_id,
+            insert_cl,
+            insert_seq_raw,
+            insert_ts_raw,
+            rowid,
+            tbl_info_index,
+            errmsg,
+        );
+    }
 
+    // --- V2 or V2AndV1 mode ---
+    // Convert any V1 wire format to V2 wire format on the fly, then dispatch
+    // to v2_packed_merge or v2_merge_insert_hash_tombstone.
+
+    // Compute common PK data.
+    // V2 hash tombstone: pks blob IS the hashed_pk, no unpacked pks needed.
+    let (unpacked_pks_opt, hashed_pk): (Option<Vec<ColumnValue>>, Vec<u8>) = if is_v2_hash_tombstone {
+        (None, insert_pks.blob().to_vec())
+    } else {
         let packed_pks = insert_pks.blob();
         let unpacked_pks = unpack_columns(&packed_pks)?;
         let hashed_pk = crate::hash_pk::hash_packed_blob(&packed_pks);
+        (Some(unpacked_pks), hashed_pk)
+    };
+
+    // Hydrate V2 from V1 metadata in dual-write mode for V1 wire format
+    if !is_v2_wire_packed && !is_v2_hash_tombstone && mwv == config::METADATA_VERSION_V2_AND_V1 {
+        if let Some(ref unpacked_pks) = unpacked_pks_opt {
+            v1_to_v2_hydrate_row(
+                db,
+                (*tab).pExtData,
+                tbl_info,
+                unpacked_pks,
+                &hashed_pk,
+            )?;
+        }
+    }
+
+    // Delete if V2 hash tombstone, or V1 wire with even CL.
+    let is_delete = is_v2_hash_tombstone || (!is_v2_wire_packed && insert_cl % 2 == 0);
+
+    let result = if is_delete {
+        let col_vrsn = insert_col_vrsn_raw.int64();
+        let seq = insert_seq_raw.int64();
+
+        v2_merge_insert_hash_tombstone(
+            db,
+            (*tab).pExtData,
+            tbl_info,
+            &hashed_pk,
+            insert_tbl,
+            insert_col,
+            insert_val,
+            col_vrsn,
+            insert_db_vrsn,
+            insert_site_id,
+            insert_cl,
+            seq,
+            insert_ts,
+            rowid,
+            tbl_info_index,
+            errmsg,
+        )
+    } else {
+        // Packed merge: compute vectors based on wire format
+        let (col_names, col_vrsns, seqs, unpacked_vals) = if is_v2_wire_packed {
+            let col_names: Vec<&str> = insert_col.split('\0').collect();
+            let col_vrsns: Vec<i64> = insert_col_vrsn_raw.text().split('\0').map(|s| s.parse::<i64>().unwrap_or(0)).collect();
+            let seqs: Vec<i64> = insert_seq_raw.text().split('\0').map(|s| s.parse::<i64>().unwrap_or(0)).collect();
+            let unpacked_vals = unpack_columns(insert_val.blob())?;
+
+            let n_cols = col_names.len();
+            if col_vrsns.len() != n_cols || seqs.len() != n_cols || unpacked_vals.len() != n_cols {
+                let err = CString::new(format!(
+                    "crsql - V2 wire packed row has mismatched lengths: col_names={}, col_vrsns={}, seqs={}, vals={}",
+                    n_cols, col_vrsns.len(), seqs.len(), unpacked_vals.len()
+                ))?;
+                *errmsg = err.into_raw();
+                return Err(ResultCode::ERROR);
+            }
+            (col_names, col_vrsns, seqs, unpacked_vals)
+        } else {
+            // V1 wire format: convert to single-element (or empty) vectors
+            let insert_col_vrsn = insert_col_vrsn_raw.int64();
+            let insert_seq = insert_seq_raw.int64();
+
+            if insert_col == crate::c::INSERT_SENTINEL {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            } else {
+                let col_val = sqlite_value_to_column_value(insert_val);
+                (
+                    vec![insert_col],
+                    vec![insert_col_vrsn],
+                    vec![insert_seq],
+                    vec![col_val],
+                )
+            }
+        };
 
         v2_packed_merge(
             db,
             (*tab).pExtData,
             tbl_info,
-            &unpacked_pks,
+            unpacked_pks_opt.as_ref().unwrap(),
             &hashed_pk,
             &col_names,
             &col_vrsns,
@@ -566,124 +703,47 @@ unsafe fn merge_insert(
             insert_site_id,
             insert_cl,
             insert_ts,
-        )?;
+        )
+    };
 
-        // Update db_version tracking
-        if !insert_site_id.is_empty() {
-            let _ = insert_db_version((*tab).pExtData, insert_site_id, insert_db_vrsn);
-        }
-        // Dual-write: copy V2 metadata to V1 metadata tables
-        // Only when not in V2-only write mode and V1 tables exist
-        let mwv = unsafe { (*(*tab).pExtData).metadataWriteVersion };
-        if mwv != config::METADATA_VERSION_V2 && tbl_info.schema_version == SchemaVersion::V2AndV1 {
-            let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
-            let (v2_key_opt, v2_cl) = v2_lookup_key_and_cl(db, &escaped, &hashed_pk)?;
-            v1_write_merge_metadata(
-                db,
-                (*tab).pExtData,
-                tbl_info,
-                Some(&unpacked_pks),
-                &hashed_pk,
-                v2_key_opt,
-                v2_cl,
-            )?;
-        }
-        return Ok(ResultCode::OK);
-    }
-
-    // Non-packed row: parse as before
-    let insert_col_vrsn = insert_col_vrsn_raw.int64();
-    let insert_seq = insert_seq_raw.int64();
-
-    // V2 dispatch: if table is using V2 metadata, route to V2 merge path
-    if tbl_info.schema_version == SchemaVersion::V2 || tbl_info.schema_version == SchemaVersion::V2AndV1 {
-        if is_v2_hash_tombstone {
-            // V2 wire tombstone: pks is hashed_pk, not packed columns
-            let hashed_pk = insert_pks.blob();
-            let result = v2_merge_insert_hash_tombstone(
-                db,
-                (*tab).pExtData,
-                tbl_info,
-                &hashed_pk,
-                insert_tbl,
-                insert_col,
-                insert_val,
-                insert_col_vrsn,
-                insert_db_vrsn,
-                insert_site_id,
-                insert_cl,
-                insert_seq,
-                insert_ts,
-                rowid,
-                tbl_info_index,
-                errmsg,
-            );
-            if result.is_ok() && !insert_site_id.is_empty() {
-                let _ = insert_db_version((*tab).pExtData, insert_site_id, insert_db_vrsn);
-            }
-            // Dual-write: copy V2 metadata to V1 metadata tables
-            let mwv = unsafe { (*(*tab).pExtData).metadataWriteVersion };
-            if result.is_ok() && mwv != config::METADATA_VERSION_V2 && tbl_info.schema_version == SchemaVersion::V2AndV1 {
-                let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
-                let (v2_key_opt, v2_cl) = v2_lookup_key_and_cl(db, &escaped, &hashed_pk).unwrap_or((None, 0));
-                let _ = v1_write_merge_metadata(
-                    db,
-                    (*tab).pExtData,
-                    tbl_info,
-                    None,
-                    &hashed_pk,
-                    v2_key_opt,
-                    v2_cl,
-                );
-            }
-            return result;
-        }
-
-        let packed_pks = insert_pks.blob();
-        let unpacked_pks = unpack_columns(&packed_pks)?;
-        let hashed_pk = crate::hash_pk::hash_packed_blob(&packed_pks);
-        let result = v2_merge_insert(
+    // Post-merge: db_version + dual-write V1 metadata
+    if result.is_ok() {
+        let _ = post_v2_merge(
             db,
             (*tab).pExtData,
             tbl_info,
-            &unpacked_pks,
+            unpacked_pks_opt.as_ref(),
             &hashed_pk,
-            insert_tbl,
-            insert_col,
-            insert_val,
-            insert_col_vrsn,
-            insert_db_vrsn,
             insert_site_id,
-            insert_cl,
-            insert_seq,
-            insert_ts,
-            rowid,
-            tbl_info_index,
-            errmsg,
+            insert_db_vrsn,
         );
-        // Update db_version tracking
-        if result.is_ok() && !insert_site_id.is_empty() {
-            let _ = insert_db_version((*tab).pExtData, insert_site_id, insert_db_vrsn);
-        }
-        // Dual-write: copy V2 metadata to V1 metadata tables
-        let mwv = unsafe { (*(*tab).pExtData).metadataWriteVersion };
-        if result.is_ok() && mwv != config::METADATA_VERSION_V2 && tbl_info.schema_version == SchemaVersion::V2AndV1 {
-            let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
-            let (v2_key_opt, v2_cl) = v2_lookup_key_and_cl(db, &escaped, &hashed_pk).unwrap_or((None, 0));
-            let _ = v1_write_merge_metadata(
-                db,
-                (*tab).pExtData,
-                tbl_info,
-                Some(&unpacked_pks),
-                &hashed_pk,
-                v2_key_opt,
-                v2_cl,
-            );
-        }
-        return result;
     }
 
-    // V1 path: unpack PKs for V1 metadata tables
+    return result;
+}
+
+/// V1 merge path: handles incoming changes for tables using V1 metadata only.
+#[allow(clippy::too_many_arguments)]
+unsafe fn v1_merge_insert(
+    db: *mut sqlite3,
+    ext_data: *mut crsql_ExtData,
+    tbl_info: &mut TableInfo,
+    insert_tbl: &str,
+    insert_pks: *mut sqlite::value,
+    insert_col: &str,
+    insert_col_vrsn_raw: *mut sqlite::value,
+    insert_val: *mut sqlite::value,
+    insert_db_vrsn: sqlite::int64,
+    insert_site_id: &[u8],
+    insert_cl: sqlite::int64,
+    insert_seq_raw: *mut sqlite::value,
+    insert_ts: sqlite::int64,
+    rowid: *mut sqlite::int64,
+    tbl_info_index: usize,
+    errmsg: *mut *mut c_char,
+) -> Result<ResultCode, ResultCode> {
+    let insert_col_vrsn = insert_col_vrsn_raw.int64();
+    let insert_seq = insert_seq_raw.int64();
     let unpacked_pks = unpack_columns(insert_pks.blob())?;
 
     // Get or create key as the first thing we do.
@@ -712,7 +772,7 @@ unsafe fn merge_insert(
             // We got a delete event but we've already processed a delete at that version.
             // Just bail.
             if insert_cl == local_cl {
-                if unsafe { (*(*tab).pExtData).mergeEqualValues == 1 }
+                if unsafe { (*ext_data).mergeEqualValues == 1 }
                     && did_site_id_win(
                         db,
                         insert_tbl,
@@ -726,7 +786,7 @@ unsafe fn merge_insert(
                     // here we set the same winner for the clock if incoming site_id won
                     set_winner_clock(
                         db,
-                        (*tab).pExtData,
+                        ext_data,
                         &tbl_info,
                         key,
                         insert_col,
@@ -742,7 +802,7 @@ unsafe fn merge_insert(
             // else, it is a delete and the cl is > than ours. Drop the row.
             let merge_result = merge_delete(
                 db,
-                (*tab).pExtData,
+                ext_data,
                 &tbl_info,
                 &unpacked_pks,
                 key,
@@ -757,7 +817,7 @@ unsafe fn merge_insert(
                     return Err(rc);
                 }
                 Ok(inner_rowid) => {
-                    (*(*tab).pExtData).rowsImpacted += 1;
+                    (*ext_data).rowsImpacted += 1;
                     *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
                     return Ok(ResultCode::OK);
                 }
@@ -780,7 +840,7 @@ unsafe fn merge_insert(
             }
             let inner_rowid = merge_sentinel_only_insert(
                 db,
-                (*tab).pExtData,
+                ext_data,
                 &tbl_info,
                 &unpacked_pks,
                 key,
@@ -792,7 +852,7 @@ unsafe fn merge_insert(
             )?;
             // a success & rowid of -1 means the merge was a no-op
             if inner_rowid != -1 {
-                (*(*tab).pExtData).rowsImpacted += 1;
+                (*ext_data).rowsImpacted += 1;
                 *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
             }
             return Ok(ResultCode::OK);
@@ -809,7 +869,7 @@ unsafe fn merge_insert(
             // and the version to set to is the cl not col_vrsn of current insert
             let inner_rowid = merge_sentinel_only_insert(
                 db,
-                (*tab).pExtData,
+                ext_data,
                 &tbl_info,
                 &unpacked_pks,
                 key,
@@ -821,7 +881,7 @@ unsafe fn merge_insert(
             )?;
             // a success & rowid of -1 means the merge was a no-op
             if inner_rowid != -1 {
-                (*(*tab).pExtData).rowsImpacted += 1;
+                (*ext_data).rowsImpacted += 1;
                 *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
             }
         }
@@ -833,7 +893,7 @@ unsafe fn merge_insert(
             || !row_exists_locally
             || did_cid_win(
                 db,
-                (*tab).pExtData,
+                ext_data,
                 insert_tbl,
                 &tbl_info,
                 &unpacked_pks,
@@ -863,25 +923,25 @@ unsafe fn merge_insert(
             return Err(rc);
         }
 
-        let rc = (*(*tab).pExtData)
+        let rc = (*ext_data)
             .pSetSyncBitStmt
             .step()
-            .and_then(|_| (*(*tab).pExtData).pSetSyncBitStmt.reset())
+            .and_then(|_| (*ext_data).pSetSyncBitStmt.reset())
             .and_then(|_| merge_stmt.step());
 
         reset_cached_stmt(merge_stmt.stmt)?;
 
-        let sync_rc = (*(*tab).pExtData)
+        let sync_rc = (*ext_data)
             .pClearSyncBitStmt
             .step()
-            .and_then(|_| (*(*tab).pExtData).pClearSyncBitStmt.reset());
+            .and_then(|_| (*ext_data).pClearSyncBitStmt.reset());
 
         rc?;
         sync_rc?;
 
         let merge_result = set_winner_clock(
             db,
-            (*tab).pExtData,
+            ext_data,
             &tbl_info,
             key,
             insert_col,
@@ -896,7 +956,7 @@ unsafe fn merge_insert(
                 return Err(rc);
             }
             Ok(inner_rowid) => {
-                (*(*tab).pExtData).rowsImpacted += 1;
+                (*ext_data).rowsImpacted += 1;
                 *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
                 return Ok(ResultCode::OK);
             }
@@ -905,7 +965,7 @@ unsafe fn merge_insert(
 
     // Update the received db_version whether the change won or not.
     if res.is_ok() && !insert_site_id.is_empty() {
-        if let Err(rc) = insert_db_version((*tab).pExtData, insert_site_id, insert_db_vrsn) {
+        if let Err(rc) = insert_db_version(ext_data, insert_site_id, insert_db_vrsn) {
             let err = CString::new(format!(
                 "Unable to insert db version {} for site id {:?}: {:?}",
                 insert_db_vrsn, insert_site_id, rc
@@ -923,269 +983,6 @@ unsafe fn merge_insert(
     res
 }
 
-/// V2 merge insert: handles incoming changes for tables using V2 metadata.
-/// Mirrors the V1 merge_insert logic but reads/writes V2 metadata tables.
-#[allow(clippy::too_many_arguments)]
-unsafe fn v2_merge_insert(
-    db: *mut sqlite3,
-    ext_data: *mut crsql_ExtData,
-    tbl_info: &mut TableInfo,
-    unpacked_pks: &Vec<ColumnValue>,
-    hashed_pk: &[u8],
-    insert_tbl: &str,
-    insert_col: &str,
-    insert_val: *mut sqlite::value,
-    insert_col_vrsn: sqlite::int64,
-    insert_db_vrsn: sqlite::int64,
-    insert_site_id: &[u8],
-    insert_cl: sqlite::int64,
-    insert_seq: sqlite::int64,
-    insert_ts: &str,
-    rowid: *mut sqlite::int64,
-    tbl_info_index: usize,
-    errmsg: *mut *mut c_char,
-) -> Result<ResultCode, ResultCode> {
-    let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
-    let col_id_bits = consts::CRSQL_COL_ID_BITS;
-
-    // In dual-write mode with incomplete migration, a row may exist in V1
-    // but not yet in V2. Hydrate V2 from V1 on-demand so we see the correct CL.
-    if tbl_info.schema_version == SchemaVersion::V2AndV1 {
-        if let Err(e) = v1_to_v2_hydrate_row(db, ext_data, tbl_info, unpacked_pks, hashed_pk) {
-            return Err(e);
-        }
-    }
-
-    // Look up key and CL from v2_pks (alive) or v2_tombstones (dead)
-    let (local_key, local_cl) = v2_lookup_key_and_cl(db, &escaped, &hashed_pk)?;
-    // If no existing entry, this is a new row from remote
-    let local_key = match local_key {
-        Some(k) => k,
-        None => {
-            // Row is in v2_tombstones (dead) or never seen (local_cl=0).
-            // Early bail: incoming CL can't beat local tombstone CL.
-            if insert_cl < local_cl {
-                return Ok(ResultCode::OK);
-            }
-            // If this is a delete (even CL) and the row doesn't exist locally,
-            // insert directly into v2_tombstones — v2_pks requires odd CL.
-            if insert_cl % 2 == 0 {
-                let site_ordinal = if insert_site_id.is_empty() {
-                    0
-                } else {
-                    get_or_set_site_ordinal(ext_data, insert_site_id)?
-                };
-                // Upsert with CL-based conflict resolution per design doc.
-                // Only update if incoming CL > local CL.
-                // If mergeEqualValues is on, also update on equal CL when site_id wins.
-                let merge_equal = unsafe { (*ext_data).mergeEqualValues };
-                let where_clause = if merge_equal == 1 {
-                    format!(
-                        "WHERE excluded.cl > \"{}{}\".cl \
-                         OR (excluded.cl = \"{}{}\".cl \
-                             AND ? > (SELECT site_id FROM crsql_site_id WHERE ordinal = \"{}{}\".site_id))",
-                        escaped, consts::V2_TOMBSTONES_SUFFIX,
-                        escaped, consts::V2_TOMBSTONES_SUFFIX,
-                        escaped, consts::V2_TOMBSTONES_SUFFIX
-                    )
-                } else {
-                    format!(
-                        "WHERE excluded.cl > \"{}{}\".cl",
-                        escaped, consts::V2_TOMBSTONES_SUFFIX
-                    )
-                };
-                let sql = format!(
-                    "INSERT INTO \"{}{}\" (site_id, db_version, seq, hashed_pk, cl, ts) \
-                     VALUES (?, ?, ?, ?, ?, ?) \
-                     ON CONFLICT(hashed_pk) DO UPDATE SET \
-                     site_id = excluded.site_id, \
-                     db_version = excluded.db_version, \
-                     seq = excluded.seq, \
-                     cl = excluded.cl, \
-                     ts = excluded.ts \
-                     {}\0",
-                    escaped, consts::V2_TOMBSTONES_SUFFIX,
-                    where_clause
-                );
-                let stmt = db.prepare_v2(&sql)?;
-                stmt.bind_int64(1, site_ordinal as i64)?;
-                stmt.bind_int64(2, insert_db_vrsn)?;
-                stmt.bind_int64(3, insert_seq)?;
-                stmt.bind_blob(4, &hashed_pk, sqlite::Destructor::STATIC)?;
-                stmt.bind_int64(5, insert_cl)?;
-                let ts_val = insert_ts.parse::<i64>().map_err(|_| ResultCode::ERROR)?;
-                let ts_val = if ts_val > 0 { ts_val } else { (*ext_data).timestamp as i64 };
-                stmt.bind_int64(6, ts_val)?;
-                if merge_equal == 1 {
-                    stmt.bind_blob(7, insert_site_id, sqlite::Destructor::STATIC)?;
-                }
-                stmt.step()?;
-                // Also insert tombstone PKs if we have them
-                if !unpacked_pks.is_empty() {
-                    let pk_col_names: Vec<String> = tbl_info.pks.iter().map(|c| c.name.clone()).collect();
-                    let pk_cols: Vec<&str> = pk_col_names.iter().map(|s| s.as_str()).collect();
-                    let placeholders: Vec<&str> = unpacked_pks.iter().map(|_| "?").collect();
-                    // Same PKs always produce the same hashed_pk, so if a tombstone_pk
-                    // entry already exists the values are identical — no update needed.
-                    let sql = format!(
-                        "INSERT INTO \"{}{}\" ({}, hashed_pk) VALUES ({}, ?) \
-                         ON CONFLICT(hashed_pk) DO NOTHING\0",
-                        escaped,
-                        consts::V2_TOMBSTONE_PKS_SUFFIX,
-                        pk_cols.join(", "),
-                        placeholders.join(", ")
-                    );
-                    let stmt = db.prepare_v2(&sql)?;
-                    bind_package_to_stmt(stmt.stmt, unpacked_pks, 0)?;
-                    stmt.bind_blob(unpacked_pks.len() as i32 + 1, &hashed_pk, sqlite::Destructor::STATIC)?;
-                    stmt.step()?;
-                }
-                return Ok(ResultCode::OK);
-            }
-            // Alive row needed (odd CL) — use shared helper for cleanup + creation.
-            // Stale CL already checked above.
-            match v2_ensure_alive_row_at_cl(db, ext_data, tbl_info, unpacked_pks, &hashed_pk, insert_cl)? {
-                Some((k, _)) => k,
-                None => return Ok(ResultCode::OK),
-            }
-        }
-    };
-
-    // Compare causal lengths
-    if insert_cl < local_cl {
-        // Old change, skip
-        return Ok(ResultCode::OK);
-    }
-
-    let is_delete = insert_cl % 2 == 0;
-    let is_sentinel_only = insert_col == crate::c::INSERT_SENTINEL;
-
-    if is_delete {
-        // Handle delete: move from v2_pks to v2_tombstones
-        // At this point insert_cl >= local_cl is guaranteed
-        {
-            let pk_col_names: Vec<String> = tbl_info.pks.iter().map(|c| c.name.clone()).collect();
-            v2_handle_delete_merge(
-                db,
-                ext_data,
-                &escaped,
-                &pk_col_names,
-                local_key,
-                &hashed_pk,
-                unpacked_pks,
-                insert_cl,
-                insert_db_vrsn,
-                insert_site_id,
-                insert_seq,
-                insert_ts,
-            )?;
-        }
-    } else if is_sentinel_only {
-        // Handle sentinel (create) merge
-        if insert_cl > local_cl {
-            // Resurrect or update CL
-            v2_update_cl(db, &escaped, local_key, insert_cl)?;
-        }
-        // For PK-only tables, write/update the sentinel clock entry at col_id=0
-        // and insert the row into the main table.
-        if tbl_info.non_pks.is_empty() {
-            // Insert row into main table (INSERT OR IGNORE in case it already exists)
-            let pk_cols: Vec<&str> = tbl_info.pks.iter().map(|c| c.name.as_str()).collect();
-            let placeholders: Vec<&str> = unpacked_pks.iter().map(|_| "?").collect();
-            let main_sql = format!(
-                "INSERT OR IGNORE INTO \"{}\" ({}) VALUES ({})\0",
-                escaped,
-                pk_cols.join(", "),
-                placeholders.join(", ")
-            );
-            let main_stmt = db.prepare_v2(&main_sql)?;
-            bind_package_to_stmt(main_stmt.stmt, unpacked_pks, 0)?;
-            main_stmt.step()?;
-
-            // Write sentinel clock entry
-            let cell_key = (local_key << consts::CRSQL_COL_ID_BITS as i64) | 0;
-            let site_ordinal = if insert_site_id.is_empty() {
-                0
-            } else {
-                get_or_set_site_ordinal(ext_data, insert_site_id)?
-            };
-            let clock_sql = format!(
-                "INSERT OR REPLACE INTO \"{}{}\" (cell_key, col_version, site_id, db_version, seq, ts) VALUES (?, 1, ?, ?, ?, ?)",
-                escaped, consts::V2_CLOCK_SUFFIX
-            );
-            let clock_stmt = db.prepare_v2(&clock_sql)?;
-            clock_stmt.bind_int64(1, cell_key)?;
-            clock_stmt.bind_int64(2, site_ordinal as i64)?;
-            clock_stmt.bind_int64(3, insert_db_vrsn)?;
-            clock_stmt.bind_int64(4, insert_seq)?;
-            let ts_val = insert_ts.parse::<i64>().map_err(|_| ResultCode::ERROR)?;
-            let ts_val = if ts_val > 0 { ts_val } else { (*ext_data).timestamp as i64 };
-            clock_stmt.bind_int64(5, ts_val)?;
-            clock_stmt.step()?;
-        }
-    } else {
-        // Value change merge
-        if insert_cl > local_cl {
-            // Bigger CL wins automatically — update CL and value
-            v2_update_cl(db, &escaped, local_key, insert_cl)?;
-            v2_apply_value_change(
-                db,
-                ext_data,
-                tbl_info,
-                &escaped,
-                local_key,
-                insert_col,
-                insert_val,
-                insert_col_vrsn,
-                insert_db_vrsn,
-                insert_site_id,
-                insert_seq,
-                insert_ts,
-                unpacked_pks,
-                col_id_bits,
-            )?;
-        } else if insert_cl == local_cl {
-            // Same CL — need to check if this column version wins
-            let col_id = v2_get_col_id(db, &escaped, insert_col)?;
-            if let Some(col_id) = col_id {
-                let cell_key = (local_key << col_id_bits) | (col_id as i64);
-                let won = v2_did_cid_win(
-                    db,
-                    &escaped,
-                    cell_key,
-                    insert_col_vrsn,
-                    insert_val,
-                )?;
-                if won {
-                    v2_apply_value_change(
-                        db,
-                        ext_data,
-                        tbl_info,
-                        &escaped,
-                        local_key,
-                        insert_col,
-                        insert_val,
-                        insert_col_vrsn,
-                        insert_db_vrsn,
-                        insert_site_id,
-                        insert_seq,
-                        insert_ts,
-                        unpacked_pks,
-                        col_id_bits,
-                    )?;
-                }
-            }
-        }
-    }
-
-    // Update db_version tracking
-    if !insert_site_id.is_empty() {
-        let _ = insert_db_version(ext_data, insert_site_id, insert_db_vrsn);
-    }
-
-    Ok(ResultCode::OK)
-}
-
 /// Ensure an alive row exists in v2_pks at incoming_cl.
 /// Handles: stale CL bail, skipped-delete cleanup, resurrection cleanup, new row creation.
 /// Returns (local_key, local_cl) where local_cl is the CL *before* any modification.
@@ -1197,6 +994,8 @@ unsafe fn v2_ensure_alive_row_at_cl(
     unpacked_pks: &Vec<ColumnValue>,
     hashed_pk: &[u8],
     incoming_cl: i64,
+    incoming_db_version: i64,
+    incoming_site_id: i64,
 ) -> Result<Option<(i64, i64)>, ResultCode> {
     let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
 
@@ -1216,7 +1015,23 @@ unsafe fn v2_ensure_alive_row_at_cl(
             v2_nuke_tombstone(db, &escaped, hashed_pk)?;
         }
         // Create fresh v2_pks entry with new CL
-        v2_insert_pk_row(db, ext_data, &escaped, tbl_info, unpacked_pks, hashed_pk, incoming_cl)?
+        let new_key = v2_insert_pk_row(db, ext_data, &escaped, tbl_info, unpacked_pks, hashed_pk, incoming_cl)?;
+        // Create zero-version clock entries for all mapped columns so they appear in sync logs.
+        // Use the incoming change's site_id and db_version since it created this row.
+        // seq=0 for placeholders; the packed column updates will overwrite specific entries.
+        let col_id_bits = consts::CRSQL_COL_ID_BITS as i64;
+        let base = new_key << col_id_bits;
+        let clock_sql = format!(
+            "INSERT INTO \"{}{}\" (cell_key, col_version, site_id, db_version, seq, ts)\n             SELECT ? + col_id, 0, ?, ?, 0, crsql_get_ts()\n             FROM \"{}{}\"\0",
+            escaped, consts::V2_CLOCK_SUFFIX,
+            escaped, consts::V2_COL_MAP_SUFFIX
+        );
+        let clock_stmt = db.prepare_v2(&clock_sql)?;
+        clock_stmt.bind_int64(1, base)?;
+        clock_stmt.bind_int64(2, incoming_site_id)?;
+        clock_stmt.bind_int64(3, incoming_db_version)?;
+        clock_stmt.step()?;
+        new_key
     } else {
         // incoming_cl == local_cl — row must already exist
         local_key_opt.unwrap_or(0)
@@ -1380,14 +1195,24 @@ pub unsafe fn v1_to_v2_hydrate_row(
     } else {
         // 3b. Row is alive — insert into v2_pks, then copy clock entries to v2_clock
         let v2_key = if tbl_info.uses_rowid_key {
-            // For rowid-key tables, __crsql_key in v2_pks is the rowid value
-            // which is the first PK column value
-            let rowid_val = match &unpacked_pks[0] {
-                ColumnValue::Integer(i) => *i,
-                _ => return Err(ResultCode::ERROR),
-            };
+            let pk_cols: Vec<&str> = tbl_info.pks.iter().map(|c| c.name.as_str()).collect();
+            let placeholders: Vec<&str> = unpacked_pks.iter().map(|_| "?").collect();
+            let alias = crate::util::escape_ident(&tbl_info.rowid_alias);
             let sql = format!(
-                "INSERT OR IGNORE INTO \"{}{}\" (__crsql_key, hashed_pk, cl) VALUES (?, ?, ?)\0",
+                "SELECT \"{}\" FROM \"{}\" WHERE {}\0",
+                alias, escaped,
+                pk_cols.iter().zip(placeholders.iter())
+                    .map(|(c, p)| format!("\"{}\" = {}", c, p))
+                    .collect::<Vec<_>>().join(" AND ")
+            );
+            let stmt = db.prepare_v2(&sql)?;
+            bind_package_to_stmt(stmt.stmt, unpacked_pks, 0)?;
+            if stmt.step()? != ResultCode::ROW {
+                return Ok(()); // Row not found in base table — skip hydration
+            }
+            let rowid_val = stmt.column_int64(0);
+            let sql = format!(
+                "INSERT INTO \"{}{}\" (__crsql_key, hashed_pk, cl) VALUES (?, ?, ?)\0",
                 escaped, consts::V2_PKS_SUFFIX
             );
             let stmt = db.prepare_v2(&sql)?;
@@ -1401,7 +1226,7 @@ pub unsafe fn v1_to_v2_hydrate_row(
             let pk_cols: Vec<&str> = tbl_info.pks.iter().map(|c| c.name.as_str()).collect();
             let placeholders: Vec<&str> = unpacked_pks.iter().map(|_| "?").collect();
             let sql = format!(
-                "INSERT OR IGNORE INTO \"{}{}\" ({}, hashed_pk, cl) VALUES ({}, ?, ?) RETURNING __crsql_key\0",
+                "INSERT INTO \"{}{}\" ({}, hashed_pk, cl) VALUES ({}, ?, ?) RETURNING __crsql_key\0",
                 escaped, consts::V2_PKS_SUFFIX,
                 pk_cols.join(", "),
                 placeholders.join(", ")
@@ -1410,29 +1235,13 @@ pub unsafe fn v1_to_v2_hydrate_row(
             bind_package_to_stmt(stmt.stmt, unpacked_pks, 0)?;
             stmt.bind_blob(unpacked_pks.len() as i32 + 1, hashed_pk, sqlite::Destructor::STATIC)?;
             stmt.bind_int64(unpacked_pks.len() as i32 + 2, v1_cl)?;
-            // If row already exists in v2_pks (e.g., from a prior partial hydrate),
-            // RETURNING won't produce a row. Fall back to SELECT.
-            if stmt.step()? == ResultCode::ROW {
-                stmt.column_int64(0)
-            } else {
-                // Look up existing v2_key
-                let sql = format!(
-                    "SELECT __crsql_key FROM \"{}{}\" WHERE hashed_pk = ?\0",
-                    escaped, consts::V2_PKS_SUFFIX
-                );
-                let lookup = db.prepare_v2(&sql)?;
-                lookup.bind_blob(1, hashed_pk, sqlite::Destructor::STATIC)?;
-                if lookup.step()? == ResultCode::ROW {
-                    lookup.column_int64(0)
-                } else {
-                    return Ok(()); // Couldn't get v2_key — skip clock copy
-                }
-            }
+            stmt.step()?;
+            stmt.column_int64(0)
         };
 
         // Copy clock entries from V1 to V2
         let sql = format!(
-            "INSERT OR REPLACE INTO \"{}{}\" (cell_key, col_version, site_id, db_version, seq, ts)
+            "INSERT INTO \"{}{}\" (cell_key, col_version, site_id, db_version, seq, ts)
              SELECT (? << {} | m.col_id), c.col_version, c.site_id, c.db_version, c.seq,
                CASE WHEN c.ts > 0 THEN c.ts ELSE {ts_fallback} END
              FROM \"{}__crsql_clock\" c
@@ -1544,118 +1353,6 @@ unsafe fn v2_insert_pk_row(
     }
 }
 
-/// Update CL for a key in v2_pks
-unsafe fn v2_update_cl(
-    db: *mut sqlite3,
-    escaped: &str,
-    key: i64,
-    cl: i64,
-) -> Result<(), ResultCode> {
-    let sql = format!(
-        "UPDATE \"{}{}\" SET cl = ? WHERE __crsql_key = ?\0",
-        escaped, consts::V2_PKS_SUFFIX
-    );
-    let stmt = db.prepare_v2(&sql)?;
-    stmt.bind_int64(1, cl)?;
-    stmt.bind_int64(2, key)?;
-    stmt.step()?;
-    Ok(())
-}
-
-/// Handle delete merge: move from v2_pks to v2_tombstones, delete clocks
-#[allow(clippy::too_many_arguments)]
-unsafe fn v2_handle_delete_merge(
-    db: *mut sqlite3,
-    ext_data: *mut crsql_ExtData,
-    escaped: &str,
-    pk_col_names: &Vec<String>,
-    key: i64,
-    hashed_pk: &[u8],
-    unpacked_pks: &Vec<ColumnValue>,
-    cl: i64,
-    db_version: i64,
-    site_id: &[u8],
-    seq: i64,
-    ts: &str,
-) -> Result<(), ResultCode> {
-    // Insert tombstone
-    let site_ordinal = if site_id.is_empty() {
-        0
-    } else {
-        get_or_set_site_ordinal(ext_data, site_id)?
-    };
-    let sql = format!(
-        "INSERT INTO \"{}{}\" (site_id, db_version, seq, hashed_pk, cl, ts) VALUES (?, ?, ?, ?, ?, ?)\0",
-        escaped, consts::V2_TOMBSTONES_SUFFIX
-    );
-    let stmt = db.prepare_v2(&sql)?;
-    stmt.bind_int64(1, site_ordinal)?;
-    stmt.bind_int64(2, db_version)?;
-    stmt.bind_int64(3, seq)?;
-    stmt.bind_blob(4, hashed_pk, sqlite::Destructor::STATIC)?;
-    stmt.bind_int64(5, cl)?;
-    let ts_val = ts.parse::<i64>().map_err(|_| ResultCode::ERROR)?;
-    let ts_val = if ts_val > 0 { ts_val } else { (*ext_data).timestamp as i64 };
-    stmt.bind_int64(6, ts_val)?;
-    stmt.step()?;
-
-    // Insert tombstone PKs
-    let pk_cols: Vec<&str> = pk_col_names.iter().map(|s| s.as_str()).collect();
-    let placeholders: Vec<&str> = unpacked_pks.iter().map(|_| "?").collect();
-    let sql = format!(
-        "INSERT INTO \"{}{}\" ({}, hashed_pk) VALUES ({}, ?)\0",
-        escaped,
-        consts::V2_TOMBSTONE_PKS_SUFFIX,
-        pk_cols.join(", "),
-        placeholders.join(", ")
-    );
-    let stmt = db.prepare_v2(&sql)?;
-    bind_package_to_stmt(stmt.stmt, unpacked_pks, 0)?;
-    stmt.bind_blob(unpacked_pks.len() as i32 + 1, hashed_pk, sqlite::Destructor::STATIC)?;
-    stmt.step()?;
-
-    // Delete clocks for this key
-    let col_id_bits = consts::CRSQL_COL_ID_BITS;
-    let sql = format!(
-        "DELETE FROM \"{}{}\" WHERE cell_key >> {} = ?\0",
-        escaped, consts::V2_CLOCK_SUFFIX, col_id_bits
-    );
-    let stmt = db.prepare_v2(&sql)?;
-    stmt.bind_int64(1, key)?;
-    stmt.step()?;
-
-    // Delete from v2_pks
-    let sql = format!(
-        "DELETE FROM \"{}{}\" WHERE __crsql_key = ?\0",
-        escaped, consts::V2_PKS_SUFFIX
-    );
-    let stmt = db.prepare_v2(&sql)?;
-    stmt.bind_int64(1, key)?;
-    stmt.step()?;
-
-    // Delete from the user table (with sync bit to prevent trigger recursion)
-    let pk_cols: Vec<&str> = pk_col_names.iter().map(|s| s.as_str()).collect();
-    let where_conds: Vec<String> = pk_cols.iter().map(|c| {
-        format!("\"{}\" = ?", crate::util::escape_ident(c))
-    }).collect();
-    let sql = format!(
-        "DELETE FROM \"{}\" WHERE {}\0",
-        escaped,
-        where_conds.join(" AND ")
-    );
-    // Set sync bit to suppress after_delete trigger
-    (*ext_data).pSetSyncBitStmt.step()?;
-    (*ext_data).pSetSyncBitStmt.reset()?;
-    let stmt = db.prepare_v2(&sql)?;
-    bind_package_to_stmt(stmt.stmt, unpacked_pks, 0)?;
-    stmt.step()?;
-    // Clear sync bit
-    (*ext_data).pClearSyncBitStmt.step()?;
-    (*ext_data).pClearSyncBitStmt.reset()?;
-
-    Ok(())
-}
-
 /// Get col_id from v2_col_map by col_name
 unsafe fn v2_get_col_id(
     db: *mut sqlite3,
@@ -1672,106 +1369,6 @@ unsafe fn v2_get_col_id(
         return Ok(Some(stmt.column_int64(0)));
     }
     Ok(None)
-}
-
-/// Check if incoming column version wins against local
-unsafe fn v2_did_cid_win(
-    db: *mut sqlite3,
-    escaped: &str,
-    cell_key: i64,
-    incoming_col_vrsn: i64,
-    incoming_val: *mut sqlite::value,
-) -> Result<bool, ResultCode> {
-    let sql = format!(
-        "SELECT col_version, site_id FROM \"{}{}\" WHERE cell_key = ?\0",
-        escaped, consts::V2_CLOCK_SUFFIX
-    );
-    let stmt = db.prepare_v2(&sql)?;
-    stmt.bind_int64(1, cell_key)?;
-    if stmt.step()? == ResultCode::ROW {
-        let local_col_vrsn = stmt.column_int64(0);
-        if incoming_col_vrsn > local_col_vrsn {
-            return Ok(true);
-        }
-        if incoming_col_vrsn == local_col_vrsn {
-            // Tie-break: compare values
-            // For now, let the incoming value win on tie (same as V1 behavior with mergeEqualValues)
-            return Ok(true);
-        }
-        return Ok(false);
-    }
-    // No local entry — incoming wins
-    Ok(true)
-}
-
-/// Apply a value change: update user table + update v2_clock
-#[allow(clippy::too_many_arguments)]
-unsafe fn v2_apply_value_change(
-    db: *mut sqlite3,
-    ext_data: *mut crsql_ExtData,
-    tbl_info: &TableInfo,
-    escaped: &str,
-    key: i64,
-    col_name: &str,
-    val: *mut sqlite::value,
-    col_vrsn: i64,
-    db_version: i64,
-    site_id: &[u8],
-    seq: i64,
-    ts: &str,
-    unpacked_pks: &Vec<ColumnValue>,
-    col_id_bits: u32,
-) -> Result<(), ResultCode> {
-    // Update the actual user table
-    let merge_stmt_ref = tbl_info.get_merge_insert_stmt(db, col_name)?;
-    let merge_stmt = merge_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
-    // Bind PK values at offset 0 (positions 1..n)
-    bind_package_to_stmt(merge_stmt.stmt, unpacked_pks, 0)?;
-    // Bind the column value for INSERT (position n+1) and UPDATE (position n+2)
-    let pk_len = unpacked_pks.len() as i32;
-    merge_stmt.bind_value(pk_len + 1, val)?;
-    merge_stmt.bind_value(pk_len + 2, val)?;
-    merge_stmt.step()?;
-    merge_stmt.reset()?;
-
-    // Get site ordinal
-    let site_ordinal = if site_id.is_empty() {
-        0
-    } else {
-        get_or_set_site_ordinal(ext_data, site_id)?
-    };
-    // Get col_id
-    let col_id = v2_get_col_id(db, escaped, col_name)?;
-    if col_id.is_none() {
-        return Ok(()); // Column not mapped, skip
-    }
-    let col_id = col_id.unwrap();
-    let cell_key = (key << col_id_bits) | (col_id as i64);
-
-    // Upsert v2_clock entry
-    let sql = format!(
-        "INSERT INTO \"{}{}\" (cell_key, col_version, site_id, db_version, seq, ts)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(cell_key) DO UPDATE SET
-           col_version = excluded.col_version,
-           site_id = excluded.site_id,
-           db_version = excluded.db_version,
-           seq = excluded.seq,
-           ts = excluded.ts\0",
-        escaped, consts::V2_CLOCK_SUFFIX
-    );
-    let stmt = db.prepare_v2(&sql)?;
-    stmt.bind_int64(1, cell_key)?;
-    stmt.bind_int64(2, col_vrsn)?;
-    stmt.bind_int64(3, site_ordinal)?;
-    stmt.bind_int64(4, db_version)?;
-    stmt.bind_int64(5, seq)?;
-    let ts_val = ts.parse::<i64>().map_err(|_| ResultCode::ERROR)?;
-    let ts_val = if ts_val > 0 { ts_val } else { (*ext_data).timestamp as i64 };
-    stmt.bind_int64(6, ts_val)?;
-    stmt.step()?;
-
-    Ok(())
 }
 
 /// Handle V2 wire tombstone (cid=-2): we only have hashed_pk, not packed PK values.
@@ -1791,7 +1388,7 @@ unsafe fn v2_merge_insert_hash_tombstone(
     insert_site_id: &[u8],
     insert_cl: sqlite::int64,
     insert_seq: sqlite::int64,
-    insert_ts: &str,
+    insert_ts: sqlite::int64,
     _rowid: *mut sqlite::int64,
     _tbl_info_index: usize,
     _errmsg: *mut *mut c_char,
@@ -1840,15 +1437,17 @@ unsafe fn v2_merge_insert_hash_tombstone(
         where_clause
     );
     let stmt = db.prepare_v2(&sql)?;
-    let site_ordinal = get_or_set_site_ordinal(ext_data, insert_site_id)?;
+    let site_ordinal = if insert_site_id.is_empty() {
+        0
+    } else {
+        get_or_set_site_ordinal(ext_data, insert_site_id)?
+    };
     stmt.bind_int64(1, site_ordinal as i64)?;
     stmt.bind_int64(2, insert_db_vrsn)?;
     stmt.bind_int64(3, insert_seq)?;
     stmt.bind_blob(4, hashed_pk, sqlite::Destructor::STATIC)?;
     stmt.bind_int64(5, insert_cl)?;
-    let ts_val = insert_ts.parse::<i64>().map_err(|_| ResultCode::ERROR)?;
-    let ts_val = if ts_val > 0 { ts_val } else { (*ext_data).timestamp as i64 };
-    stmt.bind_int64(6, ts_val)?;
+    stmt.bind_int64(6, insert_ts)?;
     if merge_equal == 1 {
         stmt.bind_blob(7, insert_site_id, sqlite::Destructor::STATIC)?;
     }
@@ -1944,7 +1543,7 @@ unsafe fn v2_packed_merge(
     db_vrsn: i64,
     site_id: &[u8],
     incoming_cl: i64,
-    ts: &str,
+    ts: i64,
 ) -> Result<ResultCode, ResultCode> {
     // ts check is done at the top of merge_insert
     let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
@@ -1952,56 +1551,29 @@ unsafe fn v2_packed_merge(
 
     // Ensure alive row exists at incoming_cl. Handles stale bail, resurrection,
     // skipped-delete cleanup, and new row creation in one shot.
+    let site_ordinal = if site_id.is_empty() {
+        0
+    } else {
+        get_or_set_site_ordinal(ext_data, site_id)?
+    };
     let (local_key, local_cl) = match v2_ensure_alive_row_at_cl(
         db, ext_data, tbl_info, unpacked_pks, hashed_pk, incoming_cl,
+        db_vrsn, site_ordinal,
     )? {
         Some(result) => result,
         None => return Ok(ResultCode::OK), // stale CL
     };
 
-    // Apply each column change
+    // Apply each column change.
+    // The upsert in v2_apply_value_change_colval handles conflict resolution:
+    // - When CL won, local clocks are at col_version=0, so incoming always wins.
+    // - When CL is equal, the WHERE clause compares col_version and values.
     for i in 0..col_names.len() {
-        let col_name = col_names[i];
-        let col_vrsn = col_vrsns[i];
-        let seq = seqs[i];
-        let col_val = &unpacked_vals[i];
-
-        if incoming_cl > local_cl {
-            // CL won — apply unconditionally
-            v2_apply_value_change_colval(
-                db, ext_data, tbl_info, &escaped, local_key, col_name,
-                col_val, col_vrsn, db_vrsn, site_id, seq, ts,
-                unpacked_pks, col_id_bits,
-            )?;
-        } else {
-            // incoming_cl == local_cl — resolve by col_version
-            let col_id = v2_get_col_id(db, &escaped, col_name)?;
-            let won = if let Some(col_id) = col_id {
-                let cell_key = (local_key << col_id_bits) | (col_id as i64);
-                let clock_sql = format!(
-                    "SELECT col_version FROM \"{}{}\" WHERE cell_key = ?\0",
-                    escaped, consts::V2_CLOCK_SUFFIX
-                );
-                let clock_stmt = db.prepare_v2(&clock_sql)?;
-                clock_stmt.bind_int64(1, cell_key)?;
-
-                if clock_stmt.step()? == ResultCode::ROW {
-                    let local_vrsn = clock_stmt.column_int64(0);
-                    col_vrsn >= local_vrsn
-                } else {
-                    true
-                }
-            } else {
-                true
-            };
-            if won {
-                v2_apply_value_change_colval(
-                    db, ext_data, tbl_info, &escaped, local_key, col_name,
-                    col_val, col_vrsn, db_vrsn, site_id, seq, ts,
-                    unpacked_pks, col_id_bits,
-                )?;
-            }
-        }
+        v2_apply_value_change_colval(
+            db, ext_data, tbl_info, &escaped, local_key, col_names[i],
+            &unpacked_vals[i], col_vrsns[i], db_vrsn, site_id, seqs[i], ts,
+            unpacked_pks, col_id_bits,
+        )?;
     }
 
     Ok(ResultCode::OK)
@@ -2016,15 +1588,18 @@ unsafe fn v2_nuke_local_row(
     unpacked_pks: &Vec<ColumnValue>,
     tbl_info: &TableInfo,
 ) -> Result<(), ResultCode> {
-    let col_id_bits = consts::CRSQL_COL_ID_BITS;
+    let col_id_bits = consts::CRSQL_COL_ID_BITS as i64;
+    let col_id_mask = consts::CRSQL_COL_ID_MASK as i64;
 
-    // Delete clocks for this key
+    // Delete clocks for this key (range scan on INTEGER PRIMARY KEY index)
+    let base = key << col_id_bits;
     let sql = format!(
-        "DELETE FROM \"{}{}\" WHERE cell_key >> {} = ?\0",
-        escaped, consts::V2_CLOCK_SUFFIX, col_id_bits
+        "DELETE FROM \"{}{}\" WHERE cell_key >= ? AND cell_key <= ?\0",
+        escaped, consts::V2_CLOCK_SUFFIX
     );
     let stmt = db.prepare_v2(&sql)?;
-    stmt.bind_int64(1, key)?;
+    stmt.bind_int64(1, base)?;
+    stmt.bind_int64(2, base | col_id_mask)?;
     stmt.step()?;
 
     // Delete from v2_pks
@@ -2102,7 +1677,7 @@ unsafe fn v2_lookup_pks_for_v1_copy(
     tbl_info: &TableInfo,
     hashed_pk: &[u8],
 ) -> Result<Vec<ColumnValue>, ResultCode> {
-    let pk_col_names: Vec<&str> = tbl_info.pks.iter().map(|c| c.name.as_str()).collect();
+    let pk_col_names: Vec<String> = tbl_info.pks.iter().map(|c| crate::util::escape_ident(&c.name)).collect();
     let pk_list = pk_col_names.join(", ");
 
     // Try v2_tombstone_pks first (row might have been deleted)
@@ -2122,15 +1697,20 @@ unsafe fn v2_lookup_pks_for_v1_copy(
 
     // Try v2_pks (row might still be alive)
     if tbl_info.uses_rowid_key {
+        let alias = crate::util::escape_ident(&tbl_info.rowid_alias);
+        let t_pk_list: Vec<String> = pk_col_names.iter().map(|c| format!("t.{}", c)).collect();
         let sql = format!(
-            "SELECT __crsql_key FROM \"{}{}\" WHERE hashed_pk = ?\0",
-            escaped, consts::V2_PKS_SUFFIX
+            "SELECT {} FROM \"{}{}\" p JOIN \"{}\" t ON t.\"{}\" = p.__crsql_key WHERE p.hashed_pk = ?\0",
+            t_pk_list.join(", "), escaped, consts::V2_PKS_SUFFIX,
+            escaped, alias
         );
         let stmt = db.prepare_v2(&sql)?;
         stmt.bind_blob(1, hashed_pk, sqlite::Destructor::STATIC)?;
         if stmt.step()? == ResultCode::ROW {
             let mut result = Vec::new();
-            result.push(ColumnValue::Integer(stmt.column_int64(0)));
+            for i in 0..tbl_info.pks.len() {
+                result.push(sqlite_value_to_column_value(stmt.column_value(i as i32)?));
+            }
             return Ok(result);
         }
     } else {
@@ -2158,7 +1738,7 @@ unsafe fn v2_lookup_pks_for_v1_copy(
 /// Reads the current V2 clock entries and mirrors them to V1 tables
 /// (__crsql_pks + __crsql_clock), ensuring semantic equivalence
 /// without relying on trigger-based V1 metadata population.
-unsafe fn v1_write_merge_metadata(
+unsafe fn v2_to_v1_mirror_metadata(
     db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
     tbl_info: &TableInfo,
@@ -2190,7 +1770,7 @@ unsafe fn v1_write_merge_metadata(
     // 3. Get or create V1 PK entry
     let v1_key = tbl_info.get_or_create_key(db, pks)?;
 
-    // 4. Delete all existing V1 clock entries for this key
+    // 4. Delete all existing V1 clock entries and sentinels for this v1 key
     let del_sql = format!(
         "DELETE FROM \"{}__crsql_clock\" WHERE key = ?\0",
         escaped
@@ -2202,58 +1782,60 @@ unsafe fn v1_write_merge_metadata(
     let col_id_bits = consts::CRSQL_COL_ID_BITS as i64;
     let col_id_mask = consts::CRSQL_COL_ID_MASK as i64;
 
-    // 5. Copy V2 state to V1
-    if let Some(v2_key) = v2_key_opt {
-        // Row is alive (in v2_pks)
-
-        // 5a. Set V1 INSERT_SENTINEL clock entry with col_version = CL
-        // Get sentinel clock data from V2 (col_id=0) if it exists
-        let sentinel_cell_key = (v2_key << col_id_bits) | 0;
-        let sentinel_sql = format!(
-            "SELECT site_id, db_version, seq, ts FROM \"{}{}\" WHERE cell_key = ?\0",
-            escaped, consts::V2_CLOCK_SUFFIX
-        );
-        let sentinel_stmt = db.prepare_v2(&sentinel_sql)?;
-        sentinel_stmt.bind_int64(1, sentinel_cell_key)?;
-
-        if sentinel_stmt.step()? == ResultCode::ROW {
-            let site_id = sentinel_stmt.column_int64(0);
-            let db_version = sentinel_stmt.column_int64(1);
-            let seq = sentinel_stmt.column_int64(2);
-            let ts = sentinel_stmt.column_int64(3);
-
-            let ins_sql = format!(
-                "INSERT OR REPLACE INTO \"{}__crsql_clock\" (key, col_name, col_version, db_version, seq, site_id, ts) VALUES (?, '-1', ?, ?, ?, ?, ?)\0",
-                escaped
-            );
-            let ins_stmt = db.prepare_v2(&ins_sql)?;
-            ins_stmt.bind_int64(1, v1_key)?;
-            ins_stmt.bind_int64(2, v2_cl)?;
-            ins_stmt.bind_int64(3, db_version)?;
-            ins_stmt.bind_int64(4, seq)?;
-            ins_stmt.bind_int64(5, site_id)?;
-            ins_stmt.bind_text(6, &format!("{}", ts), sqlite::Destructor::TRANSIENT)?;
-            ins_stmt.step()?;
+    // Set the V1 sentinel if needed
+    // V1 omits the sentinel for CL=1 (alive, default), so only write it for CL > 1.
+    // Besides the CL V1 requires (site_id, db_version, seq, ts)
+    // In V2 we have this extra data for dead rows but we don't have it for alive rows
+    // For alive rows we improvise by taking the values from col_id=0
+    if v2_cl > 1 {
+        let (source_sql, bind_cell_key) = if let Some(k) = v2_key_opt {
+            (
+                format!(
+                    "SELECT site_id, db_version, seq, ts FROM \"{}{}\" WHERE cell_key = ?\0",
+                    escaped, consts::V2_CLOCK_SUFFIX
+                ),
+                (k << col_id_bits) | 0,
+            )
         } else {
-            // No sentinel clock in V2 — still need V1 sentinel with CL
-            let ins_sql = format!(
-                "INSERT OR REPLACE INTO \"{}__crsql_clock\" (key, col_name, col_version, db_version, seq, site_id, ts) VALUES (?, '-1', ?, 0, 0, 0, '0')\0",
-                escaped
-            );
-            let ins_stmt = db.prepare_v2(&ins_sql)?;
-            ins_stmt.bind_int64(1, v1_key)?;
-            ins_stmt.bind_int64(2, v2_cl)?;
-            ins_stmt.step()?;
+            (
+                format!(
+                    "SELECT site_id, db_version, seq, ts FROM \"{}{}\" WHERE hashed_pk = ?\0",
+                    escaped, consts::V2_TOMBSTONES_SUFFIX
+                ),
+                0,
+            )
+        };
+        let ins_sql = format!(
+            "INSERT INTO \"{}__crsql_clock\" (key, col_name, col_version, db_version, seq, site_id, ts)
+             SELECT ?, '-1', {cl}, site_id, db_version, seq,
+               CASE WHEN ts > 0 THEN ts ELSE {ts_fallback} END
+             FROM ({src}) LIMIT 1\0",
+            escaped, cl = v2_cl, ts_fallback = ts_fallback, src = source_sql.trim_end_matches('\0')
+        );
+        let ins_stmt = db.prepare_v2(&ins_sql)?;
+        ins_stmt.bind_int64(1, v1_key)?;
+        if v2_key_opt.is_some() {
+            ins_stmt.bind_int64(2, bind_cell_key)?;
+        } else {
+            ins_stmt.bind_blob(2, hashed_pk, sqlite::Destructor::STATIC)?;
         }
+        ins_stmt.step()?;
+    }
 
-        // 5b. Copy cell clocks from V2 to V1 (col_id > 0)
+    // Copy clocks from V2 to V1. For PK only tables it's an no op as the
+    // insert sentinel was created already and the V2_COL_MAP_SUFFIX join will filter it out 
+    if let Some(v2_key) = v2_key_opt {
+        // cell_key = (v2_key << col_id_bits) | col_id
+        // All entries for this v2_key are in range [base, base | col_id_mask].
+        // Use range scan to leverage the INTEGER PRIMARY KEY index.
+        let base = v2_key << col_id_bits;
         let cell_sql = format!(
-            "INSERT OR REPLACE INTO \"{}__crsql_clock\" (key, col_name, col_version, db_version, seq, site_id, ts)
+            "INSERT INTO \"{}__crsql_clock\" (key, col_name, col_version, db_version, seq, site_id, ts)
              SELECT ?, m.col_name, c.col_version, c.db_version, c.seq,
                CASE WHEN c.ts > 0 THEN c.ts ELSE {ts_fallback} END, c.site_id
              FROM \"{}{}\" c
              JOIN \"{}{}\" m ON (c.cell_key & ?) = m.col_id
-             WHERE (c.cell_key >> ?) = ? AND (c.cell_key & ?) > 0\0",
+             WHERE c.cell_key >= ? AND c.cell_key <= ?\0",
             escaped,
             escaped, consts::V2_CLOCK_SUFFIX,
             escaped, consts::V2_COL_MAP_SUFFIX,
@@ -2262,67 +1844,17 @@ unsafe fn v1_write_merge_metadata(
         let cell_stmt = db.prepare_v2(&cell_sql)?;
         cell_stmt.bind_int64(1, v1_key)?;
         cell_stmt.bind_int64(2, col_id_mask)?;
-        cell_stmt.bind_int64(3, col_id_bits)?;
-        cell_stmt.bind_int64(4, v2_key)?;
-        cell_stmt.bind_int64(5, col_id_mask)?;
-
-        while cell_stmt.step()? == ResultCode::ROW {
-            let col_version = cell_stmt.column_int64(1);
-            let col_name = cell_stmt.column_text(2)?;
-            let db_version = cell_stmt.column_int64(3);
-            let seq = cell_stmt.column_int64(4);
-            let ts = cell_stmt.column_int64(5);
-            let site_id = cell_stmt.column_int64(6);
-
-            let ins_sql = format!(
-                "INSERT OR REPLACE INTO \"{}__crsql_clock\" (key, col_name, col_version, db_version, seq, site_id, ts) VALUES (?, ?, ?, ?, ?, ?, ?)\0",
-                escaped
-            );
-            let ins_stmt = db.prepare_v2(&ins_sql)?;
-            ins_stmt.bind_int64(1, v1_key)?;
-            ins_stmt.bind_text(2, col_name, sqlite::Destructor::TRANSIENT)?;
-            ins_stmt.bind_int64(3, col_version)?;
-            ins_stmt.bind_int64(4, db_version)?;
-            ins_stmt.bind_int64(5, seq)?;
-            ins_stmt.bind_int64(6, site_id)?;
-            ins_stmt.bind_text(7, &format!("{}", ts), sqlite::Destructor::TRANSIENT)?;
-            ins_stmt.step()?;
-        }
-    } else {
-        // Row is dead (in v2_tombstones)
-        let tomb_sql = format!(
-            "SELECT site_id, db_version, seq, ts FROM \"{}{}\" WHERE hashed_pk = ?\0",
-            escaped, consts::V2_TOMBSTONES_SUFFIX
-        );
-        let tomb_stmt = db.prepare_v2(&tomb_sql)?;
-        tomb_stmt.bind_blob(1, hashed_pk, sqlite::Destructor::STATIC)?;
-
-        if tomb_stmt.step()? == ResultCode::ROW {
-            let site_id = tomb_stmt.column_int64(0);
-            let db_version = tomb_stmt.column_int64(1);
-            let seq = tomb_stmt.column_int64(2);
-            let ts = tomb_stmt.column_int64(3);
-
-            // V1 DELETE_SENTINEL = INSERT_SENTINEL = '-1', CL is even for delete
-            let ins_sql = format!(
-                "INSERT OR REPLACE INTO \"{}__crsql_clock\" (key, col_name, col_version, db_version, seq, site_id, ts) VALUES (?, '-1', ?, ?, ?, ?, ?)\0",
-                escaped
-            );
-            let ins_stmt = db.prepare_v2(&ins_sql)?;
-            ins_stmt.bind_int64(1, v1_key)?;
-            ins_stmt.bind_int64(2, v2_cl)?;
-            ins_stmt.bind_int64(3, db_version)?;
-            ins_stmt.bind_int64(4, seq)?;
-            ins_stmt.bind_int64(5, site_id)?;
-            ins_stmt.bind_text(6, &format!("{}", ts), sqlite::Destructor::TRANSIENT)?;
-            ins_stmt.step()?;
-        }
+        cell_stmt.bind_int64(3, base)?;
+        cell_stmt.bind_int64(4, base | col_id_mask)?;
+        cell_stmt.step()?;
     }
 
     Ok(())
 }
 
 /// Apply a value change using ColumnValue instead of *mut sqlite::value.
+/// The clock upsert decides if the change wins via WHERE + RETURNING.
+/// The base table is only updated if the clock upsert applied (RETURNING yielded a row).
 #[allow(clippy::too_many_arguments)]
 unsafe fn v2_apply_value_change_colval(
     db: *mut sqlite3,
@@ -2336,37 +1868,10 @@ unsafe fn v2_apply_value_change_colval(
     db_version: i64,
     site_id: &[u8],
     seq: i64,
-    ts: &str,
+    ts: i64,
     unpacked_pks: &Vec<ColumnValue>,
     col_id_bits: u32,
 ) -> Result<(), ResultCode> {
-    // Update the actual user table
-    let merge_stmt_ref = tbl_info.get_merge_insert_stmt(db, col_name)?;
-    let merge_stmt = merge_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
-    // Bind PK values at offset 0 (positions 1..n)
-    bind_package_to_stmt(merge_stmt.stmt, unpacked_pks, 0)?;
-    // Bind the column value for INSERT (position n+1) and UPDATE (position n+2)
-    let pk_len = unpacked_pks.len() as i32;
-    let raw_stmt = merge_stmt.stmt;
-    // Bind INSERT value
-    match val {
-        ColumnValue::Integer(i) => { raw_stmt.bind_int64(pk_len + 1, *i)?; }
-        ColumnValue::Float(f) => { raw_stmt.bind_double(pk_len + 1, *f)?; }
-        ColumnValue::Text(t) => { raw_stmt.bind_text(pk_len + 1, t, sqlite::Destructor::STATIC)?; }
-        ColumnValue::Blob(b) => { raw_stmt.bind_blob(pk_len + 1, b, sqlite::Destructor::STATIC)?; }
-        ColumnValue::Null => { raw_stmt.bind_null(pk_len + 1)?; }
-    }
-    // Bind UPDATE value (same as INSERT)
-    match val {
-        ColumnValue::Integer(i) => { raw_stmt.bind_int64(pk_len + 2, *i)?; }
-        ColumnValue::Float(f) => { raw_stmt.bind_double(pk_len + 2, *f)?; }
-        ColumnValue::Text(t) => { raw_stmt.bind_text(pk_len + 2, t, sqlite::Destructor::STATIC)?; }
-        ColumnValue::Blob(b) => { raw_stmt.bind_blob(pk_len + 2, b, sqlite::Destructor::STATIC)?; }
-        ColumnValue::Null => { raw_stmt.bind_null(pk_len + 2)?; }
-    }
-    raw_stmt.step()?;
-    raw_stmt.reset()?;
-
     // Get site ordinal
     let site_ordinal = if site_id.is_empty() {
         0
@@ -2382,28 +1887,113 @@ unsafe fn v2_apply_value_change_colval(
     let col_id = col_id.unwrap();
     let cell_key = (key << col_id_bits) | (col_id as i64);
 
-    // Upsert v2_clock entry
+    // Build base table subquery for value comparison.
+    // For rowid-key tables, use rowid alias directly (1 param).
+    // For non-rowid tables, use PK columns (n params).
+    let escaped_col = crate::util::escape_ident(col_name);
+    let merge_equal = unsafe { (*ext_data).mergeEqualValues };
+    let pk_len = unpacked_pks.len() as i32;
+
+    let (subquery, subquery_param_count) = if tbl_info.uses_rowid_key {
+        let alias = crate::util::escape_ident(&tbl_info.rowid_alias);
+        (
+            format!("SELECT \"{}\" FROM \"{}\" WHERE \"{}\" = ?", escaped_col, escaped, alias),
+            1
+        )
+    } else {
+        let pk_where: String = tbl_info.pks
+            .iter()
+            .map(|c| format!("\"{}\" = ?", crate::util::escape_ident(&c.name)))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        (
+            format!("SELECT \"{}\" FROM \"{}\" WHERE {}", escaped_col, escaped, pk_where),
+            pk_len
+        )
+    };
+
+    // Upsert v2_clock entry with conflict resolution in WHERE clause.
+    // RETURNING tells us if the change won — only then do we update the base table.
+    // site_id comparison uses blob comparison via crsql_site_id join, matching V1 semantics.
     let sql = format!(
-        "INSERT INTO \"{}{}\" (cell_key, col_version, site_id, db_version, seq, ts)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(cell_key) DO UPDATE SET
-           col_version = excluded.col_version,
-           site_id = excluded.site_id,
-           db_version = excluded.db_version,
-           seq = excluded.seq,
-           ts = excluded.ts\0",
-        escaped, consts::V2_CLOCK_SUFFIX
+        "INSERT INTO \"{}{}\" (cell_key, col_version, site_id, db_version, seq, ts)\n
+         VALUES (?, ?, ?, ?, ?, ?)\n
+         ON CONFLICT(cell_key) DO UPDATE SET\n
+         col_version = excluded.col_version,\n
+         site_id = excluded.site_id,\n
+         db_version = excluded.db_version,\n
+         seq = excluded.seq,\n
+         ts = excluded.ts\n
+         WHERE excluded.col_version > col_version\n
+         OR (excluded.col_version = col_version AND\n
+         crsql_change_wins(?, ({}),\n
+         ? > (SELECT site_id FROM crsql_site_id WHERE ordinal = site_id), ?))\n
+         RETURNING cell_key\0",
+        escaped, consts::V2_CLOCK_SUFFIX,
+        subquery
     );
     let stmt = db.prepare_v2(&sql)?;
+    // Bind clock values (params 1-6)
     stmt.bind_int64(1, cell_key)?;
     stmt.bind_int64(2, col_vrsn)?;
     stmt.bind_int64(3, site_ordinal)?;
     stmt.bind_int64(4, db_version)?;
     stmt.bind_int64(5, seq)?;
-    let ts_val = ts.parse::<i64>().map_err(|_| ResultCode::ERROR)?;
-    let ts_val = if ts_val > 0 { ts_val } else { (*ext_data).timestamp as i64 };
-    stmt.bind_int64(6, ts_val)?;
-    stmt.step()?;
+    stmt.bind_int64(6, ts)?;
+    // Bind incoming value for crsql_change_wins (param 7)
+    match val {
+        ColumnValue::Integer(i) => { stmt.bind_int64(7, *i)?; }
+        ColumnValue::Float(f) => { stmt.bind_double(7, *f)?; }
+        ColumnValue::Text(t) => { stmt.bind_text(7, t, sqlite::Destructor::STATIC)?; }
+        ColumnValue::Blob(b) => { stmt.bind_blob(7, b, sqlite::Destructor::STATIC)?; }
+        ColumnValue::Null => { stmt.bind_null(7)?; }
+    }
+    // Bind subquery params (params 8..8+subquery_param_count)
+    if tbl_info.uses_rowid_key {
+        stmt.bind_int64(8, key)?;
+    } else {
+        bind_package_to_stmt(stmt.stmt, unpacked_pks, 7)?;
+    }
+    // Bind incoming site_id blob for comparison (param 8+subquery_param_count)
+    stmt.bind_blob(8 + subquery_param_count, site_id, sqlite::Destructor::STATIC)?;
+    // Bind mergeEqualValues flag (param 9+subquery_param_count)
+    stmt.bind_int(9 + subquery_param_count, merge_equal)?;
+
+    let won = stmt.step()? == ResultCode::ROW;
+    reset_cached_stmt(stmt.stmt)?;
+
+    if !won {
+        return Ok(());
+    }
+
+    // Change won — update the actual user table.
+    // Set sync bit to suppress triggers that would overwrite V2 clock with local site_id.
+    (*ext_data).pSetSyncBitStmt.step()?;
+    (*ext_data).pSetSyncBitStmt.reset()?;
+
+    let merge_stmt_ref = tbl_info.get_merge_insert_stmt(db, col_name)?;
+    let merge_stmt = merge_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
+    bind_package_to_stmt(merge_stmt.stmt, unpacked_pks, 0)?;
+    let raw_stmt = merge_stmt.stmt;
+    match val {
+        ColumnValue::Integer(i) => { raw_stmt.bind_int64(pk_len + 1, *i)?; }
+        ColumnValue::Float(f) => { raw_stmt.bind_double(pk_len + 1, *f)?; }
+        ColumnValue::Text(t) => { raw_stmt.bind_text(pk_len + 1, t, sqlite::Destructor::STATIC)?; }
+        ColumnValue::Blob(b) => { raw_stmt.bind_blob(pk_len + 1, b, sqlite::Destructor::STATIC)?; }
+        ColumnValue::Null => { raw_stmt.bind_null(pk_len + 1)?; }
+    }
+    match val {
+        ColumnValue::Integer(i) => { raw_stmt.bind_int64(pk_len + 2, *i)?; }
+        ColumnValue::Float(f) => { raw_stmt.bind_double(pk_len + 2, *f)?; }
+        ColumnValue::Text(t) => { raw_stmt.bind_text(pk_len + 2, t, sqlite::Destructor::STATIC)?; }
+        ColumnValue::Blob(b) => { raw_stmt.bind_blob(pk_len + 2, b, sqlite::Destructor::STATIC)?; }
+        ColumnValue::Null => { raw_stmt.bind_null(pk_len + 2)?; }
+    }
+    raw_stmt.step()?;
+    raw_stmt.reset()?;
+
+    (*ext_data).pClearSyncBitStmt.step()?;
+    (*ext_data).pClearSyncBitStmt.reset()?;
 
     Ok(())
 }

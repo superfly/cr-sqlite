@@ -492,6 +492,23 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         return null_mut();
     }
 
+    let rc = db
+        .create_function_v2(
+            "crsql_change_wins",
+            4,
+            sqlite::UTF8 | sqlite::DETERMINISTIC,
+            None,
+            Some(x_crsql_change_wins),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
     #[cfg(feature = "test")]
     if let Err(_) = db.create_function_v2(
         "crsql_cache_site_ordinal",
@@ -1254,6 +1271,37 @@ unsafe extern "C" fn x_crsql_get_ts(
         return;
     }
     ctx.result_int64(ts as sqlite::int64);
+}
+
+/**
+ * Compare incoming vs local value for LWW merge resolution.
+ * Args: (incoming_val, local_val, site_id_wins, merge_equal_values)
+ * site_id_wins is a boolean (1/0) computed by the caller via blob comparison.
+ * Returns 1 if incoming wins, 0 otherwise.
+ */
+unsafe extern "C" fn x_crsql_change_wins(
+    ctx: *mut sqlite::context,
+    argc: i32,
+    argv: *mut *mut sqlite::value,
+) {
+    if argc != 4 {
+        ctx.result_error("crsql_change_wins expects 4 args");
+        return;
+    }
+    let args = sqlite::args!(argc, argv);
+    let cmp = crate::compare_values::crsql_compare_sqlite_values(args[0], args[1]);
+    if cmp > 0 {
+        ctx.result_int(1);
+    } else if cmp < 0 {
+        ctx.result_int(0);
+    } else {
+        let merge_equal = args[3].int();
+        if merge_equal == 1 {
+            ctx.result_int(args[2].int());
+        } else {
+            ctx.result_int(0);
+        }
+    }
 }
 
 /**
