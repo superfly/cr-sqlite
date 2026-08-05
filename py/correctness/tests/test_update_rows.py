@@ -151,8 +151,8 @@ def test_ts_is_inserted():
     db1_site_id = get_site_id(db1)
     db2_site_id = get_site_id(db2)
 
-    # use max u64
-    db1.execute("SELECT crsql_set_ts('18446744073709551615')")
+    # use max i64
+    db1.execute("SELECT crsql_set_ts('9223372036854775807')")
     db1.execute("INSERT INTO foo (id, a, b) VALUES (1, 2, 3)")
     db1.commit()
 
@@ -164,8 +164,8 @@ def test_ts_is_inserted():
 
     db1_changes = db1.execute("SELECT * FROM crsql_changes").fetchall()
 
-    assert (db1_changes == [('foo', b'\x01\t\x01', 'a', 2, 1, 1, db1_site_id, 1, 0, '18446744073709551615'),
-                    ('foo', b'\x01\t\x01', 'b', 3, 1, 1, db1_site_id, 1, 1, '18446744073709551615'),
+    assert (db1_changes == [('foo', b'\x01\t\x01', 'a', 2, 1, 1, db1_site_id, 1, 0, '9223372036854775807'),
+                    ('foo', b'\x01\t\x01', 'b', 3, 1, 1, db1_site_id, 1, 1, '9223372036854775807'),
                     ('foo', b'\x01\t\x02', 'a', 5, 1, 2, db1_site_id, 1, 0, '0'),
                     ('foo', b'\x01\t\x02', 'b', 6, 1, 2, db1_site_id, 1, 1, '0')])
 

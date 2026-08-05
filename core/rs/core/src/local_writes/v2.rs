@@ -340,12 +340,13 @@ pub fn v2_after_delete(
     del_stmt.step().map_err(|e| format!("step: {:?}", e))?;
 
     let del_clock_stmt = db.prepare_v2(&format!(
-        "DELETE FROM \"{escaped}{suffix}\" WHERE cell_key >> {bits} = ?",
+        "DELETE FROM \"{escaped}{suffix}\" WHERE cell_key >= ? AND cell_key <= ?",
         escaped = escaped,
-        suffix = consts::V2_CLOCK_SUFFIX,
-        bits = consts::CRSQL_COL_ID_BITS
+        suffix = consts::V2_CLOCK_SUFFIX
     )).map_err(|e| format!("failed to prepare del clock stmt: {:?}", e))?;
-    del_clock_stmt.bind_int64(1, key).map_err(|e| format!("bind: {:?}", e))?;
+    let base = key << consts::CRSQL_COL_ID_BITS;
+    del_clock_stmt.bind_int64(1, base).map_err(|e| format!("bind: {:?}", e))?;
+    del_clock_stmt.bind_int64(2, base | consts::CRSQL_COL_ID_MASK as i64).map_err(|e| format!("bind: {:?}", e))?;
     del_clock_stmt.step().map_err(|e| format!("step: {:?}", e))?;
 
     let tomb_sql = format!(
