@@ -85,6 +85,7 @@ def test_delta_sync(all_scripts):
         conn = connect(":memory:")
         conn.execute(
             "CREATE TABLE item (id PRIMARY KEY NOT NULL, width INTEGER, height INTEGER, name TEXT, description TEXT, weight INTEGER)")
+        conn.execute("SELECT crsql_set_ts('1700000000')")
         conn.execute("SELECT crsql_as_crr('item')")
         conn.commit()
         return (i, conn, dict())
@@ -246,6 +247,7 @@ def sync_left_to_right(l, r, since_map, since_is_rowid):
             change = tuple(temp)
         else:
             ret[change[0]] = change[5]
+        r.execute("SELECT crsql_set_ts('1700000000')")
         r.execute(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
 

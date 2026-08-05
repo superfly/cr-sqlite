@@ -4,6 +4,7 @@ def sync_left_to_right(l, r, since):
     changes = l.execute(
         "SELECT * FROM crsql_changes WHERE db_version > ?", (since,))
     for change in changes:
+        r.execute("SELECT crsql_set_ts('1700000000')")
         r.execute(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
     r.commit()
@@ -12,6 +13,7 @@ def test_update_pk():
     def create_db():
         db = connect(":memory:")
         db.execute("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, a, b)")
+        db.execute("SELECT crsql_set_ts('1700000000')")
         db.execute("SELECT crsql_as_crr('foo');")
         db.commit()
         return db
@@ -71,6 +73,7 @@ def test_empty_update_doesnt_change_db_version():
     def create_db():
         db = connect(":memory:")
         db.execute("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, a, b)")
+        db.execute("SELECT crsql_set_ts('1700000000')")
         db.execute("SELECT crsql_as_crr('foo');")
         db.commit()
         return db
@@ -134,6 +137,7 @@ def test_ts_is_inserted():
     def create_db():
         db = connect(":memory:")
         db.execute("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, a, b)")
+        db.execute("SELECT crsql_set_ts('1700000000')")
         db.execute("SELECT crsql_as_crr('foo');")
         db.commit()
         return db
@@ -148,7 +152,7 @@ def test_ts_is_inserted():
     db2_site_id = get_site_id(db2)
 
     # use max u64
-    db1.execute("SELECT crsql_set_ts('18446744073709551615');")
+    db1.execute("SELECT crsql_set_ts('18446744073709551615')")
     db1.execute("INSERT INTO foo (id, a, b) VALUES (1, 2, 3)")
     db1.commit()
 
