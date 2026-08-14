@@ -6,7 +6,7 @@ A [run-time loadable extension](https://www.sqlite.org/loadext.html) for [SQLite
 
 This fork diverges from upstream cr-sqlite v0.15.0 and introduces significant, breaking changes to the change bookkeeping model and underlying data format. The current version is **0.18.0**. Databases created with cr-sqlite < 0.17.0 are not supported and must be migrated. Databases on 0.17.0 can incrementally migrate to the new V2 metadata format (see [Migration Guide](#migration-guide-017--018)).
 
-**0.19.0 will make V2 metadata + V2 wire format the default and remove V1 support entirely.**
+**0.19.0 will remove V1 support entirely. V2 schema may receive breaking changes during the 0.18.x series.**
 
 The core CRDT approach (history-free, last-write-wins per column, causal length sets) remains the same. The differences are in **how changes are tracked, timestamped, and replicated**.
 
@@ -120,7 +120,7 @@ Local writes (insert/update/delete triggers) have been significantly reworked:
 
 ## What's New in 0.18.0
 
-0.18.0 introduces a new V2 metadata format and V2 wire format for change tracking. These are opt-in in 0.18.0 and will become the default (and only) format in 0.19.0. For full design details, see [`v2_metadata_design.md`](./v2_metadata_design.md).
+0.18.0 introduces a new V2 metadata format and V2 wire format for change tracking. These are opt-in in 0.18.0. The V2 schema may receive breaking changes during the 0.18.x series. V1 support will be removed in 0.19.0. For full design details, see [`v2_metadata_design.md`](./v2_metadata_design.md).
 
 ### Mandatory `crsql_set_ts()` Before All Write Operations
 
