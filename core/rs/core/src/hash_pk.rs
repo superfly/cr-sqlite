@@ -53,3 +53,91 @@ pub extern "C" fn crsql_hash_pk(
         }
     }
 }
+
+// Stability tests with hardcoded hash vectors.
+// These hashes are computed from the exact packed blob format (varint count header
+// + TLV-encoded values) and truncated XXH128. If the packing format or hash
+// computation changes, these tests will fail — preventing silent hash changes
+// that would break existing V2 metadata tables (tombstones, v2_pks lookups, etc.).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pack_columns::{ColumnValue, pack_column_values};
+
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn compute_hash(values: &[ColumnValue]) -> Vec<u8> {
+        let packed = pack_column_values(values).unwrap();
+        hash_packed_blob(&packed)
+    }
+
+    fn assert_hash(values: &[ColumnValue], expected_hex: &str) {
+        let hash = compute_hash(values);
+        let expected = hex_to_bytes(expected_hex);
+        assert_eq!(hash, expected, "hash mismatch");
+    }
+
+    #[test]
+    fn test_single_integer_pk() {
+        assert_hash(&[ColumnValue::Integer(1)], "cbbe68493d0f89fd6eff");
+        assert_hash(&[ColumnValue::Integer(42)], "b47bb9d09c233e761427");
+        assert_hash(&[ColumnValue::Integer(0)], "50e58cbd6ada00a1070d");
+    }
+
+    #[test]
+    fn test_single_text_pk() {
+        assert_hash(&[ColumnValue::Text("hello".to_string())], "ec40da9a164df00c981f");
+        assert_hash(&[ColumnValue::Text("".to_string())], "15ca8e4527acb64342f1");
+    }
+
+    #[test]
+    fn test_composite_pk() {
+        assert_hash(
+            &[ColumnValue::Integer(1), ColumnValue::Text("abc".to_string())],
+            "d17dbd291f0b1cd9e1d5",
+        );
+    }
+
+    #[test]
+    fn test_null_pk() {
+        assert_hash(&[ColumnValue::Null], "2220638bc95eeae33b08");
+    }
+
+    #[test]
+    fn test_blob_pk() {
+        assert_hash(
+            &[ColumnValue::Blob(vec![0x01, 0x02, 0x03])],
+            "290b910dddb1869e845d",
+        );
+    }
+
+    #[test]
+    fn test_float_pk() {
+        assert_hash(&[ColumnValue::Float(3.14)], "d61f1c470f6bcc19d56a");
+    }
+
+    #[test]
+    fn test_hash_packed_blob_direct() {
+        // Known packed blob: varint(1) + integer(1) = [0x01, 0x08, 0x01]
+        let packed = vec![0x01, 0x08, 0x01];
+        let hash = hash_packed_blob(&packed);
+        assert_eq!(hash.len(), crate::consts::PK_HASH_SIZE);
+        // Verify determinism: same input always produces same output
+        let hash2 = hash_packed_blob(&packed);
+        assert_eq!(hash, hash2);
+    }
+
+    #[test]
+    fn test_different_inputs_produce_different_hashes() {
+        let packed1 = pack_column_values(&[ColumnValue::Integer(1)]).unwrap();
+        let packed2 = pack_column_values(&[ColumnValue::Integer(2)]).unwrap();
+        let hash1 = hash_packed_blob(&packed1);
+        let hash2 = hash_packed_blob(&packed2);
+        assert_ne!(hash1, hash2);
+    }
+}
