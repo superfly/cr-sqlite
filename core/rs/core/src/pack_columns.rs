@@ -161,6 +161,7 @@ fn num_bytes_needed_i64(val: i64) -> u8 {
     }
 }
 
+#[derive(Clone)]
 pub enum ColumnValue {
     Blob(Vec<u8>),
     Float(f64),
@@ -301,7 +302,7 @@ pub fn bind_package_to_stmt(
     Ok(ResultCode::OK)
 }
 
-fn bind_slot(
+pub fn bind_slot(
     slot_num: usize,
     val: &ColumnValue,
     stmt: *mut sqlite::stmt,

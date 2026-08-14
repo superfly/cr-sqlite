@@ -63,11 +63,60 @@ pub fn create_v2_tables(
     ))?;
 
     // 3. Alive PKs
-    // If uses_rowid_key (single INTEGER PRIMARY KEY on rowid table), __crsql_key = rowid.
+    // If key_is_rowid (single INTEGER PRIMARY KEY on rowid table), __crsql_key = rowid.
     // No need to store PK columns separately since rowid IS the PK.
     // STRICT always used. For non-rowid tables, dynamic PK columns use ANY type
     // (https://www.sqlite.org/stricttables.html) so STRICT works regardless of base table type.
-    if table_info.uses_rowid_key {
+    //
+    // skip_hash mode: no hashed_pk column. PK value used directly for lookups.
+    // skip_hash requires a single-column PK (enforced at as_crr time).
+    // - skip_hash + key_is_rowid: 2 cols (__crsql_key, cl) — PK fetched from main table
+    // - skip_hash + !key_is_rowid: 3 cols (__crsql_key, "pk_col", cl) — PK stored in v2_pks
+    // - hash + key_is_rowid: 3 cols (__crsql_key, hashed_pk, cl)
+    // - hash + !key_is_rowid: 3+N cols (__crsql_key, [pk_cols...], hashed_pk, cl)
+    if table_info.skip_hash {
+        if table_info.key_is_rowid {
+            db.exec_safe(&format!(
+                "CREATE TABLE IF NOT EXISTS \"{escaped}{suffix}\" (
+                  __crsql_key INTEGER PRIMARY KEY,
+                  cl INTEGER NOT NULL DEFAULT 1 CHECK (cl % 2 = 1)
+                ) STRICT;",
+                escaped = escaped,
+                suffix = consts::V2_PKS_SUFFIX,
+            ))?;
+        } else {
+            // Single PK column (skip_hash requires single PK)
+            let pk_col = &table_info.pks[0];
+            let pk_type = if pk_col.col_type.to_uppercase().contains("INT") {
+                "INTEGER"
+            } else {
+                "ANY"
+            };
+            db.exec_safe(&format!(
+                "CREATE TABLE IF NOT EXISTS \"{escaped}{suffix}\" (
+                  __crsql_key INTEGER PRIMARY KEY,
+                  \"{pk_name}\" {pk_type} NOT NULL,
+                  cl INTEGER NOT NULL DEFAULT 1 CHECK (cl % 2 = 1)
+                ) STRICT;",
+                escaped = escaped,
+                suffix = consts::V2_PKS_SUFFIX,
+                pk_name = crate::util::escape_ident(&pk_col.name),
+                pk_type = pk_type,
+            ))?;
+        }
+
+        // Unique index on PK column (only when PK is stored — non-rowid case)
+        if !table_info.key_is_rowid {
+            let pk_col = &table_info.pks[0];
+            db.exec_safe(&format!(
+                "CREATE UNIQUE INDEX IF NOT EXISTS \"idx_{escaped}_v2_pks_pk\"
+                  ON \"{escaped}{suffix}\"(\"{pk_name}\");",
+                escaped = escaped,
+                suffix = consts::V2_PKS_SUFFIX,
+                pk_name = crate::util::escape_ident(&pk_col.name),
+            ))?;
+        }
+    } else if table_info.key_is_rowid {
         db.exec_safe(&format!(
             "CREATE TABLE IF NOT EXISTS \"{escaped}{suffix}\" (
               __crsql_key INTEGER PRIMARY KEY,
@@ -101,57 +150,95 @@ pub fn create_v2_tables(
         db.exec_safe(&create_sql)?;
     }
 
-    let index_sql = format!(
-        "CREATE UNIQUE INDEX IF NOT EXISTS \"idx_{escaped}_v2_pks_hash\"
-          ON \"{escaped}{suffix}\"(hashed_pk);",
-        escaped = escaped,
-        suffix = consts::V2_PKS_SUFFIX
-    );
-    db.exec_safe(&index_sql)?;
-
-    // 4. Tombstones
-    db.exec_safe(&format!(
-        "CREATE TABLE IF NOT EXISTS \"{escaped}{suffix}\" (
-          site_id INTEGER NOT NULL,
-          db_version INTEGER NOT NULL,
-          seq INTEGER NOT NULL,
-          hashed_pk BLOB NOT NULL,
-          cl INTEGER NOT NULL CHECK (cl % 2 = 0),
-          ts INTEGER NOT NULL CHECK (ts > 0),
-          PRIMARY KEY (site_id, db_version, seq)
-        ) WITHOUT ROWID, STRICT;",
-        escaped = escaped,
-        suffix = consts::V2_TOMBSTONES_SUFFIX
-    ))?;
-
-    db.exec_safe(&format!(
-        "CREATE UNIQUE INDEX IF NOT EXISTS \"idx_{escaped}_v2_tombstones_hash\"
-          ON \"{escaped}{suffix}\"(hashed_pk);",
-        escaped = escaped,
-        suffix = consts::V2_TOMBSTONES_SUFFIX
-    ))?;
-
-    // 5. Tombstone PKs (V1 compat)
-    // STRICT always; dynamic PK columns use ANY type.
-    let mut tombstone_pk_cols_sql = String::new();
-    for (i, pk) in table_info.pks.iter().enumerate() {
-        if i > 0 { tombstone_pk_cols_sql.push_str(", "); }
-        tombstone_pk_cols_sql.push_str(&format!(
-            "\"{}\" ANY NOT NULL",
-            crate::util::escape_ident(&pk.name)
-        ));
+    // Unique index on hashed_pk for hash mode (skip_hash mode has its own index above)
+    if !table_info.skip_hash {
+        let index_sql = format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS \"idx_{escaped}_v2_pks_hash\"
+              ON \"{escaped}{suffix}\"(hashed_pk);",
+            escaped = escaped,
+            suffix = consts::V2_PKS_SUFFIX
+        );
+        db.exec_safe(&index_sql)?;
     }
 
-    let tombstone_pks_sql = format!(
-        "CREATE TABLE IF NOT EXISTS \"{escaped}{suffix}\" (
-          hashed_pk BLOB PRIMARY KEY,
-          {pk_cols}
-        ) WITHOUT ROWID, STRICT;",
-        escaped = escaped,
-        suffix = consts::V2_TOMBSTONE_PKS_SUFFIX,
-        pk_cols = tombstone_pk_cols_sql
-    );
-    db.exec_safe(&tombstone_pks_sql)?;
+    // 4. Tombstones
+    if table_info.skip_hash {
+        // skip_hash: single PK column replaces hashed_pk (skip_hash requires single PK).
+        let pk_col = &table_info.pks[0];
+        let pk_type = if pk_col.col_type.to_uppercase().contains("INT") {
+            "INTEGER"
+        } else {
+            "ANY"
+        };
+        db.exec_safe(&format!(
+            "CREATE TABLE IF NOT EXISTS \"{escaped}{suffix}\" (
+              site_id INTEGER NOT NULL,
+              db_version INTEGER NOT NULL,
+              seq INTEGER NOT NULL,
+              \"{pk_name}\" {pk_type} NOT NULL,
+              cl INTEGER NOT NULL CHECK (cl % 2 = 0),
+              ts INTEGER NOT NULL CHECK (ts > 0),
+              PRIMARY KEY (site_id, db_version, seq)
+            ) WITHOUT ROWID, STRICT;",
+            escaped = escaped,
+            suffix = consts::V2_TOMBSTONES_SUFFIX,
+            pk_name = crate::util::escape_ident(&pk_col.name),
+            pk_type = pk_type,
+        ))?;
+
+        db.exec_safe(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS \"idx_{escaped}_v2_tombstones_pk\"
+              ON \"{escaped}{suffix}\"(\"{pk_name}\");",
+            escaped = escaped,
+            suffix = consts::V2_TOMBSTONES_SUFFIX,
+            pk_name = crate::util::escape_ident(&pk_col.name),
+        ))?;
+    } else {
+        db.exec_safe(&format!(
+            "CREATE TABLE IF NOT EXISTS \"{escaped}{suffix}\" (
+              site_id INTEGER NOT NULL,
+              db_version INTEGER NOT NULL,
+              seq INTEGER NOT NULL,
+              hashed_pk BLOB NOT NULL,
+              cl INTEGER NOT NULL CHECK (cl % 2 = 0),
+              ts INTEGER NOT NULL CHECK (ts > 0),
+              PRIMARY KEY (site_id, db_version, seq)
+            ) WITHOUT ROWID, STRICT;",
+            escaped = escaped,
+            suffix = consts::V2_TOMBSTONES_SUFFIX
+        ))?;
+
+        db.exec_safe(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS \"idx_{escaped}_v2_tombstones_hash\"
+              ON \"{escaped}{suffix}\"(hashed_pk);",
+            escaped = escaped,
+            suffix = consts::V2_TOMBSTONES_SUFFIX
+        ))?;
+    }
+
+    // 5. Tombstone PKs (V1 compat) — NOT created for skip_hash tables.
+    // The PK value is stored directly in v2_tombstones, so no hash→PK mapping is needed.
+    if !table_info.skip_hash {
+        let mut tombstone_pk_cols_sql = String::new();
+        for (i, pk) in table_info.pks.iter().enumerate() {
+            if i > 0 { tombstone_pk_cols_sql.push_str(", "); }
+            tombstone_pk_cols_sql.push_str(&format!(
+                "\"{}\" ANY NOT NULL",
+                crate::util::escape_ident(&pk.name)
+            ));
+        }
+
+        let tombstone_pks_sql = format!(
+            "CREATE TABLE IF NOT EXISTS \"{escaped}{suffix}\" (
+              hashed_pk BLOB PRIMARY KEY,
+              {pk_cols}
+            ) WITHOUT ROWID, STRICT;",
+            escaped = escaped,
+            suffix = consts::V2_TOMBSTONE_PKS_SUFFIX,
+            pk_cols = tombstone_pk_cols_sql
+        );
+        db.exec_safe(&tombstone_pks_sql)?;
+    }
 
     // Populate col_map with existing non-PK columns
     populate_col_map(db, table_info)?;
@@ -203,8 +290,9 @@ pub fn compute_pk_signature(table_info: &TableInfo) -> String {
         .collect();
     entries.sort();
     format!(
-        "{}:{}",
-        if table_info.uses_rowid_key { "r" } else { "n" },
+        "{}{}:{}",
+        if table_info.key_is_rowid { "r" } else { "n" },
+        if table_info.skip_hash { "s" } else { "h" },
         entries.join(","),
     )
 }

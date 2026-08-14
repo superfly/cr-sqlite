@@ -4,6 +4,7 @@ pub mod pack_columns;
 pub mod pk_only_tables;
 pub mod pk_update;
 pub mod rowid_check;
+pub mod skip_hash_tests;
 pub mod sync_bit_honored;
 pub mod tableinfo;
 pub mod teardown;

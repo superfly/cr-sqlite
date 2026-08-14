@@ -37,16 +37,33 @@ pub fn create_crr(
     // when upgrading stuff to CRRs
     let mut table_info = pull_table_info(db, table, err)?;
 
-    // Override uses_rowid_key if without_rowid was requested.
+    // Override key_is_rowid if without_rowid was requested.
     // This only matters on first registration — subsequent pull_table_info calls
     // will infer from v2_pks schema.
-    if without_rowid && table_info.uses_rowid_key {
-        table_info.uses_rowid_key = false;
+    if without_rowid && table_info.key_is_rowid {
+        table_info.key_is_rowid = false;
         // Persist the without_rowid preference so migration path can read it
         // when creating v2_tables before v2_pks exists.
         let key = format!("without_rowid_{}\0", table);
         let stmt = db.prepare_v2("INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, 1)\0")?;
         stmt.bind_text(1, &key, sqlite::Destructor::TRANSIENT)?;
+        stmt.step()?;
+    }
+
+    // Persist skip_hash preference so migration path and subsequent pull_table_info
+    // calls can read it when v2_pks doesn't exist yet.
+    // Always persist (0 or 1) so the value is deterministic — auto-qualification
+    // alone isn't persisted, but explicit directives are.
+    let skip_hash_val: i32 = if table_info.skip_hash { 1 } else { 0 };
+    // Only persist if there was an explicit directive (not just auto-qualified).
+    // For auto-qualified tables, the auto rule will re-apply on reload.
+    // For explicitly enabled/disabled tables, we need to persist.
+    let directive = crate::schema_directive::read_skip_hash_directive_opt(db, table).unwrap_or(None);
+    if directive.is_some() {
+        let key = format!("skip_hash_{}\0", table);
+        let stmt = db.prepare_v2("INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, ?)\0")?;
+        stmt.bind_text(1, &key, sqlite::Destructor::TRANSIENT)?;
+        stmt.bind_int(2, skip_hash_val)?;
         stmt.step()?;
     }
 
@@ -67,7 +84,7 @@ pub fn create_crr(
 
     // For rowid tables (not converted to without_rowid), validate rowid range
     // and add enforcement triggers.
-    if table_info.uses_rowid_key {
+    if table_info.key_is_rowid {
         validate_rowid_range(db, table, &table_info.rowid_alias, err)?;
     }
 
@@ -78,8 +95,9 @@ pub fn create_crr(
             table,
             &table_info.pks,
             &table_info.non_pks,
-            table_info.uses_rowid_key,
+            table_info.key_is_rowid,
             &table_info.rowid_alias,
+            table_info.skip_hash,
             no_tx,
         )?;
     } else if metadata_write_version == config::METADATA_VERSION_V2_AND_V1 {
@@ -97,8 +115,9 @@ pub fn create_crr(
             table,
             &table_info.pks,
             &table_info.non_pks,
-            table_info.uses_rowid_key,
+            table_info.key_is_rowid,
             &table_info.rowid_alias,
+            table_info.skip_hash,
             no_tx,
         )?;
     } else {
@@ -120,7 +139,7 @@ pub fn create_crr(
 /// cell_key = (rowid << CRSQL_COL_ID_BITS) | col_id must fit in a signed INT64,
 /// so rowid must be >= 0 and < 2^(63 - CRSQL_COL_ID_BITS).
 /// Runtime enforcement for new writes is done in the after_insert/after_update
-/// trigger handlers in Rust, gated by tbl_info.uses_rowid_key.
+/// trigger handlers in Rust, gated by tbl_info.key_is_rowid.
 fn validate_rowid_range(
     db: *mut sqlite::sqlite3,
     table: &str,
