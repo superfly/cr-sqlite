@@ -758,6 +758,23 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         return null_mut();
     }
 
+    let rc = db
+        .create_function_v2(
+            "crsql_pack_varint_agg",
+            1,
+            sqlite::UTF8 | sqlite::DETERMINISTIC,
+            None,
+            None,
+            Some(pack_columns::crsql_pack_varint_agg_step),
+            Some(pack_columns::crsql_pack_varint_agg_final),
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
     // V2: crsql_incremental_maintenance(chunk_size) -> remaining work units
     let rc = db
         .create_function_v2(

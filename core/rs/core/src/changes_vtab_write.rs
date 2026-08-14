@@ -16,7 +16,7 @@ use crate::compare_values::crsql_compare_sqlite_values;
 use crate::config;
 use crate::db_version::{get_or_set_site_ordinal, insert_db_version};
 use crate::pack_columns::bind_package_to_stmt;
-use crate::pack_columns::{unpack_columns, ColumnValue};
+use crate::pack_columns::{unpack_columns, unpack_varints, ColumnValue};
 use crate::stmt_cache::reset_cached_stmt;
 use crate::tableinfo::{crsql_ensure_table_infos_are_up_to_date, TableInfo, SchemaVersion};
 use crate::util::slab_rowid;
@@ -516,7 +516,7 @@ unsafe fn merge_insert(
     // syncLogVersion controls what we emit, not what we accept. A node with sync-log-version=1
     // can receive V2 wire format changes from a peer with sync-log-version=2.
     // V1 wire always has INTEGER col_vrsn (raw c.col_version).
-    // V2 wire always has BLOB col_vrsn (cast(group_concat(...) as blob)).
+    // V2 wire always has BLOB col_vrsn (crsql_pack_varint_agg — varint count header + payload).
     // So col_vrsn type alone distinguishes the two formats.
     // Tombstone rows (cid='-1' or cid='-2') are never packed regardless of wire format.
     let is_v2_hash_tombstone = insert_col == crate::consts::V2_HASH_TOMBSTONE_CID;
@@ -657,8 +657,8 @@ unsafe fn merge_insert(
         // Packed merge: compute vectors based on wire format
         let (col_names, col_vrsns, seqs, unpacked_vals) = if is_v2_wire_packed {
             let col_names: Vec<&str> = insert_col.split('\0').collect();
-            let col_vrsns: Vec<i64> = insert_col_vrsn_raw.text().split('\0').map(|s| s.parse::<i64>().unwrap_or(0)).collect();
-            let seqs: Vec<i64> = insert_seq_raw.text().split('\0').map(|s| s.parse::<i64>().unwrap_or(0)).collect();
+            let col_vrsns: Vec<i64> = unpack_varints(insert_col_vrsn_raw.blob())?;
+            let seqs: Vec<i64> = unpack_varints(insert_seq_raw.blob())?;
             let unpacked_vals = unpack_columns(insert_val.blob())?;
 
             let n_cols = col_names.len();
