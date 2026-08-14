@@ -1,4 +1,3 @@
-pub mod automigrate;
 pub mod backfill;
 pub mod fract;
 pub mod pack_columns;

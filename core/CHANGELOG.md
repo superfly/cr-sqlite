@@ -1,5 +1,11 @@
 # @vlcn.io/crsqlite
 
+## 0.18.0
+
+### Minor Changes
+
+- Removed `crsql_automigrate` function. Schema management should be handled externally by the application or migration framework. Corrosion handles schema migrations externally and uses `crsql_as_crr()` to register new tables and `crsql_begin_alter()` / `crsql_commit_alter()` to reconcile cr-sqlite metadata tables after schema changes. See the README for details on how Corrosion integrates with cr-sqlite for schema management.
+
 ## 0.16.3
 
 ### Patch Changes

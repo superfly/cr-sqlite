@@ -15,8 +15,6 @@ use sqlite_nostd as sqlite;
  */
 #[no_mangle]
 pub extern "C" fn crsql_integration_check() {
-    println!("Running automigrate");
-    t::automigrate::run_suite().expect("automigrate suite");
     println!("Running backfill");
     t::backfill::run_suite().expect("backfill suite");
     println!("Running fract");
