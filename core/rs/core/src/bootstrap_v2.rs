@@ -1,7 +1,8 @@
 extern crate alloc;
 
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 use sqlite_nostd as sqlite;
 use sqlite_nostd::{Connection, ResultCode};
@@ -155,6 +156,16 @@ pub fn create_v2_tables(
     // Populate col_map with existing non-PK columns
     populate_col_map(db, table_info)?;
 
+    // Store PK column info in crsql_master for alter detection.
+    let pk_key = format!("v2_pks_{}", table_name);
+    let pk_value = compute_pk_signature(table_info);
+    let stmt = db.prepare_v2(
+        "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, ?)",
+    )?;
+    stmt.bind_text(1, &pk_key, sqlite::Destructor::TRANSIENT)?;
+    stmt.bind_text(2, &pk_value, sqlite::Destructor::TRANSIENT)?;
+    stmt.step()?;
+
     Ok(ResultCode::OK)
 }
 
@@ -179,6 +190,23 @@ fn populate_col_map(
     }
 
     Ok(ResultCode::OK)
+}
+
+/// Compute a canonical PK signature for alter detection.
+/// Format: "r:col1:type,col2:type" (rowid-key) or "n:col1:type,col2:type" (non-rowid),
+/// with PK columns sorted by name so order doesn't matter.
+pub fn compute_pk_signature(table_info: &TableInfo) -> String {
+    let mut entries: Vec<String> = table_info
+        .pks
+        .iter()
+        .map(|p| format!("{}:{}", p.name, p.col_type))
+        .collect();
+    entries.sort();
+    format!(
+        "{}:{}",
+        if table_info.uses_rowid_key { "r" } else { "n" },
+        entries.join(","),
+    )
 }
 
 /// Drop all V2 metadata tables for a given table.
@@ -212,7 +240,15 @@ pub fn drop_v2_tables(
         "DROP TABLE IF EXISTS \"{escaped}{suffix}\"",
         escaped = escaped,
         suffix = consts::V2_TOMBSTONE_PKS_SUFFIX
-    ))
+    ))?;
+
+    // Clean up PK info from crsql_master
+    let pk_key = format!("v2_pks_{}", table);
+    let stmt = db.prepare_v2("DELETE FROM crsql_master WHERE key = ?")?;
+    stmt.bind_text(1, &pk_key, sqlite::Destructor::TRANSIENT)?;
+    stmt.step()?;
+
+    Ok(ResultCode::OK)
 }
 
 /// Check if V2 tables exist for a given table.
