@@ -128,7 +128,6 @@ Starting in 0.18.0, **`crsql_set_ts()` must be called in the same transaction** 
 
 - **`crsql_as_crr()`** — creating a new CRR
 - **`crsql_begin_alter()` / `crsql_commit_alter()`** — altering CRR schema
-- **`crsql_automigrate()`** — automated schema migrations
 - **`crsql_incremental_maintenance()`** — V1→V2 migration batches
 - **`INSERT`/`UPDATE`/`DELETE` on CRR tables** — local writes (via triggers)
 - **`INSERT INTO crsql_changes`** — applying remote changes (merges)
@@ -302,7 +301,7 @@ SELECT crsql_commit_alter('table_name');
 - **Change application**: Remote changesets are inserted into `crsql_changes` in bulk (via `unnest` for batch inserts). Corrosion uses `crsql_rows_impacted()` to verify that merges actually affected rows.
 - **Timestamps**: Corrosion uses a Hybrid Logical Clock (HLC) and calls `crsql_set_ts()` before each transaction to stamp changes with an NTP64 timestamp. This enables the reaper to garbage-collect tombstones based on age.
 - **Per-site version tracking**: Corrosion uses the `crsql_db_versions` table to track the latest `db_version` received from each peer. When processing incomplete or buffered changes, it calls `crsql_set_db_version(site_id, version)` to advance the tracked version even when no changes won the merge.
-- **Schema management**: Corrosion uses `crsql_as_crr()` to register tables and `crsql_begin_alter()` / `crsql_commit_alter()` for schema migrations. When migrating from older cr-sqlite versions that lacked the `(site_id, db_version)` index on clock tables, it creates `corro_{table}__crsql_clock_site_id_dbv` indexes.
+- **Schema management**: Corrosion handles schema migrations externally and uses `crsql_as_crr()` to register new tables and `crsql_begin_alter()` / `crsql_commit_alter()` to reconcile cr-sqlite metadata after schema changes. The `crsql_automigrate()` function has been removed in 0.18.0 — schema management should be handled by the application or migration framework. When migrating from older cr-sqlite versions that lacked the `(site_id, db_version)` index on clock tables, it creates `corro_{table}__crsql_clock_site_id_dbv` indexes.
 - **Buffered changes & gap tracking**: Corrosion handles two kinds of gaps. Missing **db_versions** from a peer are tracked in `__corro_bookkeeping_gaps`. Partial transactions (a db_version split across multiple messages with missing **seqs**) are buffered in `__corro_buffered_changes` (same schema as `crsql_changes`), with received seq ranges tracked in `__corro_seq_bookkeeping`. Once all seqs for a db_version are received, the changes are applied to `crsql_changes` in bulk.
 - **Reaper**: A background reaper process uses the `ts` column to find tombstones (delete sentinel rows where `col_name = -1 AND col_version % 2 = 0 AND ts < cutoff`) and cleans them up along with orphaned entries in `__crsql_clock` and `__crsql_pks`.
 - **Config**: Corrosion enables `crsql_config_set('merge-equal-values', 1)` to optimize merges where values are equal.
