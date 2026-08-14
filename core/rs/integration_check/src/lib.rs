@@ -39,6 +39,8 @@ pub extern "C" fn crsql_integration_check() {
     t::v2_compat_tests::run_suite().expect("v2 compat tests suite");
     println!("Running rowid_check");
     t::rowid_check::run_suite().expect("rowid check suite");
+    println!("Running skip_hash_tests");
+    t::skip_hash_tests::run_suite().expect("skip_hash tests suite");
 }
 
 pub fn opendb() -> Result<CRConnection, ResultCode> {

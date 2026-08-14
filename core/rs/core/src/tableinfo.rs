@@ -47,24 +47,38 @@ pub struct TableInfo {
     pub non_pks: Vec<ColumnInfo>,
     pub schema_version: SchemaVersion,
     /// True when the main table is a rowid table with accessible rowid.
-    /// V2 uses __crsql_key = main_table.rowid and fetches PK values from
-    /// the main table via SELECT pk_cols WHERE rowid = ?.
-    /// See design doc §3 "__crsql_key Assignment (Rowid Reuse)".
+    /// True when __crsql_key in v2_pks is the SQLite rowid of the base table.
+    /// This means v2_pks uses the compact schema (__crsql_key, [pk_cols], hashed_pk, cl)
+    /// where __crsql_key = rowid, and PK values are fetched from the base table via
+    /// SELECT pk_cols WHERE rowid = ?.
     ///
-    /// IMPORTANT: This flag is about using the implicit SQLite rowid as
-    /// __crsql_key in v2_pks (3-column schema). It is NOT the same as
-    /// "INTEGER PRIMARY KEY" — that is a separate SQLite concept. Currently
-    /// this is only enabled for single INTEGER PRIMARY KEY tables where the
-    /// PK column IS the rowid alias, but the concept is independent and may
-    /// be extended to other rowid tables in the future. When this is true,
-    /// the rowid must be looked up from the base table via rowid_alias —
-    /// do NOT assume unpacked_pks[0] is the rowid.
-    pub uses_rowid_key: bool,
+    /// When false (WITHOUT ROWID tables), __crsql_key is an auto-incremented integer
+    /// and PK columns are stored directly in v2_pks.
+    ///
+    /// Relationship with has_integer_pk:
+    ///   key_is_rowid = true  → __crsql_key = rowid
+    ///   has_integer_pk = true → PK value = rowid
+    ///   Both true            → __crsql_key = PK value (can use PK directly, no JOIN)
+    ///   key_is_rowid only    → need JOIN to map PK → rowid → __crsql_key
+    pub key_is_rowid: bool,
+    /// True when the table has an INTEGER PRIMARY KEY column.
+    /// In SQLite, `INTEGER PRIMARY KEY` is a rowid alias — the PK value IS the rowid.
+    /// When combined with key_is_rowid, this means __crsql_key = PK value, so
+    /// unpacked_pks[0] can be used directly as __crsql_key without any JOIN.
+    /// See key_is_rowid doc for the full relationship matrix.
+    pub has_integer_pk: bool,
     /// The column name to use as the rowid alias for JOINs/ad-hoc queries.
     /// For INTEGER PRIMARY KEY tables: the PK column name (e.g. "id").
     /// For plain rowid tables: "rowid" (or first unshadowed built-in alias).
-    /// Only valid when uses_rowid_key is true.
+    /// Only valid when key_is_rowid is true.
     pub rowid_alias: String,
+    /// True when hashing is skipped for this table's PK.
+    /// Tombstones store the PK value directly (no hashed_pk BLOB column).
+    /// v2_tombstone_pks table is not created. Lookups use the PK value
+    /// directly instead of a hash. Independent of key_is_rowid.
+    /// Auto-qualified for single integer-affinity PKs; can be manually enabled
+    /// for other single-column PKs via schema directive or as_crr option.
+    pub skip_hash: bool,
 
     // Lookaside --
     // insert returning?
@@ -1107,9 +1121,10 @@ pub fn pull_table_info(
     };
 
     let rowid_accessible = integer_pk.is_some() || !all_aliases_shadowed;
+    let has_integer_pk = integer_pk.is_some();
 
     // Verify rowid is actually accessible (table is not WITHOUT ROWID)
-    let mut uses_rowid_key = if integer_pk.is_some() {
+    let mut key_is_rowid = if integer_pk.is_some() {
         // INTEGER PRIMARY KEY: the PK column IS the rowid alias.
         // Verify it's accessible (table is not WITHOUT ROWID).
         db.prepare_v2(&format!(
@@ -1126,10 +1141,83 @@ pub fn pull_table_info(
     // Detect V2 metadata tables
     let has_v2 = crate::bootstrap_v2::has_v2_tables(db, table).unwrap_or(false);
 
-    // If v2_pks table exists, infer uses_rowid_key from its schema.
-    // Rowid-key v2_pks has 3 columns: __crsql_key, hashed_pk, cl.
-    // Non-rowid v2_pks has 3 + N PK columns.
-    // This is the persisted source of truth for the without_rowid decision.
+    // Detect skip_hash: auto-qualified for single integer-affinity PK,
+    // or manually enabled via schema directive / crsql_master flag.
+    // skip_hash requires a single-column PK — composite PKs are not supported.
+    // Auto-qualification: pks.len() == 1 AND PK type contains "INT".
+    let auto_skip_hash = pks.len() == 1 && {
+        let pk_type = &pks[0].col_type;
+        pk_type.to_uppercase().contains("INT")
+    };
+
+    // Check for schema directive or persisted flag
+    // Returns Some(true) = explicitly enabled, Some(false) = explicitly disabled, None = not set
+    let manual_skip_hash: Option<bool> = if has_v2 {
+        // v2_pks exists — infer from its schema (presence/absence of hashed_pk column)
+        let v2_pks_name = format!("{}{}", crate::util::escape_ident_as_value(table), consts::V2_PKS_SUFFIX);
+        let has_hashed_pk_stmt = db.prepare_v2(&format!(
+            "SELECT count(*) FROM pragma_table_info('{name}') WHERE name = 'hashed_pk'",
+            name = v2_pks_name,
+        ));
+        if let Ok(stmt) = has_hashed_pk_stmt {
+            if stmt.step().unwrap_or(ResultCode::DONE) == ResultCode::ROW {
+                Some(stmt.column_int(0) == 0) // no hashed_pk column → skip_hash mode
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        // v2_pks doesn't exist yet — check crsql_master for skip_hash flag
+        // persisted by create_crr, or check schema directive in sqlite_master
+        let skip_hash_key = format!("skip_hash_{}\0", table);
+        let stmt = db.prepare_v2("SELECT value FROM crsql_master WHERE key = ?\0");
+        let mut persisted: Option<bool> = None;
+        if let Ok(stmt) = stmt {
+            if stmt.bind_text(1, &skip_hash_key, sqlite::Destructor::TRANSIENT).is_ok() {
+                if stmt.step().unwrap_or(ResultCode::DONE) == ResultCode::ROW {
+                    persisted = Some(stmt.column_int(0) == 1);
+                }
+            }
+        }
+        if let Some(p) = persisted {
+            Some(p)
+        } else {
+            // Check schema directive in sqlite_master (tri-state)
+            crate::schema_directive::read_skip_hash_directive_opt(db, table).unwrap_or(None)
+        }
+    };
+
+    // skip_hash resolution:
+    // - If v2_pks exists: manual_skip_hash is the source of truth (persisted schema).
+    // - If v2_pks doesn't exist yet:
+    //   - Explicit directive (Some) overrides auto-qualification.
+    //   - No directive (None): auto-qualification applies.
+    // Enforcement: skip_hash requires a single-column PK. If a composite PK table
+    // has skip_hash explicitly enabled via directive, ignore it (fall back to hash mode).
+    let skip_hash = if has_v2 {
+        manual_skip_hash.unwrap_or(false)
+    } else {
+        match manual_skip_hash {
+            Some(explicit) => {
+                if explicit && pks.len() != 1 {
+                    // Reject skip_hash=1 on composite PK tables — not supported.
+                    false
+                } else {
+                    explicit
+                }
+            }
+            None => auto_skip_hash,
+        }
+    };
+
+    // If v2_pks table exists, infer key_is_rowid from its schema.
+    // The inference must account for skip_hash mode:
+    // - Hash mode, rowid-key: 3 cols (__crsql_key, hashed_pk, cl)
+    // - Hash mode, non-rowid: 3+N cols (__crsql_key, [pk_cols...], hashed_pk, cl)
+    // - Skip-hash, rowid-key: 2 cols (__crsql_key, cl)
+    // - Skip-hash, non-rowid: 2+N cols (__crsql_key, [pk_col], cl)
     if has_v2 {
         let v2_pks_name = format!("{}{}", crate::util::escape_ident_as_value(table), consts::V2_PKS_SUFFIX);
         let pks_count_stmt = db.prepare_v2(&format!(
@@ -1139,9 +1227,13 @@ pub fn pull_table_info(
         if let Ok(stmt) = pks_count_stmt {
             if stmt.step().unwrap_or(ResultCode::DONE) == ResultCode::ROW {
                 let col_count = stmt.column_int(0);
-                // 3 columns = __crsql_key + hashed_pk + cl = rowid-key
-                // >3 columns = has PK columns = non-rowid
-                uses_rowid_key = col_count == 3;
+                if skip_hash {
+                    // Skip-hash: 2 cols = rowid-key, >2 = non-rowid
+                    key_is_rowid = col_count == 2;
+                } else {
+                    // Hash mode: 3 cols = rowid-key, >3 = non-rowid
+                    key_is_rowid = col_count == 3;
+                }
             }
         }
     } else {
@@ -1152,7 +1244,7 @@ pub fn pull_table_info(
         if let Ok(stmt) = stmt {
             if stmt.bind_text(1, &without_rowid_key, sqlite::Destructor::TRANSIENT).is_ok() {
                 if stmt.step().unwrap_or(ResultCode::DONE) == ResultCode::ROW {
-                    uses_rowid_key = false;
+                    key_is_rowid = false;
                 }
             }
         }
@@ -1178,8 +1270,10 @@ pub fn pull_table_info(
         pks,
         non_pks,
         schema_version,
-        uses_rowid_key,
+        key_is_rowid,
+        has_integer_pk,
         rowid_alias,
+        skip_hash,
         set_winner_clock_stmt: RefCell::new(None),
         local_cl_stmt: RefCell::new(None),
         col_version_stmt: RefCell::new(None),

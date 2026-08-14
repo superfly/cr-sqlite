@@ -65,7 +65,7 @@ unsafe fn compact_post_alter_v2(
         // PK change: drop and recreate all V2 metadata tables, then backfill
         crate::bootstrap_v2::drop_v2_tables(db, tbl_name_str)?;
         crate::bootstrap_v2::create_v2_tables(db, tbl_info)?;
-        crate::backfill_v2::backfill_table_v2(db, tbl_name_str, &tbl_info.pks, &tbl_info.non_pks, tbl_info.uses_rowid_key, &tbl_info.rowid_alias, false)?;
+        crate::backfill_v2::backfill_table_v2(db, tbl_name_str, &tbl_info.pks, &tbl_info.non_pks, tbl_info.key_is_rowid, &tbl_info.rowid_alias, tbl_info.skip_hash, false)?;
     } else {
         // Sync col_map with current schema
         sync_col_map_v2(db, &escaped, tbl_info)?

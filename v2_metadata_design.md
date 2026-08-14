@@ -153,15 +153,26 @@ Examples:
 
 **Detection logic at `as_crr` time**: query `pragma_table_info('<table>')` to determine the mode:
 
-1. Check if any column has `pk > 0` AND `type = 'INTEGER'` → `INTEGER PRIMARY KEY` exists → use it as `__crsql_key` (it *is* the rowid alias).
-2. Otherwise, check if none of `rowid`, `oid`, `_rowid_` appear as column names in `pragma_table_info` → at least one alias is unshadowed → use `rowid` as `__crsql_key`.
+1. Check if any column has `pk > 0` AND `type = 'INTEGER'` → `INTEGER PRIMARY KEY` exists. This is the rowid alias, but **rowid reuse is opt-in for `INTEGER PRIMARY KEY`** (see "Rowid Reuse: Opt-in vs Opt-out" below). Default: `key_is_rowid = false` (auto-increment fallback with stored PK column). Enable via `as_crr` option when the application knows its PK values are small (e.g., sequential, not random 64-bit, or random but within the safe range).
+2. Otherwise (no `INTEGER PRIMARY KEY`), check if none of `rowid`, `oid`, `_rowid_` appear as column names in `pragma_table_info` → at least one alias is unshadowed → use `rowid` as `__crsql_key`. **Rowid reuse is opt-out for plain rowid tables** (SQLite assigns small sequential rowids). Default: `key_is_rowid = true`. Disable via `as_crr` option to force auto-increment fallback.
 3. If all three aliases are shadowed AND no `INTEGER PRIMARY KEY` → fall back to auto-increment with stored PK columns.
 
-**Tests required**: write tests covering all three cases — (a) plain rowid table, (b) `INTEGER PRIMARY KEY` table, (c) all-three-aliases-shadowed table, (d) `INTEGER PRIMARY KEY` + shadowed aliases (case b wins). Verify that `__crsql_key` is correctly assigned and that feed/merge queries work in each case.
+**Tests required**: write tests covering all cases — (a) plain rowid table (rowid reuse on by default), (b) `INTEGER PRIMARY KEY` table (rowid reuse off by default, on when opted in), (c) all-three-aliases-shadowed table, (d) `INTEGER PRIMARY KEY` + shadowed aliases, (e) plain rowid table with rowid reuse opted out. Verify that `__crsql_key` is correctly assigned and that feed/merge queries work in each case.
 
 This eliminates the `INSERT OR IGNORE` + auto-increment round-trip on local writes:
 - Local insert: `NEW.rowid` is available directly in the trigger.
 - Local update: `NEW.rowid` is available directly in the trigger.
+
+### Rowid Reuse: Opt-in vs Opt-out
+
+The rowid reuse optimization (`key_is_rowid = true`) has different default policies depending on the table type, due to the `cell_key` packing constraint (see "Large Rowid Handling" below):
+
+| Table type | Default | `as_crr` option | Rationale |
+|---|---|---|---|
+| **Plain rowid table** (no `INTEGER PRIMARY KEY`, accessible rowid) | **Opt-out** (`key_is_rowid = true`) | `use_rowid_key = 0` to disable | SQLite assigns small sequential rowids (1, 2, 3, ...) that stay well within the `2^51` cell_key limit. Safe by default. |
+| **`INTEGER PRIMARY KEY` table** | **Opt-in** (`key_is_rowid = false`) | `use_rowid_key = 1` to enable | The PK value IS the rowid. In distributed systems, `INTEGER PRIMARY KEY` is commonly used with large random 64-bit values (snowflake IDs, random IDs, timestamp-based IDs) that will exceed the `2^51` cell_key limit and overflow into the sign bit. Disabling by default prevents silent corruption. The application must explicitly opt in when it knows its PK values are small (e.g., sequential auto-increment starting from 1). |
+
+When `key_is_rowid = false` for an `INTEGER PRIMARY KEY` table, the table falls back to auto-increment with stored PK columns (same as WITHOUT ROWID or shadowed-alias tables). The PK column is stored in `v2_pks` and lookups go through it. The `skip_hash` optimization still applies — the PK value is used directly instead of a hash, just stored as a column rather than as `__crsql_key`.
 
 > **Note:** In trigger context, `NEW.rowid` / `OLD.rowid` are always accessible for rowid tables regardless of column shadowing. The shadowing edge case only affects ad-hoc SQL queries outside triggers (e.g., merge path doing `SELECT rowid FROM main_table WHERE pk = ?`). When rowid is inaccessible for ad-hoc queries, or the table is WITHOUT ROWID, or was explicitly configured to use the WITHOUT ROWID layout at `as_crr` time, fall back to auto-increment with stored PK columns (current V1 scheme). The clock table doesn't care — `__crsql_key` is just an `INT64` join key.
 
@@ -178,7 +189,7 @@ For WITHOUT ROWID tables, use auto-increment fallback in both cases.
 
 `cell_key = (__crsql_key << CRSQL_COL_ID_BITS) | col_id` must fit in a **signed** `INT64` (SQLite's `INTEGER` type is 64-bit signed), so `cell_key` must stay positive. This means `__crsql_key` is limited to `2^(63 - CRSQL_COL_ID_BITS)`. With the default `CRSQL_COL_ID_BITS = 12`, the limit is `2^51 = 2,251,799,813,685,248`.
 
-If a rowid table may have rowids `>= 2^(63 - CRSQL_COL_ID_BITS)`, it should be converted to WITHOUT ROWID at CRR registration time (per-table decision). The `as_crr` call accepts an option to convert a rowid table to WITHOUT ROWID (storing the full PK as the primary key). This is a one-time schema decision made when the table is registered as a CRR. The `as_crr` call also accepts an opt-out parameter to skip the `CHECK` constraint below (for applications that know their rowids are safe and want to avoid the per-write overhead).
+If a rowid table may have rowids `>= 2^(63 - CRSQL_COL_ID_BITS)`, it should be converted to WITHOUT ROWID at CRR registration time (per-table decision). The `as_crr` call accepts an option to convert a rowid table to WITHOUT ROWID (storing the full PK as the primary key). This is a one-time schema decision made when the table is registered as a CRR. For `INTEGER PRIMARY KEY` tables, rowid reuse is disabled by default (see "Rowid Reuse: Opt-in vs Opt-out" above) precisely because of this risk — the application must opt in and accept the `CHECK` constraint when it knows its PK values are safe. The `as_crr` call also accepts an opt-out parameter to skip the `CHECK` constraint below (for applications that know their rowids are safe and want to avoid the per-write overhead).
 
 `CHECK` constraint on main table (rowid tables only):
 
@@ -191,6 +202,8 @@ Ensures `cell_key = (rowid << CRSQL_COL_ID_BITS) | col_id` fits in a positive si
 ### Schema
 
 Schema is dynamic — PK columns only present for WITHOUT ROWID tables.
+
+> **See §"Skip Hash Optimization"** below for a variant where `hashed_pk` is dropped entirely (single PK tables where the PK value is used directly). In that mode, `v2_pks` has no `hashed_pk` column and lookups use the PK value directly.
 
 **Example (WITHOUT ROWID, PK columns (id1, id2, ...)):**
 
@@ -230,7 +243,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS "idx_<table>_v2_pks_hash"
 
 ## 4. Tombstones: Hash Only (No Original PK Columns) + Delete Metadata
 
-WITHOUT ROWID — composite PK `(site_id, db_version, seq)` for feed ordering. This PK is deliberately chosen to make feed queries as efficient as possible — the feed scans by `(site_id, db_version)` and orders by `seq`, which is exactly the PK order. `hashed_pk` replaces original PK columns to save space. Unique index on `hashed_pk` for upsert-based conflict resolution (one tombstone per PK at any time). `cl` stored for feed output. `ts` stored for `dead_recent` selection. This table IS the delete log — no separate delete_log table needed.
+WITHOUT ROWID — composite PK `(site_id, db_version, seq)` for feed ordering.
+
+> **See §"Skip Hash Optimization"** below for a variant where `hashed_pk BLOB` is replaced with the PK column directly (single PK tables where hashing is skipped). In that mode, `v2_tombstone_pks` (§5) is not created. This PK is deliberately chosen to make feed queries as efficient as possible — the feed scans by `(site_id, db_version)` and orders by `seq`, which is exactly the PK order. `hashed_pk` replaces original PK columns to save space. Unique index on `hashed_pk` for upsert-based conflict resolution (one tombstone per PK at any time). `cl` stored for feed output. `ts` stored for `dead_recent` selection. This table IS the delete log — no separate delete_log table needed.
 
 ```sql
 CREATE TABLE IF NOT EXISTS "<table>__crsql_v2_tombstones" (
@@ -287,7 +302,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS "idx_<table>_v2_tombstones_hash"
 
 ## 5. Tombstone PK Mapping (V1 Compatibility)
 
-Maps `hashed_pk` back to original PK column values for tombstones. Needed while V1 wire format is still emitted: V1 sends `crsql_pack_columns(pk_cols)` for delete events, which requires the real PK values, not just the hash. V2 wire format sends `hashed_pk` directly, so this table is not needed for V2.
+Maps `hashed_pk` back to original PK column values for tombstones.
+
+> **Not created for skip-hash tables** — see §"Skip Hash Optimization" below. When hashing is skipped, the PK value is stored directly in `v2_tombstones`, so no hash→PK mapping is needed. Needed while V1 wire format is still emitted: V1 sends `crsql_pack_columns(pk_cols)` for delete events, which requires the real PK values, not just the hash. V2 wire format sends `hashed_pk` directly, so this table is not needed for V2.
 
 **Pruning**: entries are deleted only after ALL nodes in the cluster emit V2 format. Until then, every new tombstone gets an entry here.
 
@@ -300,6 +317,330 @@ CREATE TABLE IF NOT EXISTS "<table>__crsql_v2_tombstone_pks" (
   -- End dynamic columns
   -- Example: id INTEGER NOT NULL, name TEXT NOT NULL, etc.
 ) WITHOUT ROWID, STRICT; -- STRICT always; PK columns use ANY type
+```
+
+---
+
+## Skip Hash Optimization
+
+### Motivation
+
+The XXH128 hash exists to give rows a stable, compact, cross-node identity for tombstone storage and merge lookups. But for many PK types, the PK value itself already serves this purpose — the hash is pure overhead:
+
+- The PK value may be smaller than the default `PK_HASH_SIZE` (10 bytes) — e.g., an 8-byte integer or a fixed-size 8-byte blob.
+- The PK value is already a stable cross-node identity (same logical row → same value on every node).
+- The hash requires XXH128 computation, a `hashed_pk BLOB` column, a unique index on it, and the `v2_tombstone_pks` mapping table (for V1 compat). All of this can be eliminated.
+
+### Eligibility
+
+A table qualifies for **skip-hash mode** when:
+1. **Single PK column** (`pks.len() == 1`), AND
+2. The PK type is one where the raw value is safe to use as a cross-node identity:
+   - **Auto-qualified**: integer affinity (declared type contains `"INT"` — covers `INTEGER`, `INT`, `BIGINT`, `TINYINT`, `SMALLINT`, `MEDIUMINT`, `INT2`, `INT8`, etc.). Integer PKs are ≤ 8 bytes, have exact comparison, and are the most common case.
+   - **Manually enabled** via schema directive (`/* crsql: skip_hash=1 */`) or `as_crr` option: any single-column PK where the application guarantees the values are bounded and comparison is unambiguous (e.g., fixed-size blob PKs like 8-byte or 16-byte UUIDs, short text PKs with `BINARY` collation). The application takes responsibility for the size/comparison guarantees — cr-sqlite does not verify them at runtime (beyond the optional `CHECK` constraint for integer types).
+
+This is detected at `as_crr` time via `pragma_table_info` and is a **per-table, immutable** decision. It is independent of the rowid optimization (`key_is_rowid`) — a WITHOUT ROWID table with a single integer PK also qualifies.
+
+> **Composite PKs are not supported.** If a `skip_hash=1` directive is present on a table with multiple PK columns, it is silently ignored and the table falls back to hash mode. The complexity of multi-column lookups, indexes, and tombstone schemas across all code paths (bootstrap, local writes, feed, merge, migration, backfill, V2→V1 mirror) outweighs the marginal benefit of skipping the hash for composite PKs. The primary use case for skip_hash is single `INTEGER PRIMARY KEY` where `PK = rowid = __crsql_key` — no hash, no extra column, direct lookup.
+
+### Orthogonality with `key_is_rowid`
+
+The two flags are orthogonal:
+
+| | `key_is_rowid = true` | `key_is_rowid = false` |
+|---|---|---|
+| `skip_hash = true` | Plain rowid table + single int PK (default on), or `INTEGER PRIMARY KEY` with rowid reuse opted in | `INTEGER PRIMARY KEY` (default — rowid reuse off due to large PK risk), WITHOUT ROWID + single int PK, or rowid table with all aliases shadowed + single int PK |
+| `skip_hash = false` | Plain rowid table with accessible rowid + text/composite/blob PK | WITHOUT ROWID + text/composite/blob PK, or rowid table with all aliases shadowed |
+
+When both flags are true, there are two sub-cases:
+- **`INTEGER PRIMARY KEY` (opted in)**: `__crsql_key = rowid = PK value` — the PK value is the stable cross-node identity directly, with zero indirection. No PK column stored in `v2_pks`, no hash, no extra lookup. Requires the application to opt in via `as_crr` and accept the rowid bounds `CHECK` constraint.
+- **Plain rowid table with `INT PRIMARY KEY`** (or any single int-affinity PK on a rowid table with accessible rowid): `__crsql_key = rowid` (≠ PK value — the int PK is a regular column, not the rowid alias). PK values are fetched from the main table via `SELECT pk_col WHERE rowid = ?`. Lookups by PK value go through the main table first (`SELECT rowid FROM main_table WHERE pk_col = ?`), then `v2_pks WHERE __crsql_key = ?`. No hash, but one extra hop vs `INTEGER PRIMARY KEY`.
+
+### Runtime Guard
+
+For **auto-qualified** integer PKs: integer affinity does not *force* integer storage — SQLite's affinity conversion is best-effort (text that doesn't look like an integer stays as text). To guarantee the PK is always an integer, a `CHECK` constraint is added to the main table:
+
+```sql
+CHECK (typeof("pk_col") = 'integer')
+```
+
+This is the same category of guard as the existing rowid bounds `CHECK` (§3, "Large Rowid Handling") — declarative, enforced by SQLite at insert/update time, never reaches cr-sqlite's trigger code.
+
+**Exception**: when the PK is exactly `INTEGER PRIMARY KEY` and rowid reuse is opted in (`key_is_rowid = true`), no `typeof` `CHECK` is needed — the rowid alias is always an integer by SQLite's own rules. The rowid bounds `CHECK` (§3, "Large Rowid Handling") still applies. Other rowid tables with a single int PK (e.g., `INT PRIMARY KEY`) still need the `typeof` `CHECK` because the PK column is a regular column, not the rowid alias.
+
+For **manually-enabled** non-integer PKs (blob, text): no `typeof` `CHECK` is added — the application is responsible for ensuring the PK values are bounded and comparison is unambiguous. The tombstone table stores the PK value in its native type (BLOB, TEXT, etc.). If the application's guarantee is violated (e.g., variable-length blobs larger than expected), the only consequence is larger tombstone storage — no correctness issue, since the PK value is still a valid cross-node identity.
+
+### Schema Changes
+
+#### `v2_pks` (alive PKs)
+
+The `hashed_pk BLOB NOT NULL` column and its unique index are dropped. The PK value is used directly for lookups.
+
+**`key_is_rowid = true` (Tier A — rowid table with accessible rowid):**
+
+`__crsql_key = main_table.rowid`. No PK column stored in `v2_pks` — PK values are fetched from the main table via `SELECT pk_col WHERE rowid = ?` (same as hash mode for rowid tables). No hash, no extra column.
+
+For `INTEGER PRIMARY KEY` (opted in to rowid reuse), `__crsql_key = rowid = PK value`, so lookups by PK value go directly to `__crsql_key`. For other rowid tables with a single int PK (e.g., `INT PRIMARY KEY`, default-on), `__crsql_key = rowid ≠ PK value` — lookups by PK value require a main table hop (`SELECT rowid FROM main_table WHERE pk_col = ?`) first.
+
+```sql
+CREATE TABLE IF NOT EXISTS "<table>__crsql_v2_pks" (
+  __crsql_key INTEGER PRIMARY KEY,       -- = main_table.rowid = PK value
+  cl INTEGER NOT NULL DEFAULT 1 CHECK (cl % 2 = 1)
+) STRICT;
+-- No unique index needed — __crsql_key is the PK value, lookups by PK go directly to __crsql_key.
+```
+
+**`key_is_rowid = false` (WITHOUT ROWID or non-rowid-alias int PK):**
+
+`__crsql_key` is auto-increment (not the PK value), so the PK column must be stored. A unique index on the PK column replaces the hash index.
+
+```sql
+CREATE TABLE IF NOT EXISTS "<table>__crsql_v2_pks" (
+  __crsql_key INTEGER PRIMARY KEY,       -- auto-increment
+  "pk_col" <pk_type> NOT NULL,           -- the actual PK value (INTEGER for auto-qualified, ANY for manually-enabled)
+  cl INTEGER NOT NULL DEFAULT 1 CHECK (cl % 2 = 1)
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS "idx_<table>_v2_pks_pk"
+  ON "<table>__crsql_v2_pks"("pk_col");
+```
+
+#### `v2_tombstones` (dead PKs)
+
+The `hashed_pk BLOB NOT NULL` column is replaced with the PK column directly (in its native type). The unique index for upsert-based conflict resolution is on the PK column instead of the hash.
+
+```sql
+CREATE TABLE IF NOT EXISTS "<table>__crsql_v2_tombstones" (
+  site_id INTEGER NOT NULL,
+  db_version INTEGER NOT NULL,
+  seq INTEGER NOT NULL,
+  "pk_col" <pk_type> NOT NULL,           -- the actual PK value (INTEGER for auto-qualified, ANY for manually-enabled)
+  cl INTEGER NOT NULL CHECK (cl % 2 = 0),
+  ts INTEGER NOT NULL CHECK (ts > 0),
+  PRIMARY KEY (site_id, db_version, seq)
+) WITHOUT ROWID, STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS "idx_<table>_v2_tombstones_pk"
+  ON "<table>__crsql_v2_tombstones"("pk_col");
+```
+
+The upsert conflict resolution `ON CONFLICT("pk_col")` works identically to the hash-based version — just comparing integers instead of blobs.
+
+#### `v2_tombstone_pks` — Not Created
+
+The `v2_tombstone_pks` table (§5) is **not created** for skip-hash tables. The PK value is self-describing — no hash→PK resolution is needed. This applies to both V2 wire and V1 compat emission: for V1 compat, the PK value is read directly from `v2_tombstones.pk_col` and packed via `crsql_pack_columns`.
+
+### Feed Query Adjustments
+
+**Alive rows**: unchanged — the feed already fetches PK columns from `v2_pks` (WITHOUT ROWID) or the main table (rowid). The only difference is `v2_pks` no longer has `hashed_pk`, but the feed query doesn't reference `hashed_pk` for alive rows.
+
+**Dead rows, V2 wire format**: `d.hashed_pk as pks` becomes `crsql_pack_columns(d."pk_col") as pks`. The `cid = '-2'` sentinel is no longer needed for skip-hash tables — the PK is a real value, not a hash. Use `cid = '-1'` (same as V1 delete sentinel) since the receiver can look up the PK directly:
+
+```sql
+SELECT
+  '{table}' as tbl,
+  crsql_pack_columns(d."pk_col") as pks,   -- real PK value, not hash
+  '-1' as cid,                              -- standard delete sentinel (receiver has the real PK)
+  NULL as col_vrsn,
+  d.db_version as db_vrsn,
+  site_tbl.site_id as site_id,
+  d."pk_col" as key,                        -- PK value as key
+  d.seq as seq,
+  d.cl as cl,
+  d.ts as ts
+FROM "<table>__crsql_v2_tombstones" AS d
+LEFT JOIN crsql_site_id AS site_tbl ON d.site_id = site_tbl.ordinal
+WHERE d.site_id = ? AND d.db_version > ?
+```
+
+> **Note on `cid` sentinel**: In hash mode, `cid = '-2'` signals "the `pk` field is a hash, not a real PK — look up by hash." In skip-hash mode, the `pk` field is always a real packed PK value, so the standard `cid = '-1'` delete sentinel is used. The receiver's merge path detects skip-hash tables via `TableInfo` and looks up by integer PK directly (no hash computation, no `v2_tombstone_pks` join).
+
+**Dead rows, V1 compat wire format**: `crsql_pack_columns(tp.<pk_cols>, ...)` simplifies to `crsql_pack_columns(d."pk_col")` — the PK is read directly from `v2_tombstones`, no `v2_tombstone_pks` JOIN needed.
+
+### Merge Path Adjustments
+
+**Incoming change for a skip-hash table**: the receiver unpacks the PK value from the wire `pk` blob (via `unpack_columns`), extracts the single PK value, and uses it directly for lookups:
+
+- **Alive check**: `SELECT cl FROM v2_pks WHERE "pk_col" = ?` (non-rowid, including `INTEGER PRIMARY KEY` with rowid reuse off — the default), or `SELECT cl FROM v2_pks WHERE __crsql_key = ?` (`INTEGER PRIMARY KEY` with rowid reuse opted in, where `__crsql_key = PK value`), or `SELECT cl FROM v2_pks WHERE __crsql_key = (SELECT rowid FROM main_table WHERE "pk_col" = ?)` (rowid table with non-rowid-alias int PK, default-on).
+- **Dead check**: `SELECT cl FROM v2_tombstones WHERE "pk_col" = ?`.
+- **No hash computation** — the PK value is used as-is for all lookups.
+
+**Incoming V2 wire (`cid = '-2'`) for a skip-hash table**: this should not occur — skip-hash tables emit `cid = '-1'` with real PK values. If a `cid = '-2'` row is received for a skip-hash table (e.g., from a node that has the same table in hash mode), the receiver treats the `pk` blob as a packed PK value (not a hash) and proceeds normally. The `cid` sentinel is advisory — the receiver's `TableInfo` determines the lookup strategy, not the wire sentinel.
+
+### `TableInfo` Flag
+
+A new boolean flag is added to `TableInfo`:
+
+```rust
+pub struct TableInfo {
+    // ... existing fields ...
+    pub key_is_rowid: bool,
+    pub rowid_alias: String,
+    /// True when hashing is skipped for this table's PK.
+    /// Tombstones store the PK value directly (no hashed_pk BLOB column).
+    /// v2_tombstone_pks table is not created. Lookups use the PK value
+    /// directly instead of a hash. Independent of key_is_rowid.
+    /// Auto-qualified for single integer-affinity PKs; can be manually enabled
+    /// for other single-column PKs via schema directive or as_crr option.
+    pub skip_hash: bool,
+    // ...
+}
+```
+
+**Detection at `as_crr` time**:
+- **Auto-qualified**: `pks.len() == 1` AND the PK column's declared type (from `pragma_table_info`) contains `"INT"`.
+- **Manually enabled**: `pks.len() == 1` AND a `skip_hash=1` directive is present in the schema (see §"Schema-Embedded Configuration Directives") or the `as_crr` option is set. Works with any single-column PK type (blob, text, etc.).
+
+**Persistence**: when `v2_pks` exists, infer from its schema — if `v2_pks` has no `hashed_pk` column, `skip_hash = true`. When `v2_pks` doesn't exist yet, persist in `crsql_master` (same pattern as the `without_rowid` flag).
+
+**Inference detail**: the existing `key_is_rowid` inference (column count == 3) breaks with skip-hash mode, since a non-rowid skip-hash `v2_pks` also has 3 columns (`__crsql_key`, `pk_col`, `cl`). The inference must check for the `hashed_pk` column by name instead:
+- `v2_pks` has `hashed_pk` column → hash mode (existing logic applies: 3 columns = rowid-key, >3 = non-rowid)
+- `v2_pks` has no `hashed_pk` column → skip-hash mode
+- Within skip-hash mode: `key_is_rowid` = (column count == 2, i.e., no PK column stored — rowid table with reuse enabled where PK is fetched from main table). Note: for `INTEGER PRIMARY KEY` tables, `key_is_rowid = false` is the default, so most will have 3 columns (`__crsql_key`, `pk_col`, `cl`).
+
+### Backfill (V2)
+
+For skip-hash tables, backfill skips hash computation:
+- Tier A (`key_is_rowid = true`): `INSERT INTO v2_pks (__crsql_key, cl) VALUES (rowid, 1)`. PK value is fetched from the main table at feed time (same as hash mode for rowid tables). For `INTEGER PRIMARY KEY`, this requires rowid reuse to be opted in.
+- Tier B (`key_is_rowid = false`): `INSERT INTO v2_pks (__crsql_key, "pk_col", cl) VALUES (auto_inc, pk_value, 1)`. This is the default for `INTEGER PRIMARY KEY` tables.
+
+### V1→V2 Migration
+
+When migrating an existing V1 table that qualifies for skip-hash mode:
+- Create `v2_pks` / `v2_tombstones` with the skip-hash schema (no `hashed_pk`).
+- Do not create `v2_tombstone_pks`.
+- For each `__crsql_pks` row: use the PK value directly (no `xxh128` computation).
+- Add the `CHECK (typeof("pk_col") = 'integer')` constraint to the main table (only for auto-qualified integer PKs that are not `INTEGER PRIMARY KEY`; manually-enabled non-integer PKs get no `typeof` CHECK).
+
+### ALTER TABLE: PK Columns Changed
+
+Same as hash mode — drop all V2 tables and re-create from scratch. The `as_crr` re-detection determines whether the new PK schema qualifies for skip-hash mode.
+
+### Teardown
+
+`v2_tombstone_pks` is not dropped (it was never created). All other V2 tables are dropped as normal.
+
+### Summary: Schema Comparison
+
+| Component | Hash mode (`skip_hash = false`) | Skip-hash mode (`skip_hash = true`) |
+|---|---|---|
+| `v2_pks` columns | `__crsql_key, [pk_cols...], hashed_pk, cl` | `__crsql_key, [pk_col?], cl` (no `hashed_pk`; PK col only when `key_is_rowid = false` — the default for `INTEGER PRIMARY KEY`) |
+| `v2_pks` unique index | on `hashed_pk` | on `pk_col` (only when `key_is_rowid = false`; rowid tables with reuse enabled need none — PK fetched from main table) |
+| `v2_tombstones` PK col | `hashed_pk BLOB` | `"pk_col" <pk_type>` (INTEGER for auto-qualified, ANY for manually-enabled) |
+| `v2_tombstones` unique index | on `hashed_pk` | on `pk_col` |
+| `v2_tombstone_pks` | created (V1 compat) | **not created** |
+| Main table CHECK | rowid bounds only | rowid bounds + `typeof(pk) = 'integer'` (auto-qualified int PKs only; manually-enabled non-int PKs: no typeof CHECK) |
+| Feed dead-row `cid` | `'-2'` (V2) or `'-1'` (V1 compat) | `'-1'` (always — real PK in wire) |
+| Merge lookup | by `hashed_pk` | by PK value directly |
+| Hash computation | XXH128 per write/merge | **none** |
+
+---
+
+## Schema-Embedded Configuration Directives
+
+### Motivation
+
+The `key_is_rowid` and `skip_hash` modes (and future per-table options) are currently decided by `as_crr` runtime options or auto-detection. For distributed systems like corrosion where schema is managed declaratively (schema files → applied to all nodes), it's better to declare the desired mode **in the schema itself** — so the mode travels with the table definition and is consistent across all nodes without runtime configuration.
+
+### Mechanism: SQL Comments in `CREATE TABLE`
+
+SQLite preserves comments inside `CREATE TABLE` statements verbatim in `sqlite_master.sql`. Comments between the table name and the opening paren survive all ALTER TABLE operations (ADD/DROP COLUMN):
+
+```sql
+CREATE TABLE foo /* crsql: use_rowid_key=1, skip_hash=1 */ (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL
+)
+```
+
+Verified behavior:
+
+| Comment position | Preserved in `sqlite_master` | Survives ALTER ADD COLUMN | Survives ALTER DROP COLUMN |
+|---|---|---|---|
+| Before `CREATE TABLE` | No | — | — |
+| After table name: `CREATE TABLE foo /* ... */ (` | **Yes** | **Yes** | **Yes** |
+| Inside column list (standalone line) | **Yes** | **Yes** | **Yes** |
+| Attached to a column (trailing) | **Yes** | **Yes** | **Yes** |
+| After closing `)` | No | — | — |
+
+The recommended position is **between the table name and the opening paren** — it's the most prominent, clearly associated with the table (not a specific column), and survives all schema evolution operations.
+
+### Directive Format
+
+```
+/* crsql: key1=value1, key2=value2, ... */
+```
+
+Supported keys:
+
+| Key | Values | Effect | Default (no directive) |
+|---|---|---|---|
+| `use_rowid_key` | `0` / `1` | Enable/disable rowid reuse (overrides opt-in/opt-out default) | Per-table-type default (see §3 "Rowid Reuse: Opt-in vs Opt-out") |
+| `skip_hash` | `0` / `1` | Force enable/disable skip-hash mode (use PK value directly instead of XXH128 hash) | Auto-detected: `1` if single int-affinity PK, else `0`. Can be manually set to `1` for any single-column PK (e.g., fixed-size blob PKs). |
+| `without_rowid` | `0` / `1` | Force WITHOUT ROWID layout | `0` (rowid tables stay rowid unless converted) |
+
+If a key is absent from the directive, the existing auto-detection / default applies. The directive only overrides what it explicitly specifies.
+
+### Reading the Directive
+
+**cr-sqlite**: does not parse `CREATE TABLE` SQL — it uses `pragma_table_info` for column info. To read the directive, one extra query:
+
+```sql
+SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?
+```
+
+Then a simple string search for `/* crsql: ... */` in the result. No SQL parser needed — the directive is a fixed-format substring. This is done once at `as_crr` time (or `TableInfo` creation) and cached.
+
+**corrosion**: uses the `sqlite3_parser` crate to parse schema files into an AST. The lexer **strips comments entirely** during tokenization (both `--` and `/* */` produce no tokens). This means:
+
+- The parsed AST (`CreateTableBody`, `ColumnDefinition`, etc.) contains **zero comment data**.
+- Corrosion's `Table` struct stores `raw: CreateTableBody` (the AST), not the original SQL text.
+- Corrosion's schema comparison (used to detect schema changes across nodes) is AST-based — **adding or changing a `crsql:` directive does NOT trigger a schema change**. This is correct: the directive is cr-sqlite metadata, not schema. Two nodes with the same table definition but different `crsql:` directives would have identical ASTs and no schema diff. (In practice, all nodes should have the same directive since they share the same schema files.)
+
+Corrosion does not need to understand or propagate the directive — it creates the table from the schema file (comments and all, via `execute_schema`), and cr-sqlite's `as_crr` reads the directive from `sqlite_master.sql` when registering the table as a CRR.
+
+### Precedence
+
+1. **Schema directive** (if present) — highest priority, explicit user intent.
+2. **`as_crr` runtime option** (if provided) — overrides auto-detection but not the schema directive. Useful for migration scenarios where you want to change the mode without recreating the table (e.g., enabling `use_rowid_key` after verifying PKs are small).
+3. **Auto-detection / default** — the existing logic based on `pragma_table_info`.
+
+If the schema directive and `as_crr` option conflict, `as_crr` logs a warning and uses the schema directive. The schema is the source of truth in a declarative system.
+
+### Example Usage
+
+```sql
+-- INTEGER PRIMARY KEY with rowid reuse explicitly enabled (small sequential IDs)
+CREATE TABLE users /* crsql: use_rowid_key=1 */ (
+  id INTEGER PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE
+);
+
+-- INTEGER PRIMARY KEY with random 64-bit IDs — rowid reuse off (default), skip-hash on (auto)
+CREATE TABLE events /* crsql: use_rowid_key=0 */ (
+  id INTEGER PRIMARY KEY,
+  data TEXT
+);
+
+-- WITHOUT ROWID table with composite PK — hash mode (auto, no directive needed)
+CREATE TABLE edges (
+  src TEXT NOT NULL,
+  dst TEXT NOT NULL,
+  weight REAL,
+  PRIMARY KEY (src, dst)
+) WITHOUT ROWID;
+
+-- Plain rowid table, rowid reuse on (default), skip-hash on (auto)
+CREATE TABLE notes /* crsql: use_rowid_key=1 */ (
+  id INTEGER PRIMARY KEY,
+  body TEXT
+);
+
+-- Fixed-size 8-byte blob PK — skip-hash manually enabled (not auto-qualified)
+CREATE TABLE blobs /* crsql: skip_hash=1 */ (
+  id BLOB PRIMARY KEY,
+  data TEXT
+);
 ```
 
 ---
@@ -777,7 +1118,7 @@ Drops all V2 metadata tables for a table:
 - `<table>__crsql_v2_clock`
 - `<table>__crsql_v2_pks`
 - `<table>__crsql_v2_tombstones`
-- `<table>__crsql_v2_tombstone_pks`
+- `<table>__crsql_v2_tombstone_pks` (if it exists — not created for skip-hash tables, see §"Skip Hash Optimization")
 
 Drops all triggers (same trigger names as V1 — triggers are shared). If V1 tables still exist (not yet dropped post-migration), drops those too. Called from the existing `as_table` / `remove_crr` entry point which checks which schema version is active and dispatches accordingly.
 

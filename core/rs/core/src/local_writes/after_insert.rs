@@ -16,7 +16,7 @@ use super::trigger_fn_preamble;
 
 /**
  * crsql_after_insert("table", pk_values..., [rowid_value])
- * The rowid_value is appended when the table uses_rowid_key.
+ * The rowid_value is appended when the table key_is_rowid.
  */
 pub unsafe extern "C" fn x_crsql_after_insert(
     ctx: *mut sqlite::context,
@@ -24,7 +24,7 @@ pub unsafe extern "C" fn x_crsql_after_insert(
     argv: *mut *mut sqlite::value,
 ) {
     let result = trigger_fn_preamble(ctx, argc, argv, |table_info, values, ext_data| {
-        let (pks_new, rowid_val) = if table_info.uses_rowid_key {
+        let (pks_new, rowid_val) = if table_info.key_is_rowid {
             let len = values.len();
             (&values[1..len - 1], Some(values[len - 1]))
         } else {

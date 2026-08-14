@@ -48,6 +48,10 @@ mod migrate;
 pub mod pack_columns;
 #[cfg(not(feature = "test"))]
 mod pack_columns;
+#[cfg(feature = "test")]
+pub mod schema_directive;
+#[cfg(not(feature = "test"))]
+mod schema_directive;
 mod sha;
 mod stmt_cache;
 #[cfg(feature = "test")]

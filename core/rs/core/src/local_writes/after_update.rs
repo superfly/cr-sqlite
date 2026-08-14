@@ -19,7 +19,7 @@ pub unsafe extern "C" fn x_crsql_after_update(
     argv: *mut *mut sqlite::value,
 ) {
     let result = trigger_fn_preamble(ctx, argc, argv, |table_info, values, ext_data| {
-        let has_rowid = table_info.uses_rowid_key;
+        let has_rowid = table_info.key_is_rowid;
         let (pks_new, pks_old, non_pks_new, non_pks_old, rowid_val) =
             partition_values(values, 1, table_info.pks.len(), table_info.non_pks.len(), has_rowid)?;
 

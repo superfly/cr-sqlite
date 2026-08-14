@@ -62,7 +62,7 @@ fn crsql_changes_query_for_table_v2_v1wire(table_info: &TableInfo) -> Result<Str
     // Always JOIN main table — needed to fetch column values via CASE (cval).
     // For rowid-key tables: join on rowid alias = pk_tbl.__crsql_key.
     // For non-rowid tables: join on PK columns.
-    let (pk_expr, main_join) = if table_info.uses_rowid_key {
+    let (pk_expr, main_join) = if table_info.key_is_rowid {
         let mt_pk_list = crate::util::as_identifier_list(&table_info.pks, Some("mt."))?;
         let alias = crate::util::escape_ident(&table_info.rowid_alias);
         (mt_pk_list, format!("JOIN \"{escaped}\" AS mt ON mt.\"{alias}\" = pk_tbl.__crsql_key", alias = alias))
@@ -107,30 +107,57 @@ fn crsql_changes_query_for_table_v2_v1wire(table_info: &TableInfo) -> Result<Str
         col_id_mask = consts::CRSQL_COL_ID_MASK,
     );
 
-    // Part 2: Tombstone rows from v2_tombstones joined with v2_tombstone_pks
-    let tombstone_rows = format!(
-        "SELECT
-          '{table_name_val}' as tbl,
-          crsql_pack_columns({pk_list_tomb}) as pks,
-          '{delete_sentinel}' as cid,
-          t.cl as col_vrsn,
-          t.db_version as db_vrsn,
-          site_tbl.site_id as site_id,
-          (1 << 62) | (t.site_id << 46) | (t.db_version << 22) | t.seq as key,
-          t.seq as seq,
-          t.cl as cl,
-          t.ts as ts,
-          NULL as cval
-        FROM \"{escaped}{tomb_suffix}\" AS t
-        JOIN \"{escaped}{tomb_pks_suffix}\" AS tpk_tbl ON t.hashed_pk = tpk_tbl.hashed_pk
-        LEFT JOIN crsql_site_id AS site_tbl ON t.site_id = site_tbl.ordinal",
-        table_name_val = table_name_val,
-        pk_list_tomb = pk_list_tomb,
-        delete_sentinel = crate::c::DELETE_SENTINEL,
-        escaped = escaped,
-        tomb_suffix = consts::V2_TOMBSTONES_SUFFIX,
-        tomb_pks_suffix = consts::V2_TOMBSTONE_PKS_SUFFIX,
-    );
+    // Part 2: Tombstone rows
+    // skip_hash: PK value stored directly in v2_tombstones, no v2_tombstone_pks JOIN needed.
+    // hash mode: JOIN v2_tombstone_pks to get PK values from hashed_pk.
+    let tombstone_rows = if table_info.skip_hash {
+        let pk_col = crate::util::escape_ident(&table_info.pks[0].name);
+        format!(
+            "SELECT
+              '{table_name_val}' as tbl,
+              crsql_pack_columns(t.\"{pk_col}\") as pks,
+              '{delete_sentinel}' as cid,
+              t.cl as col_vrsn,
+              t.db_version as db_vrsn,
+              site_tbl.site_id as site_id,
+              (1 << 62) | (t.site_id << 46) | (t.db_version << 22) | t.seq as key,
+              t.seq as seq,
+              t.cl as cl,
+              t.ts as ts,
+              NULL as cval
+            FROM \"{escaped}{tomb_suffix}\" AS t
+            LEFT JOIN crsql_site_id AS site_tbl ON t.site_id = site_tbl.ordinal",
+            table_name_val = table_name_val,
+            pk_col = pk_col,
+            delete_sentinel = crate::c::DELETE_SENTINEL,
+            escaped = escaped,
+            tomb_suffix = consts::V2_TOMBSTONES_SUFFIX,
+        )
+    } else {
+        format!(
+            "SELECT
+              '{table_name_val}' as tbl,
+              crsql_pack_columns({pk_list_tomb}) as pks,
+              '{delete_sentinel}' as cid,
+              t.cl as col_vrsn,
+              t.db_version as db_vrsn,
+              site_tbl.site_id as site_id,
+              (1 << 62) | (t.site_id << 46) | (t.db_version << 22) | t.seq as key,
+              t.seq as seq,
+              t.cl as cl,
+              t.ts as ts,
+              NULL as cval
+            FROM \"{escaped}{tomb_suffix}\" AS t
+            JOIN \"{escaped}{tomb_pks_suffix}\" AS tpk_tbl ON t.hashed_pk = tpk_tbl.hashed_pk
+            LEFT JOIN crsql_site_id AS site_tbl ON t.site_id = site_tbl.ordinal",
+            table_name_val = table_name_val,
+            pk_list_tomb = pk_list_tomb,
+            delete_sentinel = crate::c::DELETE_SENTINEL,
+            escaped = escaped,
+            tomb_suffix = consts::V2_TOMBSTONES_SUFFIX,
+            tomb_pks_suffix = consts::V2_TOMBSTONE_PKS_SUFFIX,
+        )
+    };
 
     Ok(format!(
         "{cell_changes} UNION ALL {tombstone_rows}",
@@ -187,7 +214,7 @@ fn crsql_changes_query_for_table_v2_v2wire(table_info: &TableInfo) -> Result<Str
     // Always JOIN main table for packed query — needed to fetch column values via CASE.
     // For rowid-key tables: join on rowid alias = pk_tbl.__crsql_key.
     // For non-rowid tables: join on PK columns.
-    let (pk_expr, main_join) = if table_info.uses_rowid_key {
+    let (pk_expr, main_join) = if table_info.key_is_rowid {
         let mt_pk_list = crate::util::as_identifier_list(&table_info.pks, Some("mt."))?;
         let alias = crate::util::escape_ident(&table_info.rowid_alias);
         (mt_pk_list, format!("JOIN \"{escaped}\" AS mt ON mt.\"{alias}\" = pk_tbl.__crsql_key", alias = alias))
@@ -232,27 +259,54 @@ fn crsql_changes_query_for_table_v2_v2wire(table_info: &TableInfo) -> Result<Str
         col_id_mask = consts::CRSQL_COL_ID_MASK,
     );
 
-    // Part 2: Tombstone rows — V2 wire format: hashed_pk as pks, '-2' as cid
-    let tombstone_rows = format!(
-        "SELECT
-          '{table_name_val}' as tbl,
-          t.hashed_pk as pks,
-          '{hash_tombstone_cid}' as cid,
-          NULL as col_vrsn,
-          t.db_version as db_vrsn,
-          site_tbl.site_id as site_id,
-          (1 << 62) | (t.site_id << 46) | (t.db_version << 22) | t.seq as key,
-          t.seq as seq,
-          t.cl as cl,
-          t.ts as ts,
-          NULL as cval
-        FROM \"{escaped}{tomb_suffix}\" AS t
-        LEFT JOIN crsql_site_id AS site_tbl ON t.site_id = site_tbl.ordinal",
-        table_name_val = table_name_val,
-        hash_tombstone_cid = consts::V2_HASH_TOMBSTONE_CID,
-        escaped = escaped,
-        tomb_suffix = consts::V2_TOMBSTONES_SUFFIX,
-    );
+    // Part 2: Tombstone rows — V2 wire format
+    // skip_hash: crsql_pack_columns(pk_col) as pks, '-1' as cid (real PK value, not hash)
+    // hash mode: hashed_pk as pks, '-2' as cid (hash tombstone)
+    let tombstone_rows = if table_info.skip_hash {
+        let pk_col = crate::util::escape_ident(&table_info.pks[0].name);
+        format!(
+            "SELECT
+              '{table_name_val}' as tbl,
+              crsql_pack_columns(t.\"{pk_col}\") as pks,
+              '{delete_sentinel}' as cid,
+              NULL as col_vrsn,
+              t.db_version as db_vrsn,
+              site_tbl.site_id as site_id,
+              (1 << 62) | (t.site_id << 46) | (t.db_version << 22) | t.seq as key,
+              t.seq as seq,
+              t.cl as cl,
+              t.ts as ts,
+              NULL as cval
+            FROM \"{escaped}{tomb_suffix}\" AS t
+            LEFT JOIN crsql_site_id AS site_tbl ON t.site_id = site_tbl.ordinal",
+            table_name_val = table_name_val,
+            pk_col = pk_col,
+            delete_sentinel = crate::c::DELETE_SENTINEL,
+            escaped = escaped,
+            tomb_suffix = consts::V2_TOMBSTONES_SUFFIX,
+        )
+    } else {
+        format!(
+            "SELECT
+              '{table_name_val}' as tbl,
+              t.hashed_pk as pks,
+              '{hash_tombstone_cid}' as cid,
+              NULL as col_vrsn,
+              t.db_version as db_vrsn,
+              site_tbl.site_id as site_id,
+              (1 << 62) | (t.site_id << 46) | (t.db_version << 22) | t.seq as key,
+              t.seq as seq,
+              t.cl as cl,
+              t.ts as ts,
+              NULL as cval
+            FROM \"{escaped}{tomb_suffix}\" AS t
+            LEFT JOIN crsql_site_id AS site_tbl ON t.site_id = site_tbl.ordinal",
+            table_name_val = table_name_val,
+            hash_tombstone_cid = consts::V2_HASH_TOMBSTONE_CID,
+            escaped = escaped,
+            tomb_suffix = consts::V2_TOMBSTONES_SUFFIX,
+        )
+    };
 
     Ok(format!(
         "{cell_changes} UNION ALL {tombstone_rows}",
@@ -276,7 +330,7 @@ fn crsql_changes_query_for_table_v2_pkonly(table_info: &TableInfo) -> Result<Str
 
     // For rowid-key tables: PK columns come from main table (v2_pks only has __crsql_key).
     // For non-rowid tables: PK columns come from v2_pks directly.
-    let (pk_expr, main_join) = if table_info.uses_rowid_key {
+    let (pk_expr, main_join) = if table_info.key_is_rowid {
         let mt_pk_list = crate::util::as_identifier_list(&table_info.pks, Some("mt."))?;
         let alias = crate::util::escape_ident(&table_info.rowid_alias);
         (mt_pk_list, format!("JOIN \"{escaped}\" AS mt ON mt.\"{alias}\" = pk_tbl.__crsql_key", alias = alias))
@@ -316,30 +370,55 @@ fn crsql_changes_query_for_table_v2_pkonly(table_info: &TableInfo) -> Result<Str
         col_id_bits = col_id_bits,
     );
 
-    // Tombstone rows (same as v1wire)
-    let tombstone_rows = format!(
-        "SELECT
-          '{table_name_val}' as tbl,
-          crsql_pack_columns({pk_list_tomb}) as pks,
-          '{delete_sentinel}' as cid,
-          t.cl as col_vrsn,
-          t.db_version as db_vrsn,
-          site_tbl.site_id as site_id,
-          (1 << 62) | (t.site_id << 46) | (t.db_version << 22) | t.seq as key,
-          t.seq as seq,
-          t.cl as cl,
-          t.ts as ts,
-          NULL as cval
-        FROM \"{escaped}{tomb_suffix}\" AS t
-        JOIN \"{escaped}{tomb_pks_suffix}\" AS tpk_tbl ON t.hashed_pk = tpk_tbl.hashed_pk
-        LEFT JOIN crsql_site_id AS site_tbl ON t.site_id = site_tbl.ordinal",
-        table_name_val = table_name_val,
-        pk_list_tomb = pk_list_tomb,
-        delete_sentinel = crate::c::DELETE_SENTINEL,
-        escaped = escaped,
-        tomb_suffix = consts::V2_TOMBSTONES_SUFFIX,
-        tomb_pks_suffix = consts::V2_TOMBSTONE_PKS_SUFFIX,
-    );
+    // Tombstone rows (same pattern as v1wire — skip_hash reads PK directly)
+    let tombstone_rows = if table_info.skip_hash {
+        let pk_col = crate::util::escape_ident(&table_info.pks[0].name);
+        format!(
+            "SELECT
+              '{table_name_val}' as tbl,
+              crsql_pack_columns(t.\"{pk_col}\") as pks,
+              '{delete_sentinel}' as cid,
+              t.cl as col_vrsn,
+              t.db_version as db_vrsn,
+              site_tbl.site_id as site_id,
+              (1 << 62) | (t.site_id << 46) | (t.db_version << 22) | t.seq as key,
+              t.seq as seq,
+              t.cl as cl,
+              t.ts as ts,
+              NULL as cval
+            FROM \"{escaped}{tomb_suffix}\" AS t
+            LEFT JOIN crsql_site_id AS site_tbl ON t.site_id = site_tbl.ordinal",
+            table_name_val = table_name_val,
+            pk_col = pk_col,
+            delete_sentinel = crate::c::DELETE_SENTINEL,
+            escaped = escaped,
+            tomb_suffix = consts::V2_TOMBSTONES_SUFFIX,
+        )
+    } else {
+        format!(
+            "SELECT
+              '{table_name_val}' as tbl,
+              crsql_pack_columns({pk_list_tomb}) as pks,
+              '{delete_sentinel}' as cid,
+              t.cl as col_vrsn,
+              t.db_version as db_vrsn,
+              site_tbl.site_id as site_id,
+              (1 << 62) | (t.site_id << 46) | (t.db_version << 22) | t.seq as key,
+              t.seq as seq,
+              t.cl as cl,
+              t.ts as ts,
+              NULL as cval
+            FROM \"{escaped}{tomb_suffix}\" AS t
+            JOIN \"{escaped}{tomb_pks_suffix}\" AS tpk_tbl ON t.hashed_pk = tpk_tbl.hashed_pk
+            LEFT JOIN crsql_site_id AS site_tbl ON t.site_id = site_tbl.ordinal",
+            table_name_val = table_name_val,
+            pk_list_tomb = pk_list_tomb,
+            delete_sentinel = crate::c::DELETE_SENTINEL,
+            escaped = escaped,
+            tomb_suffix = consts::V2_TOMBSTONES_SUFFIX,
+            tomb_pks_suffix = consts::V2_TOMBSTONE_PKS_SUFFIX,
+        )
+    };
 
     Ok(format!(
         "{cell_changes} UNION ALL {tombstone_rows}",

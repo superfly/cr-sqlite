@@ -36,7 +36,9 @@ fn v2_pks_col_count(db: &ManagedConnection, table: &str) -> i32 {
 }
 
 /// Test that as_crr on a rowid table with safe rowids succeeds.
-/// After V2 migration, v2_pks should have rowid-key schema (3 columns).
+/// After V2 migration, v2_pks should have rowid-key schema.
+/// Single integer PK auto-qualifies for skip_hash → 2 columns (__crsql_key, cl).
+/// Non-skip_hash rowid-key → 3 columns (__crsql_key, hashed_pk, cl).
 fn test_safe_rowids_get_triggers() -> Result<(), ResultCode> {
     let db = crate::opendb()?;
     db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, data TEXT)")?;
@@ -44,10 +46,11 @@ fn test_safe_rowids_get_triggers() -> Result<(), ResultCode> {
     db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
 
-    // Migrate to V2 and verify v2_pks has rowid-key schema (3 columns)
+    // Migrate to V2 and verify v2_pks has rowid-key schema.
+    // Single integer PK → skip_hash → 2 columns (__crsql_key, cl).
     migrate_to_v2(&db.db)?;
     let col_count = v2_pks_col_count(&db.db, "foo");
-    assert!(col_count == 3, "expected 3 columns in v2_pks (rowid-key schema), got {}", col_count);
+    assert!(col_count == 2, "expected 2 columns in v2_pks (skip_hash rowid-key schema), got {}", col_count);
     Ok(())
 }
 
@@ -113,10 +116,12 @@ fn test_without_rowid_allows_oversized() -> Result<(), ResultCode> {
         "expected as_crr with without_rowid to succeed"
     );
 
-    // Migrate to V2 and verify v2_pks has non-rowid schema (4 columns for 1 PK)
+    // Migrate to V2 and verify v2_pks has non-rowid schema.
+    // Single integer PK → skip_hash + non-rowid → 3 columns (__crsql_key, id, cl).
+    // (Without skip_hash: 4 columns = __crsql_key, id, hashed_pk, cl)
     migrate_to_v2(&db.db)?;
     let col_count = v2_pks_col_count(&db.db, "foo");
-    assert!(col_count == 4, "expected 4 columns in v2_pks (non-rowid schema), got {}", col_count);
+    assert!(col_count == 3, "expected 3 columns in v2_pks (skip_hash non-rowid schema), got {}", col_count);
     Ok(())
 }
 
@@ -269,10 +274,11 @@ fn test_alter_preserves_without_rowid() -> Result<(), ResultCode> {
     db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_commit_alter('foo')")?;
 
-    // Migrate to V2 and verify v2_pks still has non-rowid schema (4 columns for 1 PK)
+    // Migrate to V2 and verify v2_pks still has non-rowid schema.
+    // Single integer PK → skip_hash + non-rowid → 3 columns (__crsql_key, id, cl).
     migrate_to_v2(&db.db)?;
     let col_count = v2_pks_col_count(&db.db, "foo");
-    assert!(col_count == 4, "expected 4 columns in v2_pks after ALTER (non-rowid preserved), got {}", col_count);
+    assert!(col_count == 3, "expected 3 columns in v2_pks after ALTER (skip_hash non-rowid preserved), got {}", col_count);
     Ok(())
 }
 
@@ -337,10 +343,11 @@ fn test_direct_v2_mode_creates_v2_only() -> Result<(), ResultCode> {
         }
     }
 
-    // v2_pks should have rowid-key schema (3 columns)
+    // v2_pks should have rowid-key schema.
+    // Single integer PK → skip_hash → 2 columns (__crsql_key, cl).
     let col_count = v2_pks_col_count(&db.db, "foo");
-    if col_count != 3 {
-        println!("test_direct_v2: v2_pks col_count={}, expected 3", col_count);
+    if col_count != 2 {
+        println!("test_direct_v2: v2_pks col_count={}, expected 2", col_count);
         return Err(ResultCode::CONSTRAINT);
     }
 

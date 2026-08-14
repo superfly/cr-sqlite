@@ -20,8 +20,9 @@ pub fn backfill_table_v2(
     table: &str,
     pk_cols: &Vec<ColumnInfo>,
     non_pk_cols: &Vec<ColumnInfo>,
-    uses_rowid_key: bool,
+    key_is_rowid: bool,
     rowid_alias: &str,
+    skip_hash: bool,
     no_tx: bool,
 ) -> Result<ResultCode, ResultCode> {
     // V2 clock tables require a non-zero ts. Error early if not set.
@@ -45,7 +46,7 @@ pub fn backfill_table_v2(
 
     // Find rows in main table not yet in v2_pks
     // For rowid-key tables, compare rowid alias vs __crsql_key, but also select PK cols for hashing
-    let sql = if uses_rowid_key {
+    let sql = if key_is_rowid {
         format!(
             "SELECT t1.\"{alias}\", {pk_cols} FROM \"{table}\" AS t1
             WHERE t1.\"{alias}\" NOT IN (SELECT __crsql_key FROM \"{table}{pks_suffix}\")",
@@ -66,7 +67,22 @@ pub fn backfill_table_v2(
     let read_stmt = db.prepare_v2(&sql)?;
 
     // Prepare insert into v2_pks
-    let insert_pks_sql = if uses_rowid_key {
+    let insert_pks_sql = if skip_hash && key_is_rowid {
+        format!(
+            "INSERT INTO \"{escaped}{suffix}\" (__crsql_key, cl) VALUES (?, 1) RETURNING __crsql_key",
+            escaped = escaped,
+            suffix = consts::V2_PKS_SUFFIX,
+        )
+    } else if skip_hash && !key_is_rowid {
+        // skip_hash, non-rowid: store PK column, no hashed_pk
+        format!(
+            "INSERT INTO \"{escaped}{suffix}\" ({pk_cols}, cl) VALUES ({pk_values}, 1) RETURNING __crsql_key",
+            escaped = escaped,
+            suffix = consts::V2_PKS_SUFFIX,
+            pk_cols = pk_cols_list,
+            pk_values = pk_cols.iter().map(|_| "?").collect::<Vec<_>>().join(", "),
+        )
+    } else if key_is_rowid {
         format!(
             "INSERT INTO \"{escaped}{suffix}\" (__crsql_key, hashed_pk, cl) VALUES (?, ?, 1) RETURNING __crsql_key",
             escaped = escaped,
@@ -99,7 +115,7 @@ pub fn backfill_table_v2(
         while read_stmt.step()? == ResultCode::ROW {
             // For rowid-key tables: col 0 = rowid, cols 1..n = PK columns
             // For non-rowid tables: cols 0..n = PK columns
-            let (rowid, pk_values) = if uses_rowid_key {
+            let (rowid, pk_values) = if key_is_rowid {
                 let r = read_stmt.column_int64(0);
                 let pks: Vec<*mut sqlite::value> = (0..pk_cols.len())
                     .map(|i| read_stmt.column_value(i as i32 + 1))
@@ -112,19 +128,31 @@ pub fn backfill_table_v2(
                 (0i64, pks)
             };
 
-            // Compute hashed_pk from PK values (not rowid)
-            let hashed_pk = hash_pk_values(&pk_values)?;
+            // Compute hashed_pk from PK values (only for hash mode)
+            let hashed_pk = if !skip_hash {
+                Some(hash_pk_values(&pk_values)?)
+            } else {
+                None
+            };
 
             // Insert into v2_pks
-            if uses_rowid_key {
+            if skip_hash && key_is_rowid {
+                // __crsql_key = rowid, no hashed_pk
+                insert_pks_stmt.bind_int64(1, rowid)?;
+            } else if skip_hash && !key_is_rowid {
+                // PK column only, no hashed_pk
+                for (i, val) in pk_values.iter().enumerate() {
+                    insert_pks_stmt.bind_value(i as i32 + 1, *val)?;
+                }
+            } else if key_is_rowid {
                 // __crsql_key = rowid, hashed_pk = hash(PK values)
                 insert_pks_stmt.bind_int64(1, rowid)?;
-                insert_pks_stmt.bind_blob(2, &hashed_pk, Destructor::STATIC)?;
+                insert_pks_stmt.bind_blob(2, hashed_pk.as_ref().unwrap(), Destructor::STATIC)?;
             } else {
                 for (i, val) in pk_values.iter().enumerate() {
                     insert_pks_stmt.bind_value(i as i32 + 1, *val)?;
                 }
-                insert_pks_stmt.bind_blob(pk_values.len() as i32 + 1, &hashed_pk, Destructor::STATIC)?;
+                insert_pks_stmt.bind_blob(pk_values.len() as i32 + 1, hashed_pk.as_ref().unwrap(), Destructor::STATIC)?;
             }
 
             match insert_pks_stmt.step()? {

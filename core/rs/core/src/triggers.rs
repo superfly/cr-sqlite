@@ -25,7 +25,7 @@ fn create_insert_trigger(
     table_info: &TableInfo,
     _err: *mut *mut c_char,
 ) -> Result<ResultCode, ResultCode> {
-    let rowid_expr = if table_info.uses_rowid_key {
+    let rowid_expr = if table_info.key_is_rowid {
         let alias = crate::util::escape_ident(&table_info.rowid_alias);
         format!(", NEW.\"{alias}\"")
     } else {
@@ -56,7 +56,7 @@ fn create_update_trigger(
     let pk_new_list = crate::util::as_identifier_list(pk_columns, Some("NEW."))?;
     let pk_old_list = crate::util::as_identifier_list(pk_columns, Some("OLD."))?;
 
-    let rowid_expr = if table_info.uses_rowid_key {
+    let rowid_expr = if table_info.key_is_rowid {
         let alias = crate::util::escape_ident(&table_info.rowid_alias);
         format!(", NEW.\"{alias}\"")
     } else {
