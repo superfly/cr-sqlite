@@ -385,6 +385,96 @@ pub unsafe extern "C" fn crsql_pack_agg_final(ctx: *mut sqlite::context) {
     ctx.result_blob_owned(result);
 }
 
+/// Accumulator state for crsql_pack_varint_agg aggregate function.
+/// Collects a sequence of integers as SQLite varints, with a varint count
+/// header prepended in xFinal. Used by the V2 packed feed query for `seq`
+/// and `col_vrsn` (both arrays of integers), replacing the old
+/// `GROUP_CONCAT(..., char(0))` text encoding.
+#[repr(C)]
+struct PackVarintAcc {
+    buf: *mut Vec<u8>,
+    count: u64,
+}
+
+impl PackVarintAcc {
+    const SIZE: c_int = core::mem::size_of::<PackVarintAcc>() as c_int;
+}
+
+/// xStep callback for crsql_pack_varint_agg.
+/// Appends the integer argument as a SQLite varint to the accumulator buffer.
+/// Non-integer arguments are coerced to int64 first (matching SQLite semantics).
+pub unsafe extern "C" fn crsql_pack_varint_agg_step(
+    ctx: *mut sqlite::context,
+    argc: c_int,
+    argv: *mut *mut sqlite::value,
+) {
+    let args = sqlite::args!(argc, argv);
+    if args.is_empty() {
+        return;
+    }
+    let value = args[0];
+
+    let acc_ptr = aggregate_context(ctx, PackVarintAcc::SIZE) as *mut PackVarintAcc;
+    if acc_ptr.is_null() {
+        ctx.result_error("crsql_pack_varint_agg: failed to allocate aggregate context");
+        ctx.result_error_code(ResultCode::NOMEM);
+        return;
+    }
+
+    if (*acc_ptr).buf.is_null() {
+        (*acc_ptr).buf = Box::into_raw(Box::new(Vec::new()));
+        (*acc_ptr).count = 0;
+    }
+
+    // SQLite varints are unsigned (u64). Reinterpret the int64 bits so
+    // negative values round-trip correctly (same bit pattern on decode).
+    let val = value.int64() as u64;
+    let buf = &mut *(*acc_ptr).buf;
+    put_varint(buf, val);
+    (*acc_ptr).count += 1;
+}
+
+/// xFinal callback for crsql_pack_varint_agg.
+/// Prepends the varint count header and returns the packed blob.
+/// Format: [count:varint, ...varint(value_i)] — matches the envelope shape
+/// of crsql_pack_columns / crsql_pack_agg (count header + payload).
+pub unsafe extern "C" fn crsql_pack_varint_agg_final(ctx: *mut sqlite::context) {
+    let acc_ptr = aggregate_context(ctx, 0) as *mut PackVarintAcc;
+
+    if acc_ptr.is_null() || (*acc_ptr).buf.is_null() {
+        // No rows: emit varint(0) so the blob is self-describing.
+        let mut empty = Vec::new();
+        put_varint(&mut empty, 0);
+        ctx.result_blob_owned(empty);
+        return;
+    }
+
+    let buf_ptr = (*acc_ptr).buf;
+    let count = (*acc_ptr).count;
+    let buf = Box::from_raw(buf_ptr);
+
+    let mut result = Vec::with_capacity(9 + buf.len());
+    put_varint(&mut result, count);
+    result.extend_from_slice(&buf);
+
+    ctx.result_blob_owned(result);
+}
+
+/// Unpack a blob produced by crsql_pack_varint_agg into a Vec<i64>.
+/// Format: [count:varint, ...varint(value_i)]. Values are reinterpreted from
+/// u64 to i64 to recover negative numbers (see crsql_pack_varint_agg_step).
+pub fn unpack_varints(data: &[u8]) -> Result<Vec<i64>, ResultCode> {
+    let (count, header_len) = get_varint(data)?;
+    let mut buf = &data[header_len..];
+    let mut out = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let (val, n) = get_varint(buf)?;
+        out.push(val as i64);
+        buf = &buf[n..];
+    }
+    Ok(out)
+}
+
 /// Encode a single SQLite value into the buffer using the same TLV encoding
 /// as pack_columns.
 fn encode_value(buf: &mut Vec<u8>, value: *mut sqlite::value) {

@@ -168,8 +168,9 @@ fn build_col_val_case(table_info: &TableInfo) -> Result<String, ResultCode> {
 
 /// V2 packed feed query (V2 wire format): coalesces clock rows that share
 /// (row_key, db_version, site_id) into a single packed event.
-/// - cid = GROUP_CONCAT(col_name, char(0))
-/// - col_vrsn = GROUP_CONCAT(col_version, char(0))
+/// - cid = GROUP_CONCAT(col_name, char(0))  (text — column names are strings)
+/// - col_vrsn = crsql_pack_varint_agg(col_version)  (binary varint array)
+/// - seq = crsql_pack_varint_agg(c.seq)  (binary varint array)
 /// - cval = crsql_pack_agg(col_val)  (column values fetched from main table via CASE)
 /// Sentinels and tombstones are always single events (no packing).
 fn crsql_changes_query_for_table_v2_v2wire(table_info: &TableInfo) -> Result<String, ResultCode> {
@@ -205,11 +206,11 @@ fn crsql_changes_query_for_table_v2_v2wire(table_info: &TableInfo) -> Result<Str
           '{table_name_val}' as tbl,
           crsql_pack_columns({pk_expr}) as pks,
           cast(group_concat(cm.col_name, char(0) ORDER BY cm.col_id) as blob) as cid,
-          cast(group_concat(c.col_version, char(0) ORDER BY cm.col_id) as blob) as col_vrsn,
+          crsql_pack_varint_agg(c.col_version ORDER BY cm.col_id) as col_vrsn,
           c.db_version as db_vrsn,
           site_tbl.site_id as site_id,
           c.cell_key >> {col_id_bits} as key,
-          cast(group_concat(c.seq, char(0) ORDER BY cm.col_id) as blob) as seq,
+          crsql_pack_varint_agg(c.seq ORDER BY cm.col_id) as seq,
           pk_tbl.cl as cl,
           c.ts as ts,
           crsql_pack_agg(({col_val_case}) ORDER BY cm.col_id) as cval

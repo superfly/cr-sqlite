@@ -552,10 +552,10 @@ Column names are used (not `col_id`) because names are deterministic across node
 | `pk` | Packed PK values via `crsql_pack_columns` (1×) |
 | `cid` | `GROUP_CONCAT(col_name, char(0))` — null-separated col names. Detection: `char(0)` present → packed; absent → single/sentinel. SQLite column names cannot contain null bytes, so this is safe. |
 | `cval` | `crsql_pack_agg(col_val)` — custom SQLite aggregate (`xStep` + `xFinal`) that collects values across the `GROUP BY` and produces a TLV blob using the same per-value encoding as `crsql_pack_columns`. Implemented in Rust alongside `crsql_pack_columns`, reusing the same per-value encoding logic. `GROUP_CONCAT` can't be used here because it loses type info (Integer/Text/Blob/Float/Null). Format: `[num_values:varint, ...[(type:3bits, intlen:5bits):u8, length?:varint, ...bytes]]`. Each value encodes its own type and length. Receiver calls `unpack_columns(cval)` → `Vec<ColumnValue>`, no external metadata needed. **ORDER IS THE CONTRACT**: values in `cval` are in the same order as column names in `cid` and versions in `col_vrsn`. All three aggregates run over the same group, so ordering is naturally consistent. |
-| `col_vrsn` | `GROUP_CONCAT(col_version, char(0))` — null-separated col versions (parallel array to `cid`; receiver zips `cid[i]` with `col_vrsn[i]`) |
+| `col_vrsn` | `crsql_pack_varint_agg(col_version)` — binary varint array (`[count:varint, ...varint(col_version_i)]`). Parallel array to `cid`; receiver zips `cid[i]` with `col_vrsn[i]`. |
 | `db_vrsn` | Single value (shared by all N columns in the group) |
 | `site_id` | Single value |
-| `seq` | `GROUP_CONCAT(t1.seq, char(0))` — null-separated seqs (parallel array to `cid`). All seqs in the group are preserved for bookeeping correctness. |
+| `seq` | `crsql_pack_varint_agg(t1.seq)` — binary varint array, same format as `col_vrsn`. Parallel array to `cid`. All seqs in the group are preserved for bookeeping correctness. |
 | `cl` | Single value (from `v2_pks` or `v2_tombstones` JOIN) |
 | `ts` | Single value |
 
@@ -582,11 +582,11 @@ SELECT
   '{table}' as tbl,
   crsql_pack_columns({pk_cols_for_table}) as pks,  -- from v2_pks (WITHOUT ROWID) or main table (rowid)
   GROUP_CONCAT(cm.col_name, char(0) ORDER BY cm.col_id) as cid,
-  GROUP_CONCAT(t1.col_version, char(0) ORDER BY cm.col_id) as col_vrsn,
+  crsql_pack_varint_agg(t1.col_version ORDER BY cm.col_id) as col_vrsn,
   t1.db_version as db_vrsn,
   site_tbl.site_id as site_id,
   t1.cell_key >> CRSQL_COL_ID_BITS as key,
-  GROUP_CONCAT(t1.seq, char(0) ORDER BY cm.col_id) as seq,  -- packed seqs; receiver records ALL in bookeeping
+  crsql_pack_varint_agg(t1.seq ORDER BY cm.col_id) as seq,  -- packed seqs; receiver records ALL in bookeeping
   ah.cl as cl,                       -- per-row, same for all columns (in GROUP BY as functionally dependent)
   t1.ts as ts,                       -- same for all rows in group (written in same transaction)
   crsql_pack_agg(
