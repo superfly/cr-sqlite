@@ -78,7 +78,11 @@ pub struct TableInfo {
     /// directly instead of a hash. Independent of key_is_rowid.
     /// Auto-qualified for single integer-affinity PKs; can be manually enabled
     /// for other single-column PKs via schema directive or as_crr option.
+    /// Requires single-column PK — composite PKs fall back to hash mode.
     pub skip_hash: bool,
+    /// Pre-computed escaped single PK column name for skip_hash mode.
+    /// Only valid when skip_hash is true (which requires pks.len() == 1).
+    pub skip_hash_pk_col: String,
 
     // Lookaside --
     // insert returning?
@@ -1212,6 +1216,13 @@ pub fn pull_table_info(
         }
     };
 
+    // Pre-compute escaped PK column name for skip_hash mode (requires single PK)
+    let skip_hash_pk_col = if skip_hash && !pks.is_empty() {
+        crate::util::escape_ident(&pks[0].name)
+    } else {
+        String::new()
+    };
+
     // If v2_pks table exists, infer key_is_rowid from its schema.
     // The inference must account for skip_hash mode:
     // - Hash mode, rowid-key: 3 cols (__crsql_key, hashed_pk, cl)
@@ -1274,6 +1285,7 @@ pub fn pull_table_info(
         has_integer_pk,
         rowid_alias,
         skip_hash,
+        skip_hash_pk_col,
         set_winner_clock_stmt: RefCell::new(None),
         local_cl_stmt: RefCell::new(None),
         col_version_stmt: RefCell::new(None),

@@ -1065,7 +1065,7 @@ unsafe fn v2_lookup_key_and_cl(
 ) -> Result<(Option<i64>, i64), ResultCode> {
     if tbl_info.skip_hash {
         // skip_hash: lookup by PK column value (single PK — skip_hash requires it)
-        let pk_col = crate::util::escape_ident(&tbl_info.pks[0].name);
+        let pk_col = &tbl_info.skip_hash_pk_col;
         let pk_val = &unpacked_pks[0];
 
         let (alive_sql, dead_sql) = if tbl_info.has_integer_pk && tbl_info.key_is_rowid {
@@ -1243,7 +1243,7 @@ pub unsafe fn v1_to_v2_hydrate_row(
 
             if tbl_info.skip_hash {
                 // Insert tombstone with PK column directly (skip_hash requires single PK)
-                let pk_col = crate::util::escape_ident(&tbl_info.pks[0].name);
+                let pk_col = &tbl_info.skip_hash_pk_col;
                 let sql = format!(
                     "INSERT OR REPLACE INTO \"{}{}\" (site_id, db_version, seq, \"{}\", cl, ts) VALUES (?, ?, ?, ?, ?, ?)\0",
                     escaped, consts::V2_TOMBSTONES_SUFFIX, pk_col
@@ -1583,7 +1583,7 @@ unsafe fn v2_merge_insert_tombstone(
 
     if tbl_info.skip_hash {
         // skip_hash: insert tombstone with PK column value (single PK)
-        let pk_col = crate::util::escape_ident(&tbl_info.pks[0].name);
+        let pk_col = &tbl_info.skip_hash_pk_col;
         let where_clause = if merge_equal == 1 {
             format!(
                 "WHERE excluded.cl > \"{}{}\".cl \
@@ -1869,7 +1869,7 @@ unsafe fn v2_nuke_tombstone(
     unpacked_pks: &[ColumnValue],
 ) -> Result<(), ResultCode> {
     if tbl_info.skip_hash {
-        let pk_col = crate::util::escape_ident(&tbl_info.pks[0].name);
+        let pk_col = &tbl_info.skip_hash_pk_col;
         let del_tomb = db.prepare_v2(&format!(
             "DELETE FROM \"{}{}\" WHERE \"{}\" = ?\0",
             escaped, consts::V2_TOMBSTONES_SUFFIX, pk_col
@@ -2035,7 +2035,7 @@ unsafe fn v2_to_v1_mirror_metadata(
             )
         } else if tbl_info.skip_hash {
             // skip_hash: look up tombstone by PK column (single PK)
-            let pk_col = crate::util::escape_ident(&tbl_info.pks[0].name);
+            let pk_col = &tbl_info.skip_hash_pk_col;
             (
                 format!(
                     "SELECT site_id, db_version, seq, ts FROM \"{}{}\" WHERE \"{}\" = ?\0",

@@ -10,6 +10,38 @@ use sqlite_nostd as sqlite;
 
 use crate::consts;
 
+/// Build the skip_hash tombstone SELECT query for feed operations.
+/// `col_vrsn_expr` is "t.cl" for v1wire/pkonly or "NULL" for v2wire.
+fn skip_hash_tombstone_query(
+    table_info: &TableInfo,
+    escaped: &str,
+    table_name_val: &str,
+    col_vrsn_expr: &str,
+) -> String {
+    format!(
+        "SELECT
+          '{table_name_val}' as tbl,
+          crsql_pack_columns(t.\"{pk_col}\") as pks,
+          '{delete_sentinel}' as cid,
+          {col_vrsn} as col_vrsn,
+          t.db_version as db_vrsn,
+          site_tbl.site_id as site_id,
+          (1 << 62) | (t.site_id << 46) | (t.db_version << 22) | t.seq as key,
+          t.seq as seq,
+          t.cl as cl,
+          t.ts as ts,
+          NULL as cval
+        FROM \"{escaped}{tomb_suffix}\" AS t
+        LEFT JOIN crsql_site_id AS site_tbl ON t.site_id = site_tbl.ordinal",
+        table_name_val = table_name_val,
+        pk_col = table_info.skip_hash_pk_col,
+        delete_sentinel = crate::c::DELETE_SENTINEL,
+        col_vrsn = col_vrsn_expr,
+        escaped = escaped,
+        tomb_suffix = consts::V2_TOMBSTONES_SUFFIX,
+    )
+}
+
 // Metadata version constants are in consts.rs
 
 fn crsql_changes_query_for_table(table_info: &TableInfo) -> Result<String, ResultCode> {
@@ -111,28 +143,7 @@ fn crsql_changes_query_for_table_v2_v1wire(table_info: &TableInfo) -> Result<Str
     // skip_hash: PK value stored directly in v2_tombstones, no v2_tombstone_pks JOIN needed.
     // hash mode: JOIN v2_tombstone_pks to get PK values from hashed_pk.
     let tombstone_rows = if table_info.skip_hash {
-        let pk_col = crate::util::escape_ident(&table_info.pks[0].name);
-        format!(
-            "SELECT
-              '{table_name_val}' as tbl,
-              crsql_pack_columns(t.\"{pk_col}\") as pks,
-              '{delete_sentinel}' as cid,
-              t.cl as col_vrsn,
-              t.db_version as db_vrsn,
-              site_tbl.site_id as site_id,
-              (1 << 62) | (t.site_id << 46) | (t.db_version << 22) | t.seq as key,
-              t.seq as seq,
-              t.cl as cl,
-              t.ts as ts,
-              NULL as cval
-            FROM \"{escaped}{tomb_suffix}\" AS t
-            LEFT JOIN crsql_site_id AS site_tbl ON t.site_id = site_tbl.ordinal",
-            table_name_val = table_name_val,
-            pk_col = pk_col,
-            delete_sentinel = crate::c::DELETE_SENTINEL,
-            escaped = escaped,
-            tomb_suffix = consts::V2_TOMBSTONES_SUFFIX,
-        )
+        skip_hash_tombstone_query(table_info, &escaped, &table_name_val, "t.cl")
     } else {
         format!(
             "SELECT
@@ -263,28 +274,7 @@ fn crsql_changes_query_for_table_v2_v2wire(table_info: &TableInfo) -> Result<Str
     // skip_hash: crsql_pack_columns(pk_col) as pks, '-1' as cid (real PK value, not hash)
     // hash mode: hashed_pk as pks, '-2' as cid (hash tombstone)
     let tombstone_rows = if table_info.skip_hash {
-        let pk_col = crate::util::escape_ident(&table_info.pks[0].name);
-        format!(
-            "SELECT
-              '{table_name_val}' as tbl,
-              crsql_pack_columns(t.\"{pk_col}\") as pks,
-              '{delete_sentinel}' as cid,
-              NULL as col_vrsn,
-              t.db_version as db_vrsn,
-              site_tbl.site_id as site_id,
-              (1 << 62) | (t.site_id << 46) | (t.db_version << 22) | t.seq as key,
-              t.seq as seq,
-              t.cl as cl,
-              t.ts as ts,
-              NULL as cval
-            FROM \"{escaped}{tomb_suffix}\" AS t
-            LEFT JOIN crsql_site_id AS site_tbl ON t.site_id = site_tbl.ordinal",
-            table_name_val = table_name_val,
-            pk_col = pk_col,
-            delete_sentinel = crate::c::DELETE_SENTINEL,
-            escaped = escaped,
-            tomb_suffix = consts::V2_TOMBSTONES_SUFFIX,
-        )
+        skip_hash_tombstone_query(table_info, &escaped, &table_name_val, "NULL")
     } else {
         format!(
             "SELECT
@@ -372,28 +362,7 @@ fn crsql_changes_query_for_table_v2_pkonly(table_info: &TableInfo) -> Result<Str
 
     // Tombstone rows (same pattern as v1wire — skip_hash reads PK directly)
     let tombstone_rows = if table_info.skip_hash {
-        let pk_col = crate::util::escape_ident(&table_info.pks[0].name);
-        format!(
-            "SELECT
-              '{table_name_val}' as tbl,
-              crsql_pack_columns(t.\"{pk_col}\") as pks,
-              '{delete_sentinel}' as cid,
-              t.cl as col_vrsn,
-              t.db_version as db_vrsn,
-              site_tbl.site_id as site_id,
-              (1 << 62) | (t.site_id << 46) | (t.db_version << 22) | t.seq as key,
-              t.seq as seq,
-              t.cl as cl,
-              t.ts as ts,
-              NULL as cval
-            FROM \"{escaped}{tomb_suffix}\" AS t
-            LEFT JOIN crsql_site_id AS site_tbl ON t.site_id = site_tbl.ordinal",
-            table_name_val = table_name_val,
-            pk_col = pk_col,
-            delete_sentinel = crate::c::DELETE_SENTINEL,
-            escaped = escaped,
-            tomb_suffix = consts::V2_TOMBSTONES_SUFFIX,
-        )
+        skip_hash_tombstone_query(table_info, &escaped, &table_name_val, "t.cl")
     } else {
         format!(
             "SELECT
