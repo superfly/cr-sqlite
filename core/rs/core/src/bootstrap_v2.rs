@@ -100,20 +100,19 @@ pub fn create_v2_tables(
                 ) STRICT;",
                 escaped = escaped,
                 suffix = consts::V2_PKS_SUFFIX,
-                pk_name = crate::util::escape_ident(&pk_col.name),
+                pk_name = table_info.skip_hash_pk_col,
                 pk_type = pk_type,
             ))?;
         }
 
         // Unique index on PK column (only when PK is stored — non-rowid case)
         if !table_info.key_is_rowid {
-            let pk_col = &table_info.pks[0];
             db.exec_safe(&format!(
                 "CREATE UNIQUE INDEX IF NOT EXISTS \"idx_{escaped}_v2_pks_pk\"
                   ON \"{escaped}{suffix}\"(\"{pk_name}\");",
                 escaped = escaped,
                 suffix = consts::V2_PKS_SUFFIX,
-                pk_name = crate::util::escape_ident(&pk_col.name),
+                pk_name = table_info.skip_hash_pk_col,
             ))?;
         }
     } else if table_info.key_is_rowid {
@@ -182,7 +181,7 @@ pub fn create_v2_tables(
             ) WITHOUT ROWID, STRICT;",
             escaped = escaped,
             suffix = consts::V2_TOMBSTONES_SUFFIX,
-            pk_name = crate::util::escape_ident(&pk_col.name),
+            pk_name = table_info.skip_hash_pk_col,
             pk_type = pk_type,
         ))?;
 
@@ -191,7 +190,7 @@ pub fn create_v2_tables(
               ON \"{escaped}{suffix}\"(\"{pk_name}\");",
             escaped = escaped,
             suffix = consts::V2_TOMBSTONES_SUFFIX,
-            pk_name = crate::util::escape_ident(&pk_col.name),
+            pk_name = table_info.skip_hash_pk_col,
         ))?;
     } else {
         db.exec_safe(&format!(

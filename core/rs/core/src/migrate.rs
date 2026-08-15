@@ -12,6 +12,27 @@ use crate::consts;
 use crate::tableinfo::{TableInfo, SchemaVersion};
 use core::mem;
 
+/// Build JOIN clause for v2_pks in non-rowid migration queries.
+/// skip_hash: JOIN on PK column directly. hash mode: JOIN on hashed_pk.
+fn v2_pks_join_clause(tbl_info: &TableInfo, escaped: &str, pk_cols_p: &str) -> String {
+    if tbl_info.skip_hash {
+        format!(
+            "JOIN \"{escaped}{v2_pks}\" vp ON vp.\"{pk_col}\" = {pk_cols_p}",
+            escaped = escaped,
+            v2_pks = consts::V2_PKS_SUFFIX,
+            pk_col = tbl_info.skip_hash_pk_col,
+            pk_cols_p = pk_cols_p
+        )
+    } else {
+        format!(
+            "JOIN \"{escaped}{v2_pks}\" vp ON vp.hashed_pk = crsql_hash_pk({pk_cols_p})",
+            escaped = escaped,
+            v2_pks = consts::V2_PKS_SUFFIX,
+            pk_cols_p = pk_cols_p
+        )
+    }
+}
+
 /// crsql_incremental_maintenance(chunk_size) -> INTEGER
 /// Dispatches to pending maintenance tasks across all CRR tables.
 /// Does up to `chunk_size` units of work per call, returns total remaining.
@@ -438,7 +459,7 @@ unsafe fn migrate_v1_to_v2_chunk(
         // Step 2: Batch insert tombstones (dead rows)
         // skip_hash: PK column replaces hashed_pk. No v2_tombstone_pks needed.
         if skip_hash {
-            let pk_col = crate::util::escape_ident(&tbl_info.pks[0].name);
+            let pk_col = &tbl_info.skip_hash_pk_col;
             db.exec_safe(&format!(
                 "INSERT OR REPLACE INTO \"{escaped}{v2_tomb}\"
                  (site_id, db_version, seq, \"{pk_col}\", cl, ts)
@@ -531,17 +552,7 @@ unsafe fn migrate_v1_to_v2_chunk(
             ))?;
         } else {
             // Non-rowid clock migration: JOIN v2_pks to get __crsql_key for cell_key computation.
-            // skip_hash: JOIN on PK column directly. hash mode: JOIN on hashed_pk.
-            let v2_pks_join = if skip_hash {
-                let pk_col = crate::util::escape_ident(&tbl_info.pks[0].name);
-                format!("JOIN \"{escaped}{v2_pks}\" vp ON vp.\"{pk_col}\" = {pk_cols_p}",
-                    escaped = escaped, v2_pks = consts::V2_PKS_SUFFIX,
-                    pk_col = pk_col, pk_cols_p = pk_cols_p_list)
-            } else {
-                format!("JOIN \"{escaped}{v2_pks}\" vp ON vp.hashed_pk = crsql_hash_pk({pk_cols_p})",
-                    escaped = escaped, v2_pks = consts::V2_PKS_SUFFIX,
-                    pk_cols_p = pk_cols_p_list)
-            };
+            let v2_pks_join = v2_pks_join_clause(tbl_info, &escaped, &pk_cols_p_list);
             db.exec_safe(&format!(
                 "INSERT OR REPLACE INTO \"{escaped}{v2_clock}\"
                  (cell_key, col_version, site_id, db_version, seq, ts)
@@ -596,17 +607,7 @@ unsafe fn migrate_v1_to_v2_chunk(
                 ))?;
             } else {
                 // Non-rowid PK-only sentinel migration: JOIN v2_pks to get __crsql_key.
-                // skip_hash: JOIN on PK column. hash mode: JOIN on hashed_pk.
-                let v2_pks_join = if skip_hash {
-                    let pk_col = crate::util::escape_ident(&tbl_info.pks[0].name);
-                    format!("JOIN \"{escaped}{v2_pks}\" vp ON vp.\"{pk_col}\" = {pk_cols_p}",
-                        escaped = escaped, v2_pks = consts::V2_PKS_SUFFIX,
-                        pk_col = pk_col, pk_cols_p = pk_cols_p_list)
-                } else {
-                    format!("JOIN \"{escaped}{v2_pks}\" vp ON vp.hashed_pk = crsql_hash_pk({pk_cols_p})",
-                        escaped = escaped, v2_pks = consts::V2_PKS_SUFFIX,
-                        pk_cols_p = pk_cols_p_list)
-                };
+                let v2_pks_join = v2_pks_join_clause(tbl_info, &escaped, &pk_cols_p_list);
                 db.exec_safe(&format!(
                     "INSERT OR REPLACE INTO \"{escaped}{v2_clock}\"
                      (cell_key, col_version, site_id, db_version, seq, ts)
