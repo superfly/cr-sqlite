@@ -15,6 +15,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::Ref;
 use core::cell::RefCell;
+use core::cell::RefMut;
 use core::ffi::c_char;
 use core::ffi::c_int;
 use core::ffi::c_void;
@@ -119,6 +120,9 @@ pub struct TableInfo {
     mark_locally_created_stmt: RefCell<Option<ManagedStmt>>,
     maybe_mark_locally_reinserted_stmt: RefCell<Option<ManagedStmt>>,
     cl_cache: BTreeMap<i64, i64>,
+    /// Cached V2 prepared statements. None if table is not V2-enabled,
+    /// or if statements haven't been prepared yet.
+    v2_stmts: RefCell<Option<crate::v2_stmts::V2Stmts>>,
 }
 
 impl TableInfo {
@@ -754,6 +758,25 @@ impl TableInfo {
         col_info.get_row_patch_data_stmt(self, db)
     }
 
+    /// Get or lazily prepare V2 cached statements.
+    /// If merge_equal has changed since last prepare, re-prepares.
+    /// The caller must hold the borrow for the duration of statement use.
+    pub fn get_v2_stmts(
+        &self,
+        db: *mut sqlite3,
+        merge_equal: i32,
+    ) -> Result<RefMut<Option<crate::v2_stmts::V2Stmts>>, ResultCode> {
+        let needs_prepare = match self.v2_stmts.try_borrow()?.as_ref() {
+            None => true,
+            Some(s) => s.merge_equal() != merge_equal,
+        };
+        if needs_prepare {
+            let stmts = crate::v2_stmts::V2Stmts::prepare(db, self, merge_equal)?;
+            *self.v2_stmts.try_borrow_mut()? = Some(stmts);
+        }
+        Ok(self.v2_stmts.try_borrow_mut()?)
+    }
+
     pub fn clear_stmts(&self) -> Result<ResultCode, ResultCode> {
         // finalize all stmts
         let mut stmt = self.set_winner_clock_stmt.try_borrow_mut()?;
@@ -792,6 +815,10 @@ impl TableInfo {
         stmt.take();
         let mut stmt = self.select_key_stmt.try_borrow_mut()?;
         stmt.take();
+
+        // V2 cached statements
+        let mut v2 = self.v2_stmts.try_borrow_mut()?;
+        v2.take();
 
         // primary key columns shouldn't have statements? right?
         for col in &self.non_pks {
@@ -1309,6 +1336,7 @@ pub fn pull_table_info(
         insert_clock_stmt: RefCell::new(None),
         update_clock_stmt: RefCell::new(None),
         cl_cache: BTreeMap::new(),
+        v2_stmts: RefCell::new(None),
     })
 }
 

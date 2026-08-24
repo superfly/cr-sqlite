@@ -68,6 +68,10 @@ pub mod test_exports;
 mod triggers;
 mod unpack_columns_vtab;
 mod util;
+#[cfg(feature = "test")]
+pub mod v2_stmts;
+#[cfg(not(feature = "test"))]
+mod v2_stmts;
 
 use alloc::format;
 use alloc::string::ToString;
