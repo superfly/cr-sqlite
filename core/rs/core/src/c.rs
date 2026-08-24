@@ -105,6 +105,15 @@ pub struct crsql_Changes_cursor {
     pub rowType: ::core::ffi::c_int,
     pub changesRowid: sqlite::int64,
     pub tblInfoIdx: ::core::ffi::c_int,
+    /// Cached prepared statement for reuse across xFilter calls.
+    /// On DONE, pChangesStmt is reset and moved here; pChangesStmt is set to null
+    /// so changes_eof sees EOF. On next xFilter, if cache key matches, we move it back.
+    pub cached_pChangesStmt: *mut sqlite::stmt,
+    /// Cache key for pChangesStmt reuse across xFilter calls.
+    pub cached_idx_str: *const c_char,
+    pub cached_meta_use_version: c_int,
+    pub cached_sync_log_version: c_int,
+    pub cached_schema_version: c_int,
 }
 
 extern "C" {
@@ -182,7 +191,7 @@ fn bindgen_test_layout_crsql_Changes_cursor() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::core::mem::size_of::<crsql_Changes_cursor>(),
-        64usize,
+        96usize,
         concat!("Size of: ", stringify!(crsql_Changes_cursor))
     );
     assert_eq!(
@@ -268,6 +277,56 @@ fn bindgen_test_layout_crsql_Changes_cursor() {
             stringify!(crsql_Changes_cursor),
             "::",
             stringify!(tblInfoIdx)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).cached_pChangesStmt) as usize - ptr as usize },
+        64usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_Changes_cursor),
+            "::",
+            stringify!(cached_pChangesStmt)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).cached_idx_str) as usize - ptr as usize },
+        72usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_Changes_cursor),
+            "::",
+            stringify!(cached_idx_str)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).cached_meta_use_version) as usize - ptr as usize },
+        80usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_Changes_cursor),
+            "::",
+            stringify!(cached_meta_use_version)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).cached_sync_log_version) as usize - ptr as usize },
+        84usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_Changes_cursor),
+            "::",
+            stringify!(cached_sync_log_version)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).cached_schema_version) as usize - ptr as usize },
+        88usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_Changes_cursor),
+            "::",
+            stringify!(cached_schema_version)
         )
     );
 }
