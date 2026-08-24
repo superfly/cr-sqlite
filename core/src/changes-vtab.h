@@ -105,6 +105,16 @@ struct crsql_Changes_cursor {
 
   sqlite3_int64 changesRowid;
   int tblInfoIdx;
+
+  /* Cache for pChangesStmt reuse across xFilter calls.
+   * On DONE, pChangesStmt is reset and moved to cached_pChangesStmt;
+   * pChangesStmt is set to null so changes_eof sees EOF.
+   * On next xFilter, if cache key matches, we move it back. */
+  sqlite3_stmt *cached_pChangesStmt;
+  const char *cached_idx_str;
+  int cached_meta_use_version;
+  int cached_sync_log_version;
+  int cached_schema_version;
 };
 
 #endif

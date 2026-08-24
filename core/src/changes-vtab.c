@@ -89,6 +89,8 @@ static int changesCrsrFinalize(crsql_Changes_cursor *crsr) {
   int rc = SQLITE_OK;
   rc += sqlite3_finalize(crsr->pChangesStmt);
   crsr->pChangesStmt = 0;
+  rc += sqlite3_finalize(crsr->cached_pChangesStmt);
+  crsr->cached_pChangesStmt = 0;
   if (crsr->pRowStmt != 0) {
     rc += sqlite3_clear_bindings(crsr->pRowStmt);
     rc += sqlite3_reset(crsr->pRowStmt);

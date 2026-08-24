@@ -36,12 +36,21 @@ fn changes_crsr_finalize(crsr: *mut crsql_Changes_cursor) -> c_int {
             Err(rc) => rc as c_int,
         };
         (*crsr).pChangesStmt = null_mut();
+        // Also finalize the cached statement if any
+        rc += match (*crsr).cached_pChangesStmt.finalize() {
+            Ok(rc) => rc as c_int,
+            Err(rc) => rc as c_int,
+        };
+        (*crsr).cached_pChangesStmt = null_mut();
         let reset_rc = reset_cached_stmt((*crsr).pRowStmt);
         match reset_rc {
             Ok(r) | Err(r) => rc += r as c_int,
         }
         (*crsr).pRowStmt = null_mut();
         (*crsr).dbVersion = crate::consts::MIN_POSSIBLE_DB_VERSION;
+
+        // Clear cached idx_str reference (SQLite owns the memory)
+        (*crsr).cached_idx_str = null_mut();
 
         rc
     }
@@ -262,12 +271,6 @@ unsafe fn changes_filter(
 ) -> Result<ResultCode, ResultCode> {
     let tab = (*cursor).pTab;
     let db = (*tab).db;
-    // This should never happen. pChangesStmt should be finalized
-    // before filter is ever invoked.
-    if !(*cursor).pChangesStmt.is_null() {
-        (*cursor).pChangesStmt.finalize()?;
-        (*cursor).pChangesStmt = null_mut();
-    }
 
     let c_rc = crsql_ensure_table_infos_are_up_to_date(
         db,
@@ -292,15 +295,49 @@ unsafe fn changes_filter(
 
     let metadata_use_version = unsafe { (*(*tab).pExtData).metadataUseVersion };
     let sync_log_version = unsafe { (*(*tab).pExtData).syncLogVersion };
-    let sql = changes_union_query(&tbl_infos, idx_str, metadata_use_version, sync_log_version)?;
+    let schema_version = unsafe { (*(*tab).pExtData).pragmaSchemaVersionForTableInfos };
 
-    let stmt = db.prepare_v2(&sql)?;
-    for (i, arg) in args.iter().enumerate() {
-        stmt.bind_value(i as i32 + 1, *arg)?;
+    // Check if we can reuse the cached prepared statement.
+    // Cache hit: cached stmt exists + same idx_str + same config + same schema version.
+    let cache_hit = !(*cursor).cached_pChangesStmt.is_null()
+        && !(*cursor).cached_idx_str.is_null()
+        && idx_str.as_ptr() == (*cursor).cached_idx_str as *const u8 as *const _
+        && (*cursor).cached_meta_use_version == metadata_use_version
+        && (*cursor).cached_sync_log_version == sync_log_version
+        && (*cursor).cached_schema_version == schema_version;
+
+    if cache_hit {
+        // Reuse cached statement — move it back to pChangesStmt, reset + rebind args
+        let stmt = (*cursor).cached_pChangesStmt;
+        (*cursor).cached_pChangesStmt = null_mut();
+        (*cursor).pChangesStmt = stmt;
+        stmt.clear_bindings()?;
+        for (i, arg) in args.iter().enumerate() {
+            stmt.bind_value(i as i32 + 1, *arg)?;
+        }
+    } else {
+        // Cache miss — finalize old cached statement, build new SQL, prepare
+        if !(*cursor).cached_pChangesStmt.is_null() {
+            (*cursor).cached_pChangesStmt.finalize()?;
+            (*cursor).cached_pChangesStmt = null_mut();
+        }
+        (*cursor).cached_idx_str = null_mut();
+
+        let sql = changes_union_query(&tbl_infos, idx_str, metadata_use_version, sync_log_version)?;
+        let stmt = db.prepare_v2(&sql)?;
+        for (i, arg) in args.iter().enumerate() {
+            stmt.bind_value(i as i32 + 1, *arg)?;
+        }
+        (*cursor).pChangesStmt = stmt.stmt;
+        forget(stmt);
+
+        // Cache the idx_str pointer (owned by SQLite, stable for the prepared stmt's lifetime)
+        (*cursor).cached_idx_str = idx_str.as_ptr() as *const c_char;
+        (*cursor).cached_meta_use_version = metadata_use_version;
+        (*cursor).cached_sync_log_version = sync_log_version;
+        (*cursor).cached_schema_version = schema_version;
     }
-    (*cursor).pChangesStmt = stmt.stmt;
-    // forget the stmt. it will be managed by the vtab
-    forget(stmt);
+
     changes_next(cursor, (*cursor).pTab.cast::<sqlite::vtab>())
 }
 
@@ -340,12 +377,23 @@ unsafe fn changes_next(
 
     let rc = (*cursor).pChangesStmt.step()?;
     if rc == ResultCode::DONE {
-        let c_rc = changes_crsr_finalize(cursor);
-        if c_rc == 0 {
-            return Ok(ResultCode::OK);
-        } else {
-            return Err(ResultCode::ERROR);
+        // Reset the statement and move it to cache for potential reuse on next xFilter.
+        // Set pChangesStmt to null so changes_eof sees EOF.
+        let stmt = (*cursor).pChangesStmt;
+        stmt.reset()?;
+        // Finalize any previously cached statement before caching this one
+        if !(*cursor).cached_pChangesStmt.is_null() {
+            (*cursor).cached_pChangesStmt.finalize()?;
         }
+        (*cursor).cached_pChangesStmt = stmt;
+        (*cursor).pChangesStmt = null_mut();
+        if !(*cursor).pRowStmt.is_null() {
+            let reset_rc = reset_cached_stmt((*cursor).pRowStmt);
+            (*cursor).pRowStmt = null_mut();
+            reset_rc?;
+        }
+        (*cursor).dbVersion = crate::consts::MIN_POSSIBLE_DB_VERSION;
+        return Ok(ResultCode::OK);
     }
 
     // we had a row... we can do the rest
