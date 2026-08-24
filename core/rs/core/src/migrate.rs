@@ -80,42 +80,28 @@ unsafe fn incremental_maintenance(
     let mut total_remaining: c_int = 0;
 
     // Priority 1: V1 table cleanup tasks (from v2&v1 -> v2 transition)
-    let cleanup_v1_sql = "SELECT key FROM crsql_master WHERE key LIKE 'cleanup_v1_tables_%'\0";
-    let cleanup_stmt = db.prepare_v2(cleanup_v1_sql)?;
-    let mut v1_cleanup_tables: Vec<String> = Vec::new();
-    while cleanup_stmt.step()? == ResultCode::ROW {
-        let key = cleanup_stmt.column_text(0)?;
-        if let Some(tbl) = key.strip_prefix("cleanup_v1_tables_") {
-            v1_cleanup_tables.push(String::from(tbl));
-        }
-    }
-    for tbl_name in &v1_cleanup_tables {
-        let remaining = cleanup_v1_tables_chunk(db, tbl_name, chunk_size as i64)?;
-        if remaining == 0 {
-            clear_cleanup_marker(db, &format!("cleanup_v1_tables_{}", tbl_name))?;
-        } else {
-            total_remaining += remaining as c_int;
-        }
-    }
+    process_cleanup_tasks(
+        db,
+        chunk_size,
+        &mut total_remaining,
+        "cleanup_v1_tables",
+        &["__crsql_clock", "__crsql_pks"],
+    )?;
 
     // Priority 2: V2 table cleanup tasks (from v2&v1 -> v1 rollback)
-    let cleanup_v2_sql = "SELECT key FROM crsql_master WHERE key LIKE 'cleanup_v2_tables_%'\0";
-    let cleanup_stmt = db.prepare_v2(cleanup_v2_sql)?;
-    let mut v2_cleanup_tables: Vec<String> = Vec::new();
-    while cleanup_stmt.step()? == ResultCode::ROW {
-        let key = cleanup_stmt.column_text(0)?;
-        if let Some(tbl) = key.strip_prefix("cleanup_v2_tables_") {
-            v2_cleanup_tables.push(String::from(tbl));
-        }
-    }
-    for tbl_name in &v2_cleanup_tables {
-        let remaining = cleanup_v2_tables_chunk(db, tbl_name, chunk_size as i64)?;
-        if remaining == 0 {
-            clear_cleanup_marker(db, &format!("cleanup_v2_tables_{}", tbl_name))?;
-        } else {
-            total_remaining += remaining as c_int;
-        }
-    }
+    process_cleanup_tasks(
+        db,
+        chunk_size,
+        &mut total_remaining,
+        "cleanup_v2_tables",
+        &[
+            consts::V2_COL_MAP_SUFFIX,
+            consts::V2_CLOCK_SUFFIX,
+            consts::V2_PKS_SUFFIX,
+            consts::V2_TOMBSTONES_SUFFIX,
+            consts::V2_TOMBSTONE_PKS_SUFFIX,
+        ],
+    )?;
 
     // Priority 3: V1→V2 migration tasks
     for tbl_info in table_infos.iter() {
@@ -148,87 +134,67 @@ unsafe fn incremental_maintenance(
     Ok(total_remaining)
 }
 
-/// Chunked V1 table cleanup: DELETE rows in batches, then DROP empty tables.
-/// Returns estimated remaining rows across both tables.
-unsafe fn cleanup_v1_tables_chunk(
+/// Process chunked cleanup tasks for tables registered in crsql_master.
+/// Looks up keys matching `{marker_prefix}_*`, deletes rows in batches from each
+/// suffixed table, and drops the tables when empty. Clears the marker when done.
+unsafe fn process_cleanup_tasks(
     db: *mut sqlite3,
-    tbl_name: &str,
-    chunk_size: i64,
-) -> Result<i64, ResultCode> {
-    let escaped = crate::util::escape_ident(tbl_name);
-    db.exec_safe("SAVEPOINT cleanup_v1_chunk")?;
-
-    let result = (|| {
-        // Delete a chunk from __crsql_clock
-        db.exec_safe(&format!(
-            "DELETE FROM \"{escaped}__crsql_clock\" LIMIT {chunk_size}",
-            escaped = escaped,
-            chunk_size = chunk_size,
-        ))?;
-        let clock_remaining = count_rows(db, &format!("\"{escaped}__crsql_clock\"", escaped = escaped))?;
-
-        // Delete a chunk from __crsql_pks
-        db.exec_safe(&format!(
-            "DELETE FROM \"{escaped}__crsql_pks\" LIMIT {chunk_size}",
-            escaped = escaped,
-            chunk_size = chunk_size,
-        ))?;
-        let pks_remaining = count_rows(db, &format!("\"{escaped}__crsql_pks\"", escaped = escaped))?;
-
-        // When both empty, drop the tables
-        if clock_remaining == 0 && pks_remaining == 0 {
-            db.exec_safe(&format!(
-                "DROP TABLE IF EXISTS \"{escaped}__crsql_clock\";\
-                 DROP TABLE IF EXISTS \"{escaped}__crsql_pks\";",
-                escaped = escaped,
-            ))?;
-        }
-
-        Ok(clock_remaining + pks_remaining)
-    })();
-
-    match result {
-        Ok(remaining) => {
-            db.exec_safe("RELEASE cleanup_v1_chunk")?;
-            Ok(remaining)
-        }
-        Err(e) => {
-            db.exec_safe("ROLLBACK")?;
-            Err(e)
+    chunk_size: c_int,
+    total_remaining: &mut c_int,
+    marker_prefix: &str,
+    suffixes: &[&str],
+) -> Result<(), ResultCode> {
+    let like_pattern = format!("{}_%", marker_prefix);
+    let sql = format!(
+        "SELECT key FROM crsql_master WHERE key LIKE '{like_pattern}'\0",
+        like_pattern = like_pattern
+    );
+    let stmt = db.prepare_v2(&sql)?;
+    let strip = format!("{}_", marker_prefix);
+    let mut tables: Vec<String> = Vec::new();
+    while stmt.step()? == ResultCode::ROW {
+        let key = stmt.column_text(0)?;
+        if let Some(tbl) = key.strip_prefix(&strip) {
+            tables.push(String::from(tbl));
         }
     }
+    for tbl_name in &tables {
+        let remaining = cleanup_tables_chunk(db, tbl_name, chunk_size as i64, suffixes)?;
+        if remaining == 0 {
+            crate::util::clear_master_key(db, &format!("{}_{}", marker_prefix, tbl_name))?;
+        } else {
+            *total_remaining += remaining as c_int;
+        }
+    }
+    Ok(())
 }
 
-/// Chunked V2 table cleanup: DELETE rows in batches, then DROP empty tables.
-/// Returns estimated remaining rows across all V2 tables.
-unsafe fn cleanup_v2_tables_chunk(
+/// Chunked table cleanup: DELETE rows in batches from each suffixed table, then
+/// DROP all tables when empty. Returns estimated remaining rows across all tables.
+unsafe fn cleanup_tables_chunk(
     db: *mut sqlite3,
     tbl_name: &str,
     chunk_size: i64,
+    suffixes: &[&str],
 ) -> Result<i64, ResultCode> {
     let escaped = crate::util::escape_ident(tbl_name);
-    db.exec_safe("SAVEPOINT cleanup_v2_chunk")?;
-
-    let v2_suffixes = [
-        consts::V2_COL_MAP_SUFFIX,
-        consts::V2_CLOCK_SUFFIX,
-        consts::V2_PKS_SUFFIX,
-        consts::V2_TOMBSTONES_SUFFIX,
-        consts::V2_TOMBSTONE_PKS_SUFFIX,
-    ];
+    db.exec_safe("SAVEPOINT cleanup_chunk")?;
 
     let result = (|| {
         let mut total_remaining: i64 = 0;
         let mut all_empty = true;
 
-        for suffix in &v2_suffixes {
+        for suffix in suffixes {
             let table_name = format!("\"{escaped}{suffix}\"", escaped = escaped, suffix = suffix);
             db.exec_safe(&format!(
                 "DELETE FROM {table_name} LIMIT {chunk_size}",
                 table_name = table_name,
                 chunk_size = chunk_size,
             ))?;
-            let remaining = count_rows(db, &table_name)?;
+            let count_sql = format!("SELECT count(*) FROM {table_name}\0", table_name = table_name);
+            let count_stmt = db.prepare_v2(&count_sql)?;
+            count_stmt.step()?;
+            let remaining = count_stmt.column_int64(0);
             total_remaining += remaining;
             if remaining > 0 {
                 all_empty = false;
@@ -237,7 +203,7 @@ unsafe fn cleanup_v2_tables_chunk(
 
         // When all empty, drop the tables
         if all_empty {
-            for suffix in &v2_suffixes {
+            for suffix in suffixes {
                 db.exec_safe(&format!(
                     "DROP TABLE IF EXISTS \"{escaped}{suffix}\";",
                     escaped = escaped,
@@ -251,7 +217,7 @@ unsafe fn cleanup_v2_tables_chunk(
 
     match result {
         Ok(remaining) => {
-            db.exec_safe("RELEASE cleanup_v2_chunk")?;
+            db.exec_safe("RELEASE cleanup_chunk")?;
             Ok(remaining)
         }
         Err(e) => {
@@ -259,23 +225,6 @@ unsafe fn cleanup_v2_tables_chunk(
             Err(e)
         }
     }
-}
-
-/// Count rows in a table (quick check).
-unsafe fn count_rows(db: *mut sqlite3, table_name: &str) -> Result<i64, ResultCode> {
-    let sql = format!("SELECT count(*) FROM {table_name}\0", table_name = table_name);
-    let stmt = db.prepare_v2(&sql)?;
-    stmt.step()?;
-    Ok(stmt.column_int64(0))
-}
-
-/// Clear a cleanup marker from crsql_master by exact key.
-unsafe fn clear_cleanup_marker(db: *mut sqlite3, key: &str) -> Result<(), ResultCode> {
-    let sql = "DELETE FROM crsql_master WHERE key = ?\0";
-    let stmt = db.prepare_v2(sql)?;
-    stmt.bind_text(1, key, sqlite_nostd::Destructor::TRANSIENT)?;
-    stmt.step()?;
-    Ok(())
 }
 
 /// Migrate a chunk of V1 PK rows to V2 tables.
@@ -292,17 +241,15 @@ unsafe fn migrate_v1_to_v2_chunk(
     db.exec_safe("SAVEPOINT migration_chunk")?;
 
     // Get progress marker from crsql_master
-    let progress = get_progress_marker(db, &tbl_info.tbl_name, "v1_to_v2_migration")?;
+    let progress_key = format!("migration_v1_to_v2_migration_{}", tbl_info.tbl_name);
+    let progress = crate::util::get_master_value(db, &progress_key)?;
     let start_key = progress.unwrap_or(0);
 
     // One-time count of total rows to migrate (stored for estimate)
-    let total_key = format!("migration_v1_to_v2_total_{}\0", tbl_info.tbl_name);
-    let total: i64 = {
-        let stmt = db.prepare_v2("SELECT value FROM crsql_master WHERE key = ?\0")?;
-        stmt.bind_text(1, &total_key, sqlite_nostd::Destructor::TRANSIENT)?;
-        if stmt.step()? == ResultCode::ROW {
-            stmt.column_int64(0)
-        } else {
+    let total_key = format!("migration_v1_to_v2_total_{}", tbl_info.tbl_name);
+    let total: i64 = match crate::util::get_master_value(db, &total_key)? {
+        Some(v) => v,
+        None => {
             // First call: count total rows
             let count_sql = format!(
                 "SELECT count(*) FROM \"{escaped}__crsql_pks\"\0",
@@ -311,36 +258,20 @@ unsafe fn migrate_v1_to_v2_chunk(
             let count_stmt = db.prepare_v2(&count_sql)?;
             count_stmt.step()?;
             let total = count_stmt.column_int64(0);
-            // Store it
-            let insert_sql = "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, ?)\0";
-            let insert_stmt = db.prepare_v2(insert_sql)?;
-            insert_stmt.bind_text(1, &total_key, sqlite_nostd::Destructor::TRANSIENT)?;
-            insert_stmt.bind_int64(2, total)?;
-            insert_stmt.step()?;
+            crate::util::set_master_value(db, &total_key, total)?;
             total
         }
     };
 
     // Track cumulative processed count for estimate
-    let done_key = format!("migration_v1_to_v2_done_{}\0", tbl_info.tbl_name);
-    let mut cumulative_done: i64 = {
-        let stmt = db.prepare_v2("SELECT value FROM crsql_master WHERE key = ?\0")?;
-        stmt.bind_text(1, &done_key, sqlite_nostd::Destructor::TRANSIENT)?;
-        if stmt.step()? == ResultCode::ROW {
-            stmt.column_int64(0)
-        } else {
-            0
-        }
-    };
+    let done_key = format!("migration_v1_to_v2_done_{}", tbl_info.tbl_name);
+    let mut cumulative_done: i64 = crate::util::get_master_value(db, &done_key)?.unwrap_or(0);
 
     // Process a chunk of rows
-    let pk_cols: Vec<String> = tbl_info.pks.iter().map(|c| format!("\"{}\"", crate::util::escape_ident(&c.name))).collect();
-    let pk_cols_list = pk_cols.join(", ");
-    let pk_cols_no_quotes: Vec<String> = tbl_info.pks.iter().map(|c| format!("p.\"{}\"", crate::util::escape_ident(&c.name))).collect();
-    let pk_cols_p_list = pk_cols_no_quotes.join(", ");
+    let (pk_cols_list, _) = crate::v2_stmts::pk_cols_and_values(&tbl_info.pks);
+    let pk_cols_p_list: String = tbl_info.pks.iter().map(|c| format!("p.\"{}\"", crate::util::escape_ident(&c.name))).collect::<Vec<_>>().join(", ");
     // PK columns qualified with t. (backing table alias) for rowid-key tables
-    let pk_cols_t: Vec<String> = tbl_info.pks.iter().map(|c| format!("t.\"{}\"", crate::util::escape_ident(&c.name))).collect();
-    let pk_cols_t_list = pk_cols_t.join(", ");
+    let pk_cols_t_list: String = tbl_info.pks.iter().map(|c| format!("t.\"{}\"", crate::util::escape_ident(&c.name))).collect::<Vec<_>>().join(", ");
 
     let sentinel = crate::c::INSERT_SENTINEL;
     let col_id_bits = consts::CRSQL_COL_ID_BITS as i64;
@@ -361,146 +292,86 @@ unsafe fn migrate_v1_to_v2_chunk(
     let pk_join_cond = pk_join_conds.join(" AND ");
 
     let result = (|| {
-        // Step 1: Batch insert alive PKs into v2_pks
-        // skip_hash mode: no hashed_pk column. PK value stored directly (non-rowid) or as __crsql_key (rowid).
-        if skip_hash && key_is_rowid {
-            db.exec_safe(&format!(
-                "INSERT OR IGNORE INTO \"{escaped}{v2_pks}\" (__crsql_key, cl)
-                 SELECT t.\"{rowid_alias}\",
-                   CASE WHEN s.col_version IS NULL OR s.col_version % 2 != 0 THEN
-                     CASE WHEN s.col_version IS NULL THEN 1 ELSE s.col_version END
-                   ELSE 1 END
-                 FROM \"{escaped}__crsql_pks\" p
-                 JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
-                   ON p.__crsql_key = chunk.__crsql_key
-                 JOIN \"{escaped}\" t ON {pk_join_cond}
-                 LEFT JOIN \"{escaped}__crsql_clock\" s
-                   ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
-                 WHERE s.col_version IS NULL OR s.col_version % 2 != 0",
-                escaped = escaped,
-                v2_pks = consts::V2_PKS_SUFFIX,
-                rowid_alias = crate::util::escape_ident(&tbl_info.rowid_alias),
-                pk_join_cond = pk_join_cond,
-                sentinel = sentinel,
-                start_key = start_key,
-                chunk_size = chunk_size,
-            ))?;
-        } else if skip_hash && !key_is_rowid {
-            db.exec_safe(&format!(
-                "INSERT OR IGNORE INTO \"{escaped}{v2_pks}\" ({pk_cols}, cl)
-                 SELECT {pk_cols_p},
-                   CASE WHEN s.col_version IS NULL OR s.col_version % 2 != 0 THEN
-                     CASE WHEN s.col_version IS NULL THEN 1 ELSE s.col_version END
-                   ELSE 1 END
-                 FROM \"{escaped}__crsql_pks\" p
-                 JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
-                   ON p.__crsql_key = chunk.__crsql_key
-                 JOIN \"{escaped}\" ON {pk_join_cond}
-                 LEFT JOIN \"{escaped}__crsql_clock\" s
-                   ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
-                 WHERE s.col_version IS NULL OR s.col_version % 2 != 0",
-                escaped = escaped,
-                v2_pks = consts::V2_PKS_SUFFIX,
-                pk_cols = pk_cols_list,
-                pk_cols_p = pk_cols_p_list,
-                pk_join_cond = pk_join_cond,
-                sentinel = sentinel,
-                start_key = start_key,
-                chunk_size = chunk_size,
-            ))?;
+        // Step 1: Batch insert alive PKs into v2_pks.
+        // Build column list and SELECT expressions conditionally based on skip_hash / key_is_rowid.
+        let rowid_alias = crate::util::escape_ident(&tbl_info.rowid_alias);
+        let (pks_cols, pks_select) = if skip_hash && key_is_rowid {
+            (
+                "__crsql_key, cl".to_string(),
+                format!("t.\"{}\"", rowid_alias),
+            )
+        } else if skip_hash {
+            (
+                format!("{}, cl", pk_cols_list),
+                pk_cols_p_list.clone(),
+            )
         } else if key_is_rowid {
-            db.exec_safe(&format!(
-                "INSERT OR IGNORE INTO \"{escaped}{v2_pks}\" (__crsql_key, hashed_pk, cl)
-                 SELECT t.\"{rowid_alias}\", crsql_hash_pk({pk_cols_t}),
-                   CASE WHEN s.col_version IS NULL OR s.col_version % 2 != 0 THEN
-                     CASE WHEN s.col_version IS NULL THEN 1 ELSE s.col_version END
-                   ELSE 1 END
-                 FROM \"{escaped}__crsql_pks\" p
-                 JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
-                   ON p.__crsql_key = chunk.__crsql_key
-                 JOIN \"{escaped}\" t ON {pk_join_cond}
-                 LEFT JOIN \"{escaped}__crsql_clock\" s
-                   ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
-                 WHERE s.col_version IS NULL OR s.col_version % 2 != 0",
-                escaped = escaped,
-                v2_pks = consts::V2_PKS_SUFFIX,
-                rowid_alias = crate::util::escape_ident(&tbl_info.rowid_alias),
-                pk_cols_t = pk_cols_t_list,
-                pk_join_cond = pk_join_cond,
-                sentinel = sentinel,
-                start_key = start_key,
-                chunk_size = chunk_size,
-            ))?;
+            (
+                "__crsql_key, hashed_pk, cl".to_string(),
+                format!("t.\"{}\", crsql_hash_pk({})", rowid_alias, pk_cols_t_list),
+            )
         } else {
-            db.exec_safe(&format!(
-                "INSERT OR IGNORE INTO \"{escaped}{v2_pks}\" ({pk_cols}, hashed_pk, cl)
-                 SELECT {pk_cols_p}, crsql_hash_pk({pk_cols_p}),
-                   CASE WHEN s.col_version IS NULL OR s.col_version % 2 != 0 THEN
-                     CASE WHEN s.col_version IS NULL THEN 1 ELSE s.col_version END
-                   ELSE 1 END
-                 FROM \"{escaped}__crsql_pks\" p
-                 JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
-                   ON p.__crsql_key = chunk.__crsql_key
-                 JOIN \"{escaped}\" ON {pk_join_cond}
-                 LEFT JOIN \"{escaped}__crsql_clock\" s
-                   ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
-                 WHERE s.col_version IS NULL OR s.col_version % 2 != 0",
-                escaped = escaped,
-                v2_pks = consts::V2_PKS_SUFFIX,
-                pk_cols = pk_cols_list,
-                pk_cols_p = pk_cols_p_list,
-                pk_join_cond = pk_join_cond,
-                sentinel = sentinel,
-                start_key = start_key,
-                chunk_size = chunk_size,
-            ))?;
-        }
+            (
+                format!("{}, hashed_pk, cl", pk_cols_list),
+                format!("{}, crsql_hash_pk({})", pk_cols_p_list, pk_cols_p_list),
+            )
+        };
+        // Backing table JOIN: aliased as `t` for rowid-key, un-aliased for non-rowid.
+        let pks_join = if key_is_rowid {
+            format!("JOIN \"{escaped}\" t ON {pk_join_cond}", escaped = escaped, pk_join_cond = pk_join_cond)
+        } else {
+            format!("JOIN \"{escaped}\" ON {pk_join_cond}", escaped = escaped, pk_join_cond = pk_join_cond)
+        };
+        db.exec_safe(&format!(
+            "INSERT OR IGNORE INTO \"{escaped}{v2_pks}\" ({pks_cols})
+             SELECT {pks_select},
+               CASE WHEN s.col_version IS NULL OR s.col_version % 2 != 0 THEN
+                 CASE WHEN s.col_version IS NULL THEN 1 ELSE s.col_version END
+               ELSE 1 END
+             FROM \"{escaped}__crsql_pks\" p
+             JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
+               ON p.__crsql_key = chunk.__crsql_key
+             {pks_join}
+             LEFT JOIN \"{escaped}__crsql_clock\" s
+               ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
+             WHERE s.col_version IS NULL OR s.col_version % 2 != 0",
+            escaped = escaped,
+            v2_pks = consts::V2_PKS_SUFFIX,
+            pks_cols = pks_cols,
+            pks_select = pks_select,
+            pks_join = pks_join,
+            sentinel = sentinel,
+            start_key = start_key,
+            chunk_size = chunk_size,
+        ))?;
 
-        // Step 2: Batch insert tombstones (dead rows)
+        // Step 2: Batch insert tombstones (dead rows).
         // skip_hash: PK column replaces hashed_pk. No v2_tombstone_pks needed.
-        if skip_hash {
-            let pk_col = &tbl_info.skip_hash_pk_col;
-            db.exec_safe(&format!(
-                "INSERT OR REPLACE INTO \"{escaped}{v2_tomb}\"
-                 (site_id, db_version, seq, \"{pk_col}\", cl, ts)
-                 SELECT s.site_id, s.db_version, s.seq, {pk_cols_p}, s.col_version,
-                   CASE WHEN s.ts > 0 THEN s.ts ELSE {ts_fallback} END
-                 FROM \"{escaped}__crsql_pks\" p
-                 JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
-                   ON p.__crsql_key = chunk.__crsql_key
-                 JOIN \"{escaped}__crsql_clock\" s
-                   ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
-                 WHERE s.col_version % 2 = 0",
-                escaped = escaped,
-                v2_tomb = consts::V2_TOMBSTONES_SUFFIX,
-                pk_col = pk_col,
-                pk_cols_p = pk_cols_p_list,
-                sentinel = sentinel,
-                start_key = start_key,
-                chunk_size = chunk_size,
-                ts_fallback = ts_fallback,
-            ))?;
+        let (tomb_pk_col, tomb_pk_select) = if skip_hash {
+            (format!("\"{}\"", tbl_info.skip_hash_pk_col), pk_cols_p_list.clone())
         } else {
-            db.exec_safe(&format!(
-                "INSERT OR REPLACE INTO \"{escaped}{v2_tomb}\"
-                 (site_id, db_version, seq, hashed_pk, cl, ts)
-                 SELECT s.site_id, s.db_version, s.seq, crsql_hash_pk({pk_cols_p}), s.col_version,
-                   CASE WHEN s.ts > 0 THEN s.ts ELSE {ts_fallback} END
-                 FROM \"{escaped}__crsql_pks\" p
-                 JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
-                   ON p.__crsql_key = chunk.__crsql_key
-                 JOIN \"{escaped}__crsql_clock\" s
-                   ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
-                 WHERE s.col_version % 2 = 0",
-                escaped = escaped,
-                v2_tomb = consts::V2_TOMBSTONES_SUFFIX,
-                pk_cols_p = pk_cols_p_list,
-                sentinel = sentinel,
-                start_key = start_key,
-                chunk_size = chunk_size,
-                ts_fallback = ts_fallback,
-            ))?;
-        }
+            ("hashed_pk".to_string(), format!("crsql_hash_pk({})", pk_cols_p_list))
+        };
+        db.exec_safe(&format!(
+            "INSERT OR REPLACE INTO \"{escaped}{v2_tomb}\"
+             (site_id, db_version, seq, {tomb_pk_col}, cl, ts)
+             SELECT s.site_id, s.db_version, s.seq, {tomb_pk_select}, s.col_version,
+               CASE WHEN s.ts > 0 THEN s.ts ELSE {ts_fallback} END
+             FROM \"{escaped}__crsql_pks\" p
+             JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
+               ON p.__crsql_key = chunk.__crsql_key
+             JOIN \"{escaped}__crsql_clock\" s
+               ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
+             WHERE s.col_version % 2 = 0",
+            escaped = escaped,
+            v2_tomb = consts::V2_TOMBSTONES_SUFFIX,
+            tomb_pk_col = tomb_pk_col,
+            tomb_pk_select = tomb_pk_select,
+            sentinel = sentinel,
+            start_key = start_key,
+            chunk_size = chunk_size,
+            ts_fallback = ts_fallback,
+        ))?;
 
         // Step 3: Batch insert tombstone PKs (hash mode only — skip_hash stores PK directly in tombstone)
         if !skip_hash {
@@ -523,113 +394,74 @@ unsafe fn migrate_v1_to_v2_chunk(
             ))?;
         }
 
-        // Step 4: Batch migrate clock entries — INNER JOIN on pks chunk + v2_col_map
-        // For rowid-key tables: cell_key uses t.<rowid_alias> instead of c.key
-        if key_is_rowid {
-            db.exec_safe(&format!(
-                "INSERT OR REPLACE INTO \"{escaped}{v2_clock}\"
-                 (cell_key, col_version, site_id, db_version, seq, ts)
-                 SELECT (t.\"{rowid_alias}\" << {col_id_bits}) | m.col_id,
-                   c.col_version, c.site_id, c.db_version, c.seq,
-                   CASE WHEN c.ts > 0 THEN c.ts ELSE {ts_fallback} END
-                 FROM \"{escaped}__crsql_clock\" c
-                 JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
-                   ON c.key = chunk.__crsql_key
-                 JOIN \"{escaped}__crsql_pks\" p ON c.key = p.__crsql_key
-                 JOIN \"{escaped}\" t ON {pk_join_cond}
-                 JOIN \"{escaped}{v2_col_map}\" m ON c.col_name = m.col_name
-                 WHERE c.col_name != '{sentinel}'",
-                escaped = escaped,
-                v2_clock = consts::V2_CLOCK_SUFFIX,
-                v2_col_map = consts::V2_COL_MAP_SUFFIX,
-                col_id_bits = col_id_bits,
-                rowid_alias = crate::util::escape_ident(&tbl_info.rowid_alias),
-                pk_join_cond = pk_join_cond,
-                sentinel = sentinel,
-                start_key = start_key,
-                chunk_size = chunk_size,
-                ts_fallback = ts_fallback,
-            ))?;
-        } else {
-            // Non-rowid clock migration: JOIN v2_pks to get __crsql_key for cell_key computation.
-            let v2_pks_join = v2_pks_join_clause(tbl_info, &escaped, &pk_cols_p_list);
-            db.exec_safe(&format!(
-                "INSERT OR REPLACE INTO \"{escaped}{v2_clock}\"
-                 (cell_key, col_version, site_id, db_version, seq, ts)
-                 SELECT (vp.__crsql_key << {col_id_bits}) | m.col_id,
-                   c.col_version, c.site_id, c.db_version, c.seq,
-                   CASE WHEN c.ts > 0 THEN c.ts ELSE {ts_fallback} END
-                 FROM \"{escaped}__crsql_clock\" c
-                 JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
-                   ON c.key = chunk.__crsql_key
-                 JOIN \"{escaped}__crsql_pks\" p ON c.key = p.__crsql_key
-                 {v2_pks_join}
-                 JOIN \"{escaped}{v2_col_map}\" m ON c.col_name = m.col_name
-                 WHERE c.col_name != '{sentinel}'",
-                escaped = escaped,
-                v2_clock = consts::V2_CLOCK_SUFFIX,
-                v2_col_map = consts::V2_COL_MAP_SUFFIX,
-                col_id_bits = col_id_bits,
-                v2_pks_join = v2_pks_join,
-                sentinel = sentinel,
-                start_key = start_key,
-                chunk_size = chunk_size,
-                ts_fallback = ts_fallback,
-            ))?;
-        }
-
+        // Step 4: Batch migrate clock entries — INNER JOIN on pks chunk + v2_col_map.
         // Step 4b: For PK-only tables, migrate V1 sentinel clock entries to V2 sentinel at col_id=0.
+        // Both steps share the same structure; only the col_id source, col_version, WHERE, and
+        // the v2_col_map JOIN differ. We build conditionally and run both in a loop.
+        let clock_joins = if key_is_rowid {
+            let base_join = format!(
+                "JOIN \"{escaped}\" t ON {pk_join_cond}",
+                escaped = escaped, pk_join_cond = pk_join_cond
+            );
+            let cell_key_base = format!("(t.\"{}\" << {col_id_bits})", rowid_alias, col_id_bits = col_id_bits);
+            (cell_key_base, base_join)
+        } else {
+            let v2_pks_join = v2_pks_join_clause(tbl_info, &escaped, &pk_cols_p_list);
+            let cell_key_base = format!("(vp.__crsql_key << {col_id_bits})", col_id_bits = col_id_bits);
+            (cell_key_base, v2_pks_join)
+        };
+        let (ref cell_key_base, ref base_join) = clock_joins;
+
+        // Step 4: non-sentinel clock entries (join v2_col_map for col_id)
+        db.exec_safe(&format!(
+            "INSERT OR REPLACE INTO \"{escaped}{v2_clock}\"
+             (cell_key, col_version, site_id, db_version, seq, ts)
+             SELECT {cell_key_base} | m.col_id,
+               c.col_version, c.site_id, c.db_version, c.seq,
+               CASE WHEN c.ts > 0 THEN c.ts ELSE {ts_fallback} END
+             FROM \"{escaped}__crsql_clock\" c
+             JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
+               ON c.key = chunk.__crsql_key
+             JOIN \"{escaped}__crsql_pks\" p ON c.key = p.__crsql_key
+             {base_join}
+             JOIN \"{escaped}{v2_col_map}\" m ON c.col_name = m.col_name
+             WHERE c.col_name != '{sentinel}'",
+            escaped = escaped,
+            v2_clock = consts::V2_CLOCK_SUFFIX,
+            v2_col_map = consts::V2_COL_MAP_SUFFIX,
+            cell_key_base = cell_key_base,
+            base_join = base_join,
+            sentinel = sentinel,
+            start_key = start_key,
+            chunk_size = chunk_size,
+            ts_fallback = ts_fallback,
+        ))?;
+
+        // Step 4b: For PK-only tables, migrate sentinel clock entries at col_id=0.
         // The normal clock migration (step 4) skips sentinels. For PK-only tables, the sentinel
         // is the only clock entry, so we need to migrate it separately.
         if tbl_info.non_pks.is_empty() {
-            if key_is_rowid {
-                db.exec_safe(&format!(
-                    "INSERT OR REPLACE INTO \"{escaped}{v2_clock}\"
-                     (cell_key, col_version, site_id, db_version, seq, ts)
-                     SELECT (t.\"{rowid_alias}\" << {col_id_bits}) | 0,
-                       1, c.site_id, c.db_version, c.seq,
-                       CASE WHEN c.ts > 0 THEN c.ts ELSE {ts_fallback} END
-                     FROM \"{escaped}__crsql_clock\" c
-                     JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
-                       ON c.key = chunk.__crsql_key
-                     JOIN \"{escaped}__crsql_pks\" p ON c.key = p.__crsql_key
-                     JOIN \"{escaped}\" t ON {pk_join_cond}
-                     WHERE c.col_name = '{sentinel}'",
-                    escaped = escaped,
-                    v2_clock = consts::V2_CLOCK_SUFFIX,
-                    col_id_bits = col_id_bits,
-                    rowid_alias = crate::util::escape_ident(&tbl_info.rowid_alias),
-                    pk_join_cond = pk_join_cond,
-                    sentinel = sentinel,
-                    start_key = start_key,
-                    chunk_size = chunk_size,
-                    ts_fallback = ts_fallback,
-                ))?;
-            } else {
-                // Non-rowid PK-only sentinel migration: JOIN v2_pks to get __crsql_key.
-                let v2_pks_join = v2_pks_join_clause(tbl_info, &escaped, &pk_cols_p_list);
-                db.exec_safe(&format!(
-                    "INSERT OR REPLACE INTO \"{escaped}{v2_clock}\"
-                     (cell_key, col_version, site_id, db_version, seq, ts)
-                     SELECT (vp.__crsql_key << {col_id_bits}) | 0,
-                       1, c.site_id, c.db_version, c.seq,
-                       CASE WHEN c.ts > 0 THEN c.ts ELSE {ts_fallback} END
-                     FROM \"{escaped}__crsql_clock\" c
-                     JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
-                       ON c.key = chunk.__crsql_key
-                     JOIN \"{escaped}__crsql_pks\" p ON c.key = p.__crsql_key
-                     {v2_pks_join}
-                     WHERE c.col_name = '{sentinel}'",
-                    escaped = escaped,
-                    v2_clock = consts::V2_CLOCK_SUFFIX,
-                    col_id_bits = col_id_bits,
-                    v2_pks_join = v2_pks_join,
-                    sentinel = sentinel,
-                    start_key = start_key,
-                    chunk_size = chunk_size,
-                    ts_fallback = ts_fallback,
-                ))?;
-            }
+            db.exec_safe(&format!(
+                "INSERT OR REPLACE INTO \"{escaped}{v2_clock}\"
+                 (cell_key, col_version, site_id, db_version, seq, ts)
+                 SELECT {cell_key_base} | 0,
+                   1, c.site_id, c.db_version, c.seq,
+                   CASE WHEN c.ts > 0 THEN c.ts ELSE {ts_fallback} END
+                 FROM \"{escaped}__crsql_clock\" c
+                 JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
+                   ON c.key = chunk.__crsql_key
+                 JOIN \"{escaped}__crsql_pks\" p ON c.key = p.__crsql_key
+                 {base_join}
+                 WHERE c.col_name = '{sentinel}'",
+                escaped = escaped,
+                v2_clock = consts::V2_CLOCK_SUFFIX,
+                cell_key_base = cell_key_base,
+                base_join = base_join,
+                sentinel = sentinel,
+                start_key = start_key,
+                chunk_size = chunk_size,
+                ts_fallback = ts_fallback,
+            ))?;
         }
 
         // Step 5: Get max key from chunk to update cursor.
@@ -654,7 +486,7 @@ unsafe fn migrate_v1_to_v2_chunk(
             Ok(0i64)
         } else {
             // Update progress marker to last key processed
-            set_progress_marker(db, &tbl_info.tbl_name, "v1_to_v2_migration", last_key)?;
+            crate::util::set_master_value(db, &progress_key, last_key)?;
             // Use chunk_size as processed count for estimate (actual may be less due to orphans/IGNORE)
             Ok(chunk_size)
         }
@@ -666,24 +498,15 @@ unsafe fn migrate_v1_to_v2_chunk(
             crate::debug::debug_log(&format!("migrate_chunk: processed={} cumulative_done={} total={}", processed, cumulative_done, total));
             if processed == 0 || cumulative_done >= total {
                 // Migration complete for this table (no more rows, or all rows processed)
-                clear_progress_marker(db, &tbl_info.tbl_name, "v1_to_v2_migration")?;
+                crate::util::clear_master_key(db, &progress_key)?;
                 // Clear total and done markers
-                let clear_sql = "DELETE FROM crsql_master WHERE key = ?\0";
-                let stmt = db.prepare_v2(clear_sql)?;
-                stmt.bind_text(1, &total_key, sqlite_nostd::Destructor::TRANSIENT)?;
-                stmt.step()?;
-                let stmt = db.prepare_v2(clear_sql)?;
-                stmt.bind_text(1, &done_key, sqlite_nostd::Destructor::TRANSIENT)?;
-                stmt.step()?;
+                crate::util::clear_master_key(db, &total_key)?;
+                crate::util::clear_master_key(db, &done_key)?;
                 db.exec_safe("RELEASE migration_chunk")?;
                 Ok(0)
             } else {
                 // Update done marker
-                let update_sql = "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, ?)\0";
-                let stmt = db.prepare_v2(update_sql)?;
-                stmt.bind_text(1, &done_key, sqlite_nostd::Destructor::TRANSIENT)?;
-                stmt.bind_int64(2, cumulative_done)?;
-                stmt.step()?;
+                crate::util::set_master_value(db, &done_key, cumulative_done)?;
                 db.exec_safe("RELEASE migration_chunk")?;
                 let remaining = total - cumulative_done;
                 let remaining = if remaining < 0 { 0i64 } else { remaining };
@@ -701,57 +524,4 @@ unsafe fn migrate_v1_to_v2_chunk(
             Err(e)
         }
     }
-}
-
-/// Get progress marker from crsql_master
-unsafe fn get_progress_marker(
-    db: *mut sqlite3,
-    tbl_name: &str,
-    task_type: &str,
-) -> Result<Option<i64>, ResultCode> {
-    let key = format!("migration_{}_{}", task_type, tbl_name);
-    let sql = format!(
-        "SELECT value FROM crsql_master WHERE key = ?\0"
-    );
-    let stmt = db.prepare_v2(&sql)?;
-    stmt.bind_text(1, &key, sqlite_nostd::Destructor::STATIC)?;
-    if stmt.step()? == ResultCode::ROW {
-        let val = stmt.column_int64(0);
-        return Ok(Some(val));
-    }
-    Ok(None)
-}
-
-/// Set progress marker in crsql_master
-unsafe fn set_progress_marker(
-    db: *mut sqlite3,
-    tbl_name: &str,
-    task_type: &str,
-    marker: i64,
-) -> Result<(), ResultCode> {
-    let key = format!("migration_{}_{}", task_type, tbl_name);
-    let sql = format!(
-        "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, ?)\0"
-    );
-    let stmt = db.prepare_v2(&sql)?;
-    stmt.bind_text(1, &key, sqlite_nostd::Destructor::STATIC)?;
-    stmt.bind_int64(2, marker)?;
-    stmt.step()?;
-    Ok(())
-}
-
-/// Clear progress marker from crsql_master
-unsafe fn clear_progress_marker(
-    db: *mut sqlite3,
-    tbl_name: &str,
-    task_type: &str,
-) -> Result<(), ResultCode> {
-    let key = format!("migration_{}_{}", task_type, tbl_name);
-    let sql = format!(
-        "DELETE FROM crsql_master WHERE key = ?\0"
-    );
-    let stmt = db.prepare_v2(&sql)?;
-    stmt.bind_text(1, &key, sqlite_nostd::Destructor::STATIC)?;
-    stmt.step()?;
-    Ok(())
 }

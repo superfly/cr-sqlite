@@ -44,6 +44,62 @@ fn skip_hash_tombstone_query(
 
 // Metadata version constants are in consts.rs
 
+/// Build the PK expression and main table JOIN clause for V2 feed queries.
+/// Returns (pk_expr, main_join) where:
+/// - pk_expr: the PK column list for crsql_pack_columns (e.g., "mt.col1, mt.col2" or "pk_tbl.col1, ...")
+/// - main_join: the JOIN clause to the base table (needed for cval fetch via CASE)
+///
+/// For rowid-key tables: join on rowid alias = pk_tbl.__crsql_key.
+/// For non-rowid tables: join on PK columns.
+fn build_pk_expr_and_join(table_info: &TableInfo, escaped: &str) -> Result<(String, String), ResultCode> {
+    if table_info.key_is_rowid {
+        let mt_pk_list = crate::util::as_identifier_list(&table_info.pks, Some("mt."))?;
+        let alias = crate::util::escape_ident(&table_info.rowid_alias);
+        Ok((mt_pk_list, format!("JOIN \"{escaped}\" AS mt ON mt.\"{alias}\" = pk_tbl.__crsql_key", alias = alias)))
+    } else {
+        let pk_list = crate::util::as_identifier_list(&table_info.pks, Some("pk_tbl."))?;
+        let pk_join_conds: Vec<String> = table_info.pks.iter().map(|c| {
+            format!("mt.\"{col}\" = pk_tbl.\"{col}\"", col = crate::util::escape_ident(&c.name))
+        }).collect();
+        Ok((pk_list, format!("JOIN \"{escaped}\" AS mt ON {conds}", conds = pk_join_conds.join(" AND "))))
+    }
+}
+
+/// Build the hash-mode tombstone SELECT for V2 feed queries.
+/// Used by v1wire and pkonly query builders (skip_hash uses skip_hash_tombstone_query instead).
+fn hash_tombstone_query(
+    table_info: &TableInfo,
+    escaped: &str,
+    table_name_val: &str,
+    pk_list_tomb: &str,
+    col_vrsn_expr: &str,
+) -> String {
+    format!(
+        "SELECT
+          '{table_name_val}' as tbl,
+          crsql_pack_columns({pk_list_tomb}) as pks,
+          '{delete_sentinel}' as cid,
+          {col_vrsn} as col_vrsn,
+          t.db_version as db_vrsn,
+          site_tbl.site_id as site_id,
+          (1 << 62) | (t.site_id << 46) | (t.db_version << 22) | t.seq as key,
+          t.seq as seq,
+          t.cl as cl,
+          t.ts as ts,
+          NULL as cval
+        FROM \"{escaped}{tomb_suffix}\" AS t
+        JOIN \"{escaped}{tomb_pks_suffix}\" AS tpk_tbl ON t.hashed_pk = tpk_tbl.hashed_pk
+        LEFT JOIN crsql_site_id AS site_tbl ON t.site_id = site_tbl.ordinal",
+        table_name_val = table_name_val,
+        pk_list_tomb = pk_list_tomb,
+        delete_sentinel = crate::c::DELETE_SENTINEL,
+        col_vrsn = col_vrsn_expr,
+        escaped = escaped,
+        tomb_suffix = consts::V2_TOMBSTONES_SUFFIX,
+        tomb_pks_suffix = consts::V2_TOMBSTONE_PKS_SUFFIX,
+    )
+}
+
 fn crsql_changes_query_for_table(table_info: &TableInfo) -> Result<String, ResultCode> {
     if table_info.pks.is_empty() {
         return Err(ResultCode::ABORT);
@@ -85,26 +141,12 @@ fn crsql_changes_query_for_table_v2_v1wire(table_info: &TableInfo) -> Result<Str
         return Err(ResultCode::ABORT);
     }
 
-    let pk_list = crate::util::as_identifier_list(&table_info.pks, Some("pk_tbl."))?;
     let pk_list_tomb = crate::util::as_identifier_list(&table_info.pks, Some("tpk_tbl."))?;
     let escaped = crate::util::escape_ident(&table_info.tbl_name);
     let table_name_val = crate::util::escape_ident_as_value(&table_info.tbl_name);
     let col_id_bits = consts::CRSQL_COL_ID_BITS;
 
-    // Always JOIN main table — needed to fetch column values via CASE (cval).
-    // For rowid-key tables: join on rowid alias = pk_tbl.__crsql_key.
-    // For non-rowid tables: join on PK columns.
-    let (pk_expr, main_join) = if table_info.key_is_rowid {
-        let mt_pk_list = crate::util::as_identifier_list(&table_info.pks, Some("mt."))?;
-        let alias = crate::util::escape_ident(&table_info.rowid_alias);
-        (mt_pk_list, format!("JOIN \"{escaped}\" AS mt ON mt.\"{alias}\" = pk_tbl.__crsql_key", alias = alias))
-    } else {
-        let pk_join_conds: Vec<String> = table_info.pks.iter().map(|c| {
-            format!("mt.\"{col}\" = pk_tbl.\"{col}\"", col = crate::util::escape_ident(&c.name))
-        }).collect();
-        (pk_list.clone(), format!("JOIN \"{escaped}\" AS mt ON {conds}", escaped = escaped, conds = pk_join_conds.join(" AND ")))
-    };
-
+    let (pk_expr, main_join) = build_pk_expr_and_join(table_info, &escaped)?;
     let col_val_case = build_col_val_case(table_info)?;
 
     // Part 1: Cell changes from v2_clock joined with v2_pks and v2_col_map
@@ -145,29 +187,7 @@ fn crsql_changes_query_for_table_v2_v1wire(table_info: &TableInfo) -> Result<Str
     let tombstone_rows = if table_info.skip_hash {
         skip_hash_tombstone_query(table_info, &escaped, &table_name_val, "t.cl")
     } else {
-        format!(
-            "SELECT
-              '{table_name_val}' as tbl,
-              crsql_pack_columns({pk_list_tomb}) as pks,
-              '{delete_sentinel}' as cid,
-              t.cl as col_vrsn,
-              t.db_version as db_vrsn,
-              site_tbl.site_id as site_id,
-              (1 << 62) | (t.site_id << 46) | (t.db_version << 22) | t.seq as key,
-              t.seq as seq,
-              t.cl as cl,
-              t.ts as ts,
-              NULL as cval
-            FROM \"{escaped}{tomb_suffix}\" AS t
-            JOIN \"{escaped}{tomb_pks_suffix}\" AS tpk_tbl ON t.hashed_pk = tpk_tbl.hashed_pk
-            LEFT JOIN crsql_site_id AS site_tbl ON t.site_id = site_tbl.ordinal",
-            table_name_val = table_name_val,
-            pk_list_tomb = pk_list_tomb,
-            delete_sentinel = crate::c::DELETE_SENTINEL,
-            escaped = escaped,
-            tomb_suffix = consts::V2_TOMBSTONES_SUFFIX,
-            tomb_pks_suffix = consts::V2_TOMBSTONE_PKS_SUFFIX,
-        )
+        hash_tombstone_query(table_info, &escaped, &table_name_val, &pk_list_tomb, "t.cl")
     };
 
     Ok(format!(
@@ -216,25 +236,12 @@ fn crsql_changes_query_for_table_v2_v2wire(table_info: &TableInfo) -> Result<Str
         return Err(ResultCode::ABORT);
     }
 
-    let pk_list = crate::util::as_identifier_list(&table_info.pks, Some("pk_tbl."))?;
     let escaped = crate::util::escape_ident(&table_info.tbl_name);
     let table_name_val = crate::util::escape_ident_as_value(&table_info.tbl_name);
     let col_id_bits = consts::CRSQL_COL_ID_BITS;
     let col_val_case = build_col_val_case(table_info)?;
 
-    // Always JOIN main table for packed query — needed to fetch column values via CASE.
-    // For rowid-key tables: join on rowid alias = pk_tbl.__crsql_key.
-    // For non-rowid tables: join on PK columns.
-    let (pk_expr, main_join) = if table_info.key_is_rowid {
-        let mt_pk_list = crate::util::as_identifier_list(&table_info.pks, Some("mt."))?;
-        let alias = crate::util::escape_ident(&table_info.rowid_alias);
-        (mt_pk_list, format!("JOIN \"{escaped}\" AS mt ON mt.\"{alias}\" = pk_tbl.__crsql_key", alias = alias))
-    } else {
-        let pk_join_conds: Vec<String> = table_info.pks.iter().map(|c| {
-            format!("mt.\"{col}\" = pk_tbl.\"{col}\"", col = crate::util::escape_ident(&c.name))
-        }).collect();
-        (pk_list.clone(), format!("JOIN \"{escaped}\" AS mt ON {conds}", escaped = escaped, conds = pk_join_conds.join(" AND ")))
-    };
+    let (pk_expr, main_join) = build_pk_expr_and_join(table_info, &escaped)?;
 
     // Part 1: Packed cell changes — GROUP BY (key expression, db_version, site_id)
     // No subquery needed with SQLite 3.44+ — ORDER BY inside aggregates ensures alignment.
@@ -318,19 +325,7 @@ fn crsql_changes_query_for_table_v2_pkonly(table_info: &TableInfo) -> Result<Str
     let table_name_val = crate::util::escape_ident_as_value(&table_info.tbl_name);
     let col_id_bits = consts::CRSQL_COL_ID_BITS;
 
-    // For rowid-key tables: PK columns come from main table (v2_pks only has __crsql_key).
-    // For non-rowid tables: PK columns come from v2_pks directly.
-    let (pk_expr, main_join) = if table_info.key_is_rowid {
-        let mt_pk_list = crate::util::as_identifier_list(&table_info.pks, Some("mt."))?;
-        let alias = crate::util::escape_ident(&table_info.rowid_alias);
-        (mt_pk_list, format!("JOIN \"{escaped}\" AS mt ON mt.\"{alias}\" = pk_tbl.__crsql_key", alias = alias))
-    } else {
-        let pk_list = crate::util::as_identifier_list(&table_info.pks, Some("pk_tbl."))?;
-        let pk_join_conds: Vec<String> = table_info.pks.iter().map(|c| {
-            format!("mt.\"{col}\" = pk_tbl.\"{col}\"", col = crate::util::escape_ident(&c.name))
-        }).collect();
-        (pk_list, format!("JOIN \"{escaped}\" AS mt ON {conds}", escaped = escaped, conds = pk_join_conds.join(" AND ")))
-    };
+    let (pk_expr, main_join) = build_pk_expr_and_join(table_info, &escaped)?;
 
     // Sentinel clock entries at col_id=0
     let cell_changes = format!(
@@ -364,29 +359,7 @@ fn crsql_changes_query_for_table_v2_pkonly(table_info: &TableInfo) -> Result<Str
     let tombstone_rows = if table_info.skip_hash {
         skip_hash_tombstone_query(table_info, &escaped, &table_name_val, "t.cl")
     } else {
-        format!(
-            "SELECT
-              '{table_name_val}' as tbl,
-              crsql_pack_columns({pk_list_tomb}) as pks,
-              '{delete_sentinel}' as cid,
-              t.cl as col_vrsn,
-              t.db_version as db_vrsn,
-              site_tbl.site_id as site_id,
-              (1 << 62) | (t.site_id << 46) | (t.db_version << 22) | t.seq as key,
-              t.seq as seq,
-              t.cl as cl,
-              t.ts as ts,
-              NULL as cval
-            FROM \"{escaped}{tomb_suffix}\" AS t
-            JOIN \"{escaped}{tomb_pks_suffix}\" AS tpk_tbl ON t.hashed_pk = tpk_tbl.hashed_pk
-            LEFT JOIN crsql_site_id AS site_tbl ON t.site_id = site_tbl.ordinal",
-            table_name_val = table_name_val,
-            pk_list_tomb = pk_list_tomb,
-            delete_sentinel = crate::c::DELETE_SENTINEL,
-            escaped = escaped,
-            tomb_suffix = consts::V2_TOMBSTONES_SUFFIX,
-            tomb_pks_suffix = consts::V2_TOMBSTONE_PKS_SUFFIX,
-        )
+        hash_tombstone_query(table_info, &escaped, &table_name_val, &pk_list_tomb, "t.cl")
     };
 
     Ok(format!(

@@ -39,10 +39,7 @@ pub fn backfill_table_v2(
     }
 
     let escaped = crate::util::escape_ident(table);
-    let pk_cols_list = pk_cols.iter()
-        .map(|f| format!("\"{}\"", crate::util::escape_ident(&f.name)))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let (pk_cols_list, pk_values_list) = crate::v2_stmts::pk_cols_and_values(pk_cols);
 
     // Find rows in main table not yet in v2_pks
     // For rowid-key tables, compare rowid alias vs __crsql_key, but also select PK cols for hashing
@@ -66,41 +63,10 @@ pub fn backfill_table_v2(
     };
     let read_stmt = db.prepare_v2(&sql)?;
 
-    // Prepare insert into v2_pks
-    let insert_pks_sql = if skip_hash && key_is_rowid {
-        format!(
-            "INSERT INTO \"{escaped}{suffix}\" (__crsql_key, cl) VALUES (?, 1) RETURNING __crsql_key",
-            escaped = escaped,
-            suffix = consts::V2_PKS_SUFFIX,
-        )
-    } else if skip_hash && !key_is_rowid {
-        // skip_hash, non-rowid: store PK column, no hashed_pk
-        format!(
-            "INSERT INTO \"{escaped}{suffix}\" ({pk_cols}, cl) VALUES ({pk_values}, 1) RETURNING __crsql_key",
-            escaped = escaped,
-            suffix = consts::V2_PKS_SUFFIX,
-            pk_cols = pk_cols_list,
-            pk_values = pk_cols.iter().map(|_| "?").collect::<Vec<_>>().join(", "),
-        )
-    } else if key_is_rowid {
-        format!(
-            "INSERT INTO \"{escaped}{suffix}\" (__crsql_key, hashed_pk, cl) VALUES (?, ?, 1) RETURNING __crsql_key",
-            escaped = escaped,
-            suffix = consts::V2_PKS_SUFFIX,
-        )
-    } else {
-        let pk_values = pk_cols.iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "INSERT INTO \"{escaped}{suffix}\" ({pk_cols}, hashed_pk, cl) VALUES ({pk_values}, ?, 1) RETURNING __crsql_key",
-            escaped = escaped,
-            suffix = consts::V2_PKS_SUFFIX,
-            pk_cols = pk_cols_list,
-            pk_values = pk_values,
-        )
-    };
+    // Prepare insert into v2_pks — reuse the shared SQL builder from v2_stmts
+    let insert_pks_sql = crate::v2_stmts::v2_pks_insert_sql(
+        skip_hash, key_is_rowid, &escaped, &pk_cols_list, &pk_values_list, "1",
+    );
     let insert_pks_stmt = db.prepare_v2(&insert_pks_sql)?;
 
     // Prepare insert into v2_clock
