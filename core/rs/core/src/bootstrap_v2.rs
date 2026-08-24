@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use sqlite_nostd as sqlite;
 use sqlite_nostd::{Connection, ResultCode};
 
-use crate::tableinfo::TableInfo;
+use crate::tableinfo::{ColumnInfo, TableInfo};
 use crate::consts;
 
 /// Create all V2 metadata tables for a given CRR table.
@@ -126,14 +126,7 @@ pub fn create_v2_tables(
             suffix = consts::V2_PKS_SUFFIX,
         ))?;
     } else {
-        let mut pk_cols_sql = String::new();
-        for (i, pk) in table_info.pks.iter().enumerate() {
-            if i > 0 { pk_cols_sql.push_str(", "); }
-            pk_cols_sql.push_str(&format!(
-                "\"{}\" ANY NOT NULL",
-                crate::util::escape_ident(&pk.name)
-            ));
-        }
+        let pk_cols_sql = build_pk_cols_sql(&table_info.pks);
 
         let create_sql = format!(
             "CREATE TABLE IF NOT EXISTS \"{escaped}{suffix}\" (
@@ -218,14 +211,7 @@ pub fn create_v2_tables(
     // 5. Tombstone PKs (V1 compat) — NOT created for skip_hash tables.
     // The PK value is stored directly in v2_tombstones, so no hash→PK mapping is needed.
     if !table_info.skip_hash {
-        let mut tombstone_pk_cols_sql = String::new();
-        for (i, pk) in table_info.pks.iter().enumerate() {
-            if i > 0 { tombstone_pk_cols_sql.push_str(", "); }
-            tombstone_pk_cols_sql.push_str(&format!(
-                "\"{}\" ANY NOT NULL",
-                crate::util::escape_ident(&pk.name)
-            ));
-        }
+        let tombstone_pk_cols_sql = build_pk_cols_sql(&table_info.pks);
 
         let tombstone_pks_sql = format!(
             "CREATE TABLE IF NOT EXISTS \"{escaped}{suffix}\" (
@@ -303,31 +289,20 @@ pub fn drop_v2_tables(
 ) -> Result<ResultCode, ResultCode> {
     let escaped = crate::util::escape_ident(table);
 
-    db.exec_safe(&format!(
-        "DROP TABLE IF EXISTS \"{escaped}{suffix}\"",
-        escaped = escaped,
-        suffix = consts::V2_COL_MAP_SUFFIX
-    ))?;
-    db.exec_safe(&format!(
-        "DROP TABLE IF EXISTS \"{escaped}{suffix}\"",
-        escaped = escaped,
-        suffix = consts::V2_CLOCK_SUFFIX
-    ))?;
-    db.exec_safe(&format!(
-        "DROP TABLE IF EXISTS \"{escaped}{suffix}\"",
-        escaped = escaped,
-        suffix = consts::V2_PKS_SUFFIX
-    ))?;
-    db.exec_safe(&format!(
-        "DROP TABLE IF EXISTS \"{escaped}{suffix}\"",
-        escaped = escaped,
-        suffix = consts::V2_TOMBSTONES_SUFFIX
-    ))?;
-    db.exec_safe(&format!(
-        "DROP TABLE IF EXISTS \"{escaped}{suffix}\"",
-        escaped = escaped,
-        suffix = consts::V2_TOMBSTONE_PKS_SUFFIX
-    ))?;
+    let suffixes = [
+        consts::V2_COL_MAP_SUFFIX,
+        consts::V2_CLOCK_SUFFIX,
+        consts::V2_PKS_SUFFIX,
+        consts::V2_TOMBSTONES_SUFFIX,
+        consts::V2_TOMBSTONE_PKS_SUFFIX,
+    ];
+    for suffix in suffixes {
+        db.exec_safe(&format!(
+            "DROP TABLE IF EXISTS \"{escaped}{suffix}\"",
+            escaped = escaped,
+            suffix = suffix
+        ))?;
+    }
 
     // Clean up PK info from crsql_master
     let pk_key = format!("v2_pks_{}", table);
@@ -350,4 +325,18 @@ pub fn has_v2_tables(
     ))?;
     let rc = stmt.step()?;
     Ok(rc == ResultCode::ROW)
+}
+
+/// Build a comma-separated list of `"col" ANY NOT NULL` column definitions
+/// for the given PK columns. Used when creating v2_pks and v2_tombstone_pks tables.
+fn build_pk_cols_sql(pks: &[ColumnInfo]) -> String {
+    let mut sql = String::new();
+    for (i, pk) in pks.iter().enumerate() {
+        if i > 0 { sql.push_str(", "); }
+        sql.push_str(&format!(
+            "\"{}\" ANY NOT NULL",
+            crate::util::escape_ident(&pk.name)
+        ));
+    }
+    sql
 }

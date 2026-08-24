@@ -1025,8 +1025,7 @@ unsafe fn v2_ensure_alive_row_at_cl(
         // seq=0 for placeholders; the packed column updates will overwrite specific entries.
         let col_id_bits = consts::CRSQL_COL_ID_BITS as i64;
         let base = new_key << col_id_bits;
-        let merge_equal = unsafe { (*ext_data).mergeEqualValues };
-        let mut v2_ref = tbl_info.get_v2_stmts(db, merge_equal)?;
+        let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
         let v2 = v2_ref.as_mut().unwrap();
         let mut clock_stmt = v2.clock_zero_fill();
         clock_stmt.bind_int64(1, base)?;
@@ -1059,8 +1058,7 @@ unsafe fn v2_lookup_key_and_cl(
     unpacked_pks: &[ColumnValue],
     ext_data: *mut crsql_ExtData,
 ) -> Result<(Option<i64>, i64), ResultCode> {
-    let merge_equal = unsafe { (*ext_data).mergeEqualValues };
-    let mut v2_ref = tbl_info.get_v2_stmts(db, merge_equal)?;
+    let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
     let v2 = v2_ref.as_mut().unwrap();
     let mut stmt = v2.lookup_row_state();
     if tbl_info.skip_hash {
@@ -1131,8 +1129,7 @@ pub unsafe fn v1_to_v2_hydrate_row(
     };
 
     // 2. Look up V1 CL from sentinel clock entry
-    let merge_equal = unsafe { (*ext_data).mergeEqualValues };
-    let mut v2_ref = tbl_info.get_v2_stmts(db, merge_equal)?;
+    let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
     let v2 = v2_ref.as_mut().unwrap();
 
     let (v1_cl, is_dead) = {
@@ -1173,9 +1170,9 @@ pub unsafe fn v1_to_v2_hydrate_row(
             }
         };
 
-        // Insert tombstone (site_id is a param here, unlike local writes which use 0)
+        // Insert tombstone (site_id is a bind param — 0 for local writes, actual site for hydration)
         {
-            let mut ins = v2.tomb_insert_site();
+            let mut ins = v2.tomb_insert();
             ins.bind_int64(1, site_id)?;
             ins.bind_int64(2, db_version)?;
             ins.bind_int64(3, seq)?;
@@ -1210,9 +1207,9 @@ pub unsafe fn v1_to_v2_hydrate_row(
                 stmt.column_int64(0)
             };
 
-            // Insert into v2_pks (no RETURNING — we already have the rowid)
+            // Insert into v2_pks with RETURNING (unified path for rowid and non-rowid)
             {
-                let mut ins = v2.pks_insert_rowid();
+                let mut ins = v2.pks_insert();
                 if tbl_info.skip_hash {
                     ins.bind_int64(1, rowid_val)?;
                     ins.bind_int64(2, v1_cl)?;
@@ -1222,11 +1219,11 @@ pub unsafe fn v1_to_v2_hydrate_row(
                     ins.bind_int64(3, v1_cl)?;
                 }
                 ins.step()?;
+                ins.column_int64(0)
             }
-            rowid_val
         } else {
             // Non-rowid table: insert PK columns into v2_pks with RETURNING
-            let mut ins = v2.pks_insert_cl_param();
+            let mut ins = v2.pks_insert();
             bind_package_to_stmt(ins.stmt, unpacked_pks, 0)?;
             let next_slot = if tbl_info.skip_hash {
                 unpacked_pks.len() as i32 + 1
@@ -1274,8 +1271,7 @@ unsafe fn v2_insert_base_row(
     tbl_info: &TableInfo,
     unpacked_pks: &Vec<ColumnValue>,
 ) -> Result<(), ResultCode> {
-    let merge_equal = unsafe { (*ext_data).mergeEqualValues };
-    let mut v2_ref = tbl_info.get_v2_stmts(db, merge_equal)?;
+    let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
     let v2 = v2_ref.as_mut().unwrap();
     (*ext_data).pSetSyncBitStmt.step()?;
     (*ext_data).pSetSyncBitStmt.reset()?;
@@ -1304,14 +1300,13 @@ unsafe fn v2_insert_pk_row(
     // First create the row in the base table
     v2_insert_base_row(db, ext_data, escaped, tbl_info, unpacked_pks)?;
 
-    let merge_equal = unsafe { (*ext_data).mergeEqualValues };
-    let mut v2_ref = tbl_info.get_v2_stmts(db, merge_equal)?;
+    let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
     let v2 = v2_ref.as_mut().unwrap();
 
-    // Then insert the PK row into v2_pks
+    // Then insert the PK row into v2_pks (unified path with RETURNING)
     if tbl_info.key_is_rowid {
         let rowid = sqlite::last_insert_rowid(db);
-        let mut ins = v2.pks_insert_rowid();
+        let mut ins = v2.pks_insert();
         if tbl_info.skip_hash {
             ins.bind_int64(1, rowid)?;
             ins.bind_int64(2, cl)?;
@@ -1321,10 +1316,10 @@ unsafe fn v2_insert_pk_row(
             ins.bind_int64(3, cl)?;
         }
         ins.step()?;
-        Ok(rowid)
+        Ok(ins.column_int64(0))
     } else {
-        // Non-rowid: use pks_insert_cl_param (has RETURNING)
-        let mut ins = v2.pks_insert_cl_param();
+        // Non-rowid: use pks_insert (has RETURNING)
+        let mut ins = v2.pks_insert();
         bind_package_to_stmt(ins.stmt, unpacked_pks, 0)?;
         let next_slot = if tbl_info.skip_hash {
             unpacked_pks.len() as i32 + 1
@@ -1345,8 +1340,7 @@ unsafe fn v2_get_col_id(
     ext_data: *mut crsql_ExtData,
     col_name: &str,
 ) -> Result<Option<i64>, ResultCode> {
-    let merge_equal = unsafe { (*ext_data).mergeEqualValues };
-    let mut v2_ref = tbl_info.get_v2_stmts(db, merge_equal)?;
+    let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
     let v2 = v2_ref.as_mut().unwrap();
     let mut stmt = v2.col_id_lookup();
     stmt.bind_text(1, col_name, sqlite::Destructor::STATIC)?;
@@ -1417,7 +1411,7 @@ unsafe fn v2_merge_insert_tombstone(
         get_or_set_site_ordinal(ext_data, insert_site_id)?
     };
 
-    let mut v2_ref = tbl_info.get_v2_stmts(db, merge_equal)?;
+    let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
     let v2 = v2_ref.as_mut().unwrap();
 
     // Upsert tombstone with conflict resolution (merge_equal baked into SQL at prep time)
@@ -1555,8 +1549,7 @@ unsafe fn v2_nuke_local_row(
 ) -> Result<(), ResultCode> {
     let col_id_bits = consts::CRSQL_COL_ID_BITS as i64;
     let col_id_mask = consts::CRSQL_COL_ID_MASK as i64;
-    let merge_equal = unsafe { (*ext_data).mergeEqualValues };
-    let mut v2_ref = tbl_info.get_v2_stmts(db, merge_equal)?;
+    let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
     let v2 = v2_ref.as_mut().unwrap();
 
     // Delete clocks for this key (range scan on INTEGER PRIMARY KEY index)
@@ -1604,8 +1597,7 @@ unsafe fn v2_nuke_tombstone(
     unpacked_pks: &[ColumnValue],
     ext_data: *mut crsql_ExtData,
 ) -> Result<(), ResultCode> {
-    let merge_equal = unsafe { (*ext_data).mergeEqualValues };
-    let mut v2_ref = tbl_info.get_v2_stmts(db, merge_equal)?;
+    let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
     let v2 = v2_ref.as_mut().unwrap();
 
     // Delete from v2_tombstones
@@ -1643,8 +1635,7 @@ unsafe fn v2_lookup_pks_for_v1_copy(
     if tbl_info.skip_hash {
         return Ok(Vec::new());
     }
-    let merge_equal = unsafe { (*ext_data).mergeEqualValues };
-    let mut v2_ref = tbl_info.get_v2_stmts(db, merge_equal)?;
+    let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
     let v2 = v2_ref.as_mut().unwrap();
 
     // Try v2_tombstone_pks first (row might have been deleted)
@@ -1714,8 +1705,7 @@ unsafe fn v2_to_v1_mirror_metadata(
     // 3. Get or create V1 PK entry
     let v1_key = tbl_info.get_or_create_key(db, pks)?;
 
-    let merge_equal = unsafe { (*ext_data).mergeEqualValues };
-    let mut v2_ref = tbl_info.get_v2_stmts(db, merge_equal)?;
+    let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
     let v2 = v2_ref.as_mut().unwrap();
 
     // 4. Delete all existing V1 clock entries and sentinels for this v1 key
@@ -1814,7 +1804,7 @@ unsafe fn v2_apply_value_change_colval(
     let subquery_param_count = if tbl_info.key_is_rowid { 1 } else { pk_len };
 
     // Get cached per-column clock merge upsert (lazily prepared on first use for this column)
-    let mut v2_ref = tbl_info.get_v2_stmts(db, merge_equal)?;
+    let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
     let v2 = v2_ref.as_mut().unwrap();
     let mut stmt = v2.clock_merge_upsert(db, tbl_info, escaped, col_name)?;
 

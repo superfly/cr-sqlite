@@ -15,17 +15,6 @@ pub fn hash_pk_values(values: &[*mut sqlite::value]) -> Result<Vec<u8>, ResultCo
     Ok(bytes[..crate::consts::PK_HASH_SIZE].to_vec())
 }
 
-/// Hash PK values from unpacked ColumnValue list.
-/// Packs the values and hashes with XXH128, truncated to PK_HASH_SIZE bytes.
-pub fn hash_pk_values_from_column_values(
-    values: &[crate::pack_columns::ColumnValue],
-) -> Result<Vec<u8>, ResultCode> {
-    let packed = crate::pack_columns::pack_column_values(values)?;
-    let hash = xxhash_rust::xxh3::xxh3_128(&packed);
-    let bytes = hash.to_be_bytes();
-    Ok(bytes[..crate::consts::PK_HASH_SIZE].to_vec())
-}
-
 /// Hash a pre-packed PK blob directly (e.g., from crsql_changes pk column).
 /// Avoids the unpack→repack cycle when the packed blob is already available.
 pub fn hash_packed_blob(packed: &[u8]) -> Vec<u8> {

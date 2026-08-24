@@ -9,7 +9,7 @@ use sqlite_nostd as sqlite;
 use sqlite_nostd::{sqlite3, Connection, ManagedStmt, ResultCode};
 
 use crate::consts;
-use crate::tableinfo::TableInfo;
+use crate::tableinfo::{ColumnInfo, TableInfo};
 
 /// RAII guard that resets + clears bindings on drop.
 /// Prevents "forgot to reset" bugs — the compiler does it for you.
@@ -57,12 +57,8 @@ pub struct V2Stmts {
     lookup_row_state: ManagedStmt,
 
     // --- v2_pks mutations ---
-    /// INSERT ... cl=1 (truly new row, local writes)
-    pks_insert_cl1: ManagedStmt,
-    /// INSERT ... cl=? (resurrection, local writes)
-    pks_insert_cl_param: ManagedStmt,
-    /// INSERT ... cl=? (no RETURNING — for hydration/merge rowid path)
-    pks_insert_rowid: ManagedStmt,
+    /// INSERT ... cl=? with RETURNING __crsql_key (used for new rows, resurrections, hydration, merge)
+    pks_insert: ManagedStmt,
     /// UPDATE v2_pks SET cl = ? WHERE __crsql_key = ?
     pks_update_cl: ManagedStmt,
     /// DELETE FROM v2_pks WHERE __crsql_key = ?
@@ -71,10 +67,8 @@ pub struct V2Stmts {
     // --- v2_tombstones mutations ---
     /// DELETE FROM v2_tombstones WHERE ... (local writes)
     tomb_delete: ManagedStmt,
-    /// INSERT OR REPLACE INTO v2_tombstones ... (local writes, site_id=0)
+    /// INSERT OR REPLACE INTO v2_tombstones ... (site_id is always a bind param)
     tomb_insert: ManagedStmt,
-    /// INSERT OR REPLACE INTO v2_tombstones ... (hydration, site_id param)
-    tomb_insert_site: ManagedStmt,
     /// Upsert with ON CONFLICT + merge_equal WHERE clause (merge path)
     tomb_upsert: ManagedStmt,
     /// hash mode only
@@ -146,7 +140,7 @@ impl V2Stmts {
     /// All SQL lives here — one place to read, one place to fail.
     pub fn prepare(db: *mut sqlite3, tbl_info: &TableInfo, merge_equal: i32) -> Result<Self, ResultCode> {
         let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
-        let (pk_cols, pk_values) = pk_cols_and_values(tbl_info);
+        let (pk_cols, pk_values) = pk_cols_and_values(&tbl_info.pks);
         let (where_tomb, _use_hash_tomb) = v2_pk_lookup_where(tbl_info, false);
         let pk_col_name = if tbl_info.skip_hash { &tbl_info.skip_hash_pk_col } else { "hashed_pk" };
 
@@ -192,26 +186,9 @@ impl V2Stmts {
 
         // --- v2_pks mutations ---
 
-        let pks_insert_cl1 = db.prepare_v3(
-            &v2_pks_insert_sql(tbl_info, &escaped, &pk_cols, &pk_values, "1"),
+        let pks_insert = db.prepare_v3(
+            &v2_pks_insert_sql(tbl_info.skip_hash, tbl_info.key_is_rowid, &escaped, &pk_cols, &pk_values, "?"),
             sqlite::PREPARE_PERSISTENT)?;
-
-        let pks_insert_cl_param = db.prepare_v3(
-            &v2_pks_insert_sql(tbl_info, &escaped, &pk_cols, &pk_values, "?"),
-            sqlite::PREPARE_PERSISTENT)?;
-
-        // For rowid-key tables: INSERT (__crsql_key, [hashed_pk,] cl) without RETURNING
-        let pks_insert_rowid = if tbl_info.skip_hash {
-            db.prepare_v3(&format!(
-                "INSERT INTO \"{escaped}{}\" (__crsql_key, cl) VALUES (?, ?)",
-                consts::V2_PKS_SUFFIX
-            ), sqlite::PREPARE_PERSISTENT)?
-        } else {
-            db.prepare_v3(&format!(
-                "INSERT INTO \"{escaped}{}\" (__crsql_key, hashed_pk, cl) VALUES (?, ?, ?)",
-                consts::V2_PKS_SUFFIX
-            ), sqlite::PREPARE_PERSISTENT)?
-        };
 
         let pks_update_cl = db.prepare_v3(&format!(
             "UPDATE \"{escaped}{}\" SET cl = ? WHERE __crsql_key = ?",
@@ -230,16 +207,8 @@ impl V2Stmts {
             consts::V2_TOMBSTONES_SUFFIX
         ), sqlite::PREPARE_PERSISTENT)?;
 
-        // Local writes: site_id is always 0 (local)
+        // site_id is always a bind param (0 for local writes, actual site for hydration/merge)
         let tomb_insert = db.prepare_v3(&format!(
-            "INSERT OR REPLACE INTO \"{escaped}{}\" (site_id, db_version, seq, \"{pk_col}\", cl, ts) \
-             VALUES (0, ?, ?, ?, ?, ?)",
-            consts::V2_TOMBSTONES_SUFFIX,
-            pk_col = pk_col_name,
-        ), sqlite::PREPARE_PERSISTENT)?;
-
-        // Hydration: site_id is a parameter
-        let tomb_insert_site = db.prepare_v3(&format!(
             "INSERT OR REPLACE INTO \"{escaped}{}\" (site_id, db_version, seq, \"{pk_col}\", cl, ts) \
              VALUES (?, ?, ?, ?, ?, ?)",
             consts::V2_TOMBSTONES_SUFFIX,
@@ -513,14 +482,11 @@ impl V2Stmts {
 
         Ok(Self {
             lookup_row_state,
-            pks_insert_cl1,
-            pks_insert_cl_param,
-            pks_insert_rowid,
+            pks_insert,
             pks_update_cl,
             pks_delete,
             tomb_delete,
             tomb_insert,
-            tomb_insert_site,
             tomb_upsert,
             tomb_pks_delete,
             tomb_pks_insert,
@@ -599,14 +565,11 @@ impl V2Stmts {
     // --- Getters ---
 
     pub fn lookup_row_state(&mut self) -> StmtGuard { StmtGuard::new(&mut self.lookup_row_state) }
-    pub fn pks_insert_cl1(&mut self) -> StmtGuard { StmtGuard::new(&mut self.pks_insert_cl1) }
-    pub fn pks_insert_cl_param(&mut self) -> StmtGuard { StmtGuard::new(&mut self.pks_insert_cl_param) }
-    pub fn pks_insert_rowid(&mut self) -> StmtGuard { StmtGuard::new(&mut self.pks_insert_rowid) }
+    pub fn pks_insert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.pks_insert) }
     pub fn pks_update_cl(&mut self) -> StmtGuard { StmtGuard::new(&mut self.pks_update_cl) }
     pub fn pks_delete(&mut self) -> StmtGuard { StmtGuard::new(&mut self.pks_delete) }
     pub fn tomb_delete(&mut self) -> StmtGuard { StmtGuard::new(&mut self.tomb_delete) }
     pub fn tomb_insert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.tomb_insert) }
-    pub fn tomb_insert_site(&mut self) -> StmtGuard { StmtGuard::new(&mut self.tomb_insert_site) }
     pub fn tomb_upsert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.tomb_upsert) }
     pub fn clock_insert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.clock_insert) }
     pub fn clock_upsert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.clock_upsert) }
@@ -680,31 +643,32 @@ fn v2_pk_lookup_where(tbl_info: &TableInfo, is_pks_table: bool) -> (String, bool
     }
 }
 
-fn v2_pks_insert_sql(
-    tbl_info: &TableInfo,
+pub fn v2_pks_insert_sql(
+    skip_hash: bool,
+    key_is_rowid: bool,
     escaped: &str,
     pk_cols: &str,
     pk_values: &str,
     cl_expr: &str,
 ) -> String {
     let suffix = consts::V2_PKS_SUFFIX;
-    if tbl_info.skip_hash && tbl_info.key_is_rowid {
+    if skip_hash && key_is_rowid {
         format!("INSERT INTO \"{escaped}{suffix}\" (__crsql_key, cl) VALUES (?, {cl_expr}) RETURNING __crsql_key")
-    } else if tbl_info.skip_hash {
+    } else if skip_hash {
         format!("INSERT INTO \"{escaped}{suffix}\" ({pk_cols}, cl) VALUES ({pk_values}, {cl_expr}) RETURNING __crsql_key")
-    } else if tbl_info.key_is_rowid {
+    } else if key_is_rowid {
         format!("INSERT INTO \"{escaped}{suffix}\" (__crsql_key, hashed_pk, cl) VALUES (?, ?, {cl_expr}) RETURNING __crsql_key")
     } else {
         format!("INSERT INTO \"{escaped}{suffix}\" ({pk_cols}, hashed_pk, cl) VALUES ({pk_values}, ?, {cl_expr}) RETURNING __crsql_key")
     }
 }
 
-fn pk_cols_and_values(tbl_info: &TableInfo) -> (String, String) {
-    let pk_cols = tbl_info.pks.iter()
+pub fn pk_cols_and_values(pks: &[ColumnInfo]) -> (String, String) {
+    let pk_cols = pks.iter()
         .map(|p| format!("\"{}\"", crate::util::escape_ident(&p.name)))
         .collect::<Vec<_>>()
         .join(", ");
-    let pk_values = tbl_info.pks.iter()
+    let pk_values = pks.iter()
         .map(|_| "?")
         .collect::<Vec<_>>()
         .join(", ");

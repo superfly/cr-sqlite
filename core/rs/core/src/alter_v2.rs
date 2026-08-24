@@ -122,14 +122,21 @@ unsafe fn sync_col_map_v2(
     for (col_id, col_name) in &existing_cols {
         if !current_set.contains(&col_name.as_str()) {
             dropped_col_ids.push(*col_id);
-            let stmt = db.prepare_v2(&format!(
-                "DELETE FROM \"{}{}\" WHERE col_id = ?\0",
-                escaped, consts::V2_COL_MAP_SUFFIX
-            ))?;
-            stmt.bind_int64(1, *col_id)?;
-            stmt.step()?;
-            drop(stmt);
         }
+    }
+
+    // Batch delete dropped columns from col_map
+    if !dropped_col_ids.is_empty() {
+        let placeholders = dropped_col_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let stmt = db.prepare_v2(&format!(
+            "DELETE FROM \"{}{}\" WHERE col_id IN ({})\0",
+            escaped, consts::V2_COL_MAP_SUFFIX, placeholders
+        ))?;
+        for (i, col_id) in dropped_col_ids.iter().enumerate() {
+            stmt.bind_int64(i as i32 + 1, *col_id)?;
+        }
+        stmt.step()?;
+        drop(stmt);
     }
 
     // If the table will become PK-only, migrate one dropped column's clock
@@ -148,13 +155,16 @@ unsafe fn sync_col_map_v2(
         }
     }
 
-    // Delete clock entries for all remaining dropped columns
-    for col_id in &dropped_col_ids {
+    // Batch delete clock entries for all remaining dropped columns
+    if !dropped_col_ids.is_empty() {
+        let placeholders = dropped_col_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let stmt = db.prepare_v2(&format!(
-            "DELETE FROM \"{}{}\" WHERE cell_key & {} = ?\0",
-            escaped, consts::V2_CLOCK_SUFFIX, col_id_mask
+            "DELETE FROM \"{}{}\" WHERE cell_key & {} IN ({})\0",
+            escaped, consts::V2_CLOCK_SUFFIX, col_id_mask, placeholders
         ))?;
-        stmt.bind_int64(1, *col_id)?;
+        for (i, col_id) in dropped_col_ids.iter().enumerate() {
+            stmt.bind_int64(i as i32 + 1, *col_id)?;
+        }
         stmt.step()?;
         drop(stmt);
     }
@@ -168,21 +178,31 @@ unsafe fn sync_col_map_v2(
         .collect();
 
     let mut next_col_id: i64 = 0;
+    let mut new_col_rows: Vec<(i64, &str)> = vec![];
     for col in &tbl_info.non_pks {
         if !existing_names.contains(&col.name) {
             while used_col_ids.contains(&next_col_id) {
                 next_col_id += 1;
             }
-            let stmt = db.prepare_v2(&format!(
-                "INSERT INTO \"{}{}\" (col_id, col_name) VALUES (?, ?)\0",
-                escaped, consts::V2_COL_MAP_SUFFIX
-            ))?;
-            stmt.bind_int64(1, next_col_id)?;
-            stmt.bind_text(2, &col.name, sqlite_nostd::Destructor::STATIC)?;
-            stmt.step()?;
-            drop(stmt);
+            new_col_rows.push((next_col_id, col.name.as_str()));
             next_col_id += 1;
         }
+    }
+
+    // Batch insert all new columns in a single statement
+    if !new_col_rows.is_empty() {
+        let placeholders = new_col_rows.iter().map(|_| "(?, ?)").collect::<Vec<_>>().join(", ");
+        let stmt = db.prepare_v2(&format!(
+            "INSERT INTO \"{}{}\" (col_id, col_name) VALUES {}\0",
+            escaped, consts::V2_COL_MAP_SUFFIX, placeholders
+        ))?;
+        for (i, (col_id, col_name)) in new_col_rows.iter().enumerate() {
+            let param = i as i32 * 2 + 1;
+            stmt.bind_int64(param, *col_id)?;
+            stmt.bind_text(param + 1, col_name, sqlite_nostd::Destructor::STATIC)?;
+        }
+        stmt.step()?;
+        drop(stmt);
     }
 
     Ok(())

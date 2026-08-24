@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use core::str::Utf8Error;
 use sqlite::{sqlite3, ColumnType, Connection, ResultCode};
 use sqlite_nostd as sqlite;
+use sqlite_nostd::Destructor;
 
 pub fn get_dflt_value(
     db: *mut sqlite3,
@@ -132,6 +133,37 @@ impl Countable for *mut sqlite::sqlite3 {
         stmt.step()?;
         Ok(stmt.column_int(0))
     }
+}
+
+/// Get an integer value from crsql_master by exact key.
+/// Returns None if the key does not exist.
+pub unsafe fn get_master_value(db: *mut sqlite3, key: &str) -> Result<Option<i64>, ResultCode> {
+    let sql = "SELECT value FROM crsql_master WHERE key = ?\0";
+    let stmt = db.prepare_v2(sql)?;
+    stmt.bind_text(1, key, Destructor::STATIC)?;
+    if stmt.step()? == ResultCode::ROW {
+        return Ok(Some(stmt.column_int64(0)));
+    }
+    Ok(None)
+}
+
+/// Set an integer value in crsql_master by exact key (insert or replace).
+pub unsafe fn set_master_value(db: *mut sqlite3, key: &str, value: i64) -> Result<(), ResultCode> {
+    let sql = "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, ?)\0";
+    let stmt = db.prepare_v2(sql)?;
+    stmt.bind_text(1, key, Destructor::STATIC)?;
+    stmt.bind_int64(2, value)?;
+    stmt.step()?;
+    Ok(())
+}
+
+/// Delete a key from crsql_master by exact key.
+pub unsafe fn clear_master_key(db: *mut sqlite3, key: &str) -> Result<(), ResultCode> {
+    let sql = "DELETE FROM crsql_master WHERE key = ?\0";
+    let stmt = db.prepare_v2(sql)?;
+    stmt.bind_text(1, key, Destructor::STATIC)?;
+    stmt.step()?;
+    Ok(())
 }
 
 #[cfg(test)]

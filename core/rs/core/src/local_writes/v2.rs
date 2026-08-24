@@ -104,8 +104,7 @@ pub fn v2_after_insert(
     let ts_val = unsafe { (*ext_data).timestamp as i64 };
 
     // Get cached statements (lazily prepared on first use)
-    let merge_equal = unsafe { (*ext_data).mergeEqualValues };
-    let mut v2_stmts_ref = tbl_info.get_v2_stmts(db, merge_equal)
+    let mut v2_stmts_ref = tbl_info.get_v2_stmts(db, ext_data)
         .map_err(|e| format!("failed to get v2 stmts: {:?}", e))?;
     let v2_stmts = v2_stmts_ref.as_mut().unwrap();
 
@@ -170,15 +169,16 @@ pub fn v2_after_insert(
         }
 
         // Re-insert into v2_pks with resurrected CL
-        let mut ins = v2_stmts.pks_insert_cl_param();
+        let mut ins = v2_stmts.pks_insert();
         let cl_slot = bind_pks_insert(&mut ins, tbl_info, pks_new, &hashed_pk)?;
         ins.bind_int64(cl_slot, new_cl).map_err(|e| format!("bind: {:?}", e))?;
         ins.step().map_err(|e| format!("step: {:?}", e))?;
         ins.column_int64(0)
     } else {
         // Truly new row — insert into v2_pks with cl=1
-        let mut ins = v2_stmts.pks_insert_cl1();
-        bind_pks_insert(&mut ins, tbl_info, pks_new, &hashed_pk)?;
+        let mut ins = v2_stmts.pks_insert();
+        let cl_slot = bind_pks_insert(&mut ins, tbl_info, pks_new, &hashed_pk)?;
+        ins.bind_int64(cl_slot, 1).map_err(|e| format!("bind: {:?}", e))?;
         ins.step().map_err(|e| {
             let errmsg = db.errmsg().unwrap_or_else(|_| "unknown".to_string());
             format!("step: {:?} - {}", e, errmsg)
@@ -239,8 +239,7 @@ pub fn v2_after_update(
     let hashed_pk = compute_hashed_pk(tbl_info, pks_new)?;
     let ts_val = unsafe { (*ext_data).timestamp as i64 };
 
-    let merge_equal = unsafe { (*ext_data).mergeEqualValues };
-    let mut v2_stmts_ref = tbl_info.get_v2_stmts(db, merge_equal)
+    let mut v2_stmts_ref = tbl_info.get_v2_stmts(db, ext_data)
         .map_err(|e| format!("failed to get v2 stmts: {:?}", e))?;
     let v2_stmts = v2_stmts_ref.as_mut().unwrap();
 
@@ -295,8 +294,7 @@ pub fn v2_after_delete(
     let hashed_pk = compute_hashed_pk(tbl_info, pks_old)?;
     let ts_val = unsafe { (*ext_data).timestamp as i64 };
 
-    let merge_equal = unsafe { (*ext_data).mergeEqualValues };
-    let mut v2_stmts_ref = tbl_info.get_v2_stmts(db, merge_equal)
+    let mut v2_stmts_ref = tbl_info.get_v2_stmts(db, ext_data)
         .map_err(|e| format!("failed to get v2 stmts: {:?}", e))?;
     let v2_stmts = v2_stmts_ref.as_mut().unwrap();
 
@@ -339,15 +337,16 @@ pub fn v2_after_delete(
     // Insert tombstone
     {
         let mut ins = v2_stmts.tomb_insert();
-        ins.bind_int64(1, db_version).map_err(|e| format!("bind: {:?}", e))?;
-        ins.bind_int(2, seq).map_err(|e| format!("bind: {:?}", e))?;
+        ins.bind_int(1, 0).map_err(|e| format!("bind: {:?}", e))?;
+        ins.bind_int64(2, db_version).map_err(|e| format!("bind: {:?}", e))?;
+        ins.bind_int(3, seq).map_err(|e| format!("bind: {:?}", e))?;
         if skip_hash {
-            ins.bind_value(3, pks_old[0]).map_err(|e| format!("bind: {:?}", e))?;
+            ins.bind_value(4, pks_old[0]).map_err(|e| format!("bind: {:?}", e))?;
         } else {
-            ins.bind_blob(3, hashed_pk.as_ref().unwrap(), Destructor::STATIC).map_err(|e| format!("bind: {:?}", e))?;
+            ins.bind_blob(4, hashed_pk.as_ref().unwrap(), Destructor::STATIC).map_err(|e| format!("bind: {:?}", e))?;
         }
-        ins.bind_int64(4, new_cl).map_err(|e| format!("bind: {:?}", e))?;
-        ins.bind_int64(5, ts_val).map_err(|e| format!("bind: {:?}", e))?;
+        ins.bind_int64(5, new_cl).map_err(|e| format!("bind: {:?}", e))?;
+        ins.bind_int64(6, ts_val).map_err(|e| format!("bind: {:?}", e))?;
         ins.step().map_err(|e| format!("step: {:?}", e))?;
     }
 

@@ -159,18 +159,8 @@ pub extern "C" fn crsql_config_set(
             // Setting to v2 requires all migrations to be complete
             if new_val == 2 {
                 let db = ctx.db_handle();
-                match is_migration_complete(db) {
-                    Ok(true) => {},
-                    Ok(false) => {
-                        ctx.result_error("Cannot set metadata-use-version to v2: migration not complete for all tables");
-                        ctx.result_error_code(ResultCode::ERROR);
-                        return;
-                    },
-                    Err(rc) => {
-                        ctx.result_error("Failed to check migration status");
-                        ctx.result_error_code(rc);
-                        return;
-                    }
+                if check_migration_complete_or_error(ctx, db, "metadata-use-version").is_err() {
+                    return;
                 }
             }
             unsafe { (*ext_data).metadataUseVersion = new_val };
@@ -187,18 +177,8 @@ pub extern "C" fn crsql_config_set(
             // Setting to v2 requires all migrations to be complete
             if new_val == 2 {
                 let db = ctx.db_handle();
-                match is_migration_complete(db) {
-                    Ok(true) => {},
-                    Ok(false) => {
-                        ctx.result_error("Cannot set sync-log-version to v2: migration not complete for all tables");
-                        ctx.result_error_code(ResultCode::ERROR);
-                        return;
-                    },
-                    Err(rc) => {
-                        ctx.result_error("Failed to check migration status");
-                        ctx.result_error_code(rc);
-                        return;
-                    }
+                if check_migration_complete_or_error(ctx, db, "sync-log-version").is_err() {
+                    return;
                 }
             }
             unsafe { (*ext_data).syncLogVersion = new_val };
@@ -330,18 +310,72 @@ fn validate_sync_log_transition(old: c_int, new: c_int, use_version: c_int, writ
     }
 }
 
-/// Create V2 metadata tables for all existing CRR tables that don't have them yet.
-/// Called during the V1→V2AndV1 transition so dual-write triggers have V2 tables ready.
-fn create_v2_tables_for_existing_crrs(db: *mut sqlite_nostd::sqlite3) -> Result<(), ResultCode> {
-    let sql = "SELECT DISTINCT name FROM sqlite_master WHERE name LIKE '%__crsql_clock'\0";
-    let stmt = db.prepare_v2(sql)?;
+/// Find all tables in sqlite_master whose name ends with `suffix`,
+/// returning the base table names (with the suffix stripped).
+fn find_tables_with_suffix(
+    db: *mut sqlite_nostd::sqlite3,
+    suffix: &str,
+) -> Result<Vec<alloc::string::String>, ResultCode> {
+    let sql = format!(
+        "SELECT DISTINCT name FROM sqlite_master WHERE name LIKE '%{}'\0",
+        suffix
+    );
+    let stmt = db.prepare_v2(&sql)?;
     let mut table_names: Vec<alloc::string::String> = Vec::new();
     while stmt.step()? == ResultCode::ROW {
         let name = stmt.column_text(0)?;
-        if let Some(base) = name.strip_suffix("__crsql_clock") {
+        if let Some(base) = name.strip_suffix(suffix) {
             table_names.push(alloc::string::String::from(base));
         }
     }
+    Ok(table_names)
+}
+
+/// Queue a task in crsql_master by inserting a key with value 0.
+/// The key is formed as `{key_prefix}_{table_name}`.
+fn queue_task(
+    db: *mut sqlite_nostd::sqlite3,
+    key_prefix: &str,
+    table_name: &str,
+) -> Result<(), ResultCode> {
+    let key = format!("{}_{}", key_prefix, table_name);
+    let sql = "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, 0)\0";
+    let stmt = db.prepare_v2(sql)?;
+    stmt.bind_text(1, &key, sqlite::Destructor::TRANSIENT)?;
+    stmt.step()?;
+    Ok(())
+}
+
+/// Check that all migration tasks are complete, setting an error on the
+/// context if not. Returns `Ok(())` if migration is complete, or `Err(())`
+/// if an error was set on the context (caller should return immediately).
+fn check_migration_complete_or_error(
+    ctx: *mut sqlite::context,
+    db: *mut sqlite_nostd::sqlite3,
+    config_name: &str,
+) -> Result<(), ()> {
+    match is_migration_complete(db) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            ctx.result_error(&format!(
+                "Cannot set {} to v2: migration not complete for all tables",
+                config_name
+            ));
+            ctx.result_error_code(ResultCode::ERROR);
+            Err(())
+        }
+        Err(rc) => {
+            ctx.result_error("Failed to check migration status");
+            ctx.result_error_code(rc);
+            Err(())
+        }
+    }
+}
+
+/// Create V2 metadata tables for all existing CRR tables that don't have them yet.
+/// Called during the V1→V2AndV1 transition so dual-write triggers have V2 tables ready.
+fn create_v2_tables_for_existing_crrs(db: *mut sqlite_nostd::sqlite3) -> Result<(), ResultCode> {
+    let table_names = find_tables_with_suffix(db, "__crsql_clock")?;
 
     for tbl_name in &table_names {
         // Check if V2 tables already exist (e.g., table was created in dual-write mode)
@@ -366,27 +400,10 @@ fn create_v2_tables_for_existing_crrs(db: *mut sqlite_nostd::sqlite3) -> Result<
 /// Queue migration tasks for all V1 CRR tables.
 /// Sets a progress marker of 0 for each table that has __crsql_clock (V1) tables.
 fn queue_migration_tasks(db: *mut sqlite_nostd::sqlite3) -> Result<(), ResultCode> {
-    // Find all V1 clock tables (tables with __crsql_clock suffix)
-    let sql = "SELECT DISTINCT name FROM sqlite_master WHERE name LIKE '%__crsql_clock'\0";
-    let stmt = db.prepare_v2(sql)?;
-    let mut table_names: Vec<alloc::string::String> = Vec::new();
-    while stmt.step()? == ResultCode::ROW {
-        let name = stmt.column_text(0)?;
-        // Strip __crsql_clock suffix to get base table name
-        if let Some(base) = name.strip_suffix("__crsql_clock") {
-            table_names.push(alloc::string::String::from(base));
-        }
-    }
-
-    // Queue a migration task for each table by setting progress marker to 0
+    let table_names = find_tables_with_suffix(db, "__crsql_clock")?;
     for tbl_name in &table_names {
-        let key = format!("migration_v1_to_v2_migration_{}", tbl_name);
-        let sql = "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, 0)\0";
-        let stmt = db.prepare_v2(sql)?;
-        stmt.bind_text(1, &key, sqlite::Destructor::TRANSIENT)?;
-        stmt.step()?;
+        queue_task(db, "migration_v1_to_v2_migration", tbl_name)?;
     }
-
     Ok(())
 }
 
@@ -409,21 +426,9 @@ fn clear_migration_markers(db: *mut sqlite_nostd::sqlite3) -> Result<(), ResultC
 /// Queue V1 table cleanup tasks for all CRR tables that have V1 clock tables.
 /// Called when transitioning from v2&v1 to v2 (V1 tables no longer needed).
 fn queue_v1_cleanup_tasks(db: *mut sqlite_nostd::sqlite3) -> Result<(), ResultCode> {
-    let sql = "SELECT DISTINCT name FROM sqlite_master WHERE name LIKE '%__crsql_clock'\0";
-    let stmt = db.prepare_v2(sql)?;
-    let mut table_names: Vec<alloc::string::String> = Vec::new();
-    while stmt.step()? == ResultCode::ROW {
-        let name = stmt.column_text(0)?;
-        if let Some(base) = name.strip_suffix("__crsql_clock") {
-            table_names.push(alloc::string::String::from(base));
-        }
-    }
+    let table_names = find_tables_with_suffix(db, "__crsql_clock")?;
     for tbl_name in &table_names {
-        let key = format!("cleanup_v1_tables_{}", tbl_name);
-        let sql = "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, 0)\0";
-        let stmt = db.prepare_v2(sql)?;
-        stmt.bind_text(1, &key, sqlite::Destructor::TRANSIENT)?;
-        stmt.step()?;
+        queue_task(db, "cleanup_v1_tables", tbl_name)?;
     }
     Ok(())
 }
@@ -431,21 +436,9 @@ fn queue_v1_cleanup_tasks(db: *mut sqlite_nostd::sqlite3) -> Result<(), ResultCo
 /// Queue V2 table cleanup tasks for all CRR tables that have V2 tables.
 /// Called when rolling back from v2&v1 to v1 (V2 tables no longer needed).
 fn queue_v2_cleanup_tasks(db: *mut sqlite_nostd::sqlite3) -> Result<(), ResultCode> {
-    let sql = "SELECT DISTINCT name FROM sqlite_master WHERE name LIKE '%__crsql_v2_clock'\0";
-    let stmt = db.prepare_v2(sql)?;
-    let mut table_names: Vec<alloc::string::String> = Vec::new();
-    while stmt.step()? == ResultCode::ROW {
-        let name = stmt.column_text(0)?;
-        if let Some(base) = name.strip_suffix("__crsql_v2_clock") {
-            table_names.push(alloc::string::String::from(base));
-        }
-    }
+    let table_names = find_tables_with_suffix(db, "__crsql_v2_clock")?;
     for tbl_name in &table_names {
-        let key = format!("cleanup_v2_tables_{}", tbl_name);
-        let sql = "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, 0)\0";
-        let stmt = db.prepare_v2(sql)?;
-        stmt.bind_text(1, &key, sqlite::Destructor::TRANSIENT)?;
-        stmt.step()?;
+        queue_task(db, "cleanup_v2_tables", tbl_name)?;
     }
     Ok(())
 }

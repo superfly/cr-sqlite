@@ -21,14 +21,6 @@ pub fn read_skip_hash_directive_opt(
     Ok(directives.get("skip_hash").map(|v| is_truthy(v)))
 }
 
-/// Backward-compatible boolean version: returns true only if directive present and enabled.
-pub fn read_skip_hash_directive(
-    db: *mut sqlite::sqlite3,
-    table: &str,
-) -> Result<bool, ResultCode> {
-    Ok(read_skip_hash_directive_opt(db, table)?.unwrap_or(false))
-}
-
 /// Read all crsql directives from the table's CREATE TABLE SQL.
 /// Parses `/* crsql: key1=value1, key2=value2, ... */` comments.
 fn read_directives(

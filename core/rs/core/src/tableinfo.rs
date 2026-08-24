@@ -764,8 +764,9 @@ impl TableInfo {
     pub fn get_v2_stmts(
         &self,
         db: *mut sqlite3,
-        merge_equal: i32,
+        ext_data: *mut crate::c::crsql_ExtData,
     ) -> Result<RefMut<Option<crate::v2_stmts::V2Stmts>>, ResultCode> {
+        let merge_equal = unsafe { (*ext_data).mergeEqualValues };
         let needs_prepare = match self.v2_stmts.try_borrow()?.as_ref() {
             None => true,
             Some(s) => s.merge_equal() != merge_equal,
