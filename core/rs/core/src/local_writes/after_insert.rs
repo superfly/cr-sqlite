@@ -9,7 +9,7 @@ use sqlite::ResultCode;
 use sqlite_nostd as sqlite;
 use sqlite_nostd::Value;
 
-use crate::{c::crsql_ExtData, tableinfo::{TableInfo, SchemaVersion}, config, consts};
+use crate::{c::crsql_ExtData, tableinfo::TableInfo, config, consts};
 
 use super::bump_seq;
 use super::trigger_fn_preamble;
@@ -51,8 +51,8 @@ fn after_insert(
     rowid_val: Option<*mut value>,
 ) -> Result<ResultCode, String> {
     // Enforce rowid range for rowid-key tables
-    if let Some(rowid) = rowid_val {
-        let rowid = rowid.int64();
+    if tbl_info.key_is_rowid {
+        let rowid = rowid_val.ok_or("rowid-key table missing rowid value")?.int64();
         if rowid < 0 || rowid >= consts::MAX_ROWID_KEY {
             return Err(format!(
                 "rowid out of cr-sqlite safe range [0, {})",
@@ -63,34 +63,19 @@ fn after_insert(
 
     let mwv = unsafe { (*ext_data).metadataWriteVersion };
 
-    // Mode 3 (V2-only): write to V2 only, even if V1 tables still exist during cleanup
+    // Mode 3 (V2-only): write to V2 only
     if mwv == config::METADATA_VERSION_V2 {
         return super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new);
     }
 
-    // Mode 1 (V1-only): write to V1 only, even if V2 tables still exist from rollback
-    let mut v2_ran = false;
-    let saved_seq = unsafe { (*ext_data).seq };
-    if mwv == config::METADATA_VERSION_V1 {
-        // fall through to V1 write logic below, skipping V2
-    } else {
-        // V2-only schema: just write to V2 tables
-        if tbl_info.schema_version == SchemaVersion::V2 {
-            return super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new);
-        }
-
-        // V2AndV1 mode: write to V2 tables first, then fall through to V1
-        if tbl_info.schema_version == SchemaVersion::V2AndV1 {
-            // Hydrate V2 from V1 on-demand (migration may not have reached this row yet)
-            unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_new) }
-                .map_err(|_| "V1 to V2 hydration failed".to_string())?;
-            super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new)?;
-            v2_ran = true;
-        }
-    }
-
-    // Restore seq so V1 reuses the same values V2 just bumped.
-    if v2_ran {
+    // Mode 1 (V1-only): write to V1 only
+    if mwv == config::METADATA_VERSION_V2_AND_V1 {
+        // Dual-write: hydrate V2 from V1 on-demand, then write to V2 first
+        let saved_seq = unsafe { (*ext_data).seq };
+        unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_new) }
+            .map_err(|_| "V1 to V2 hydration failed".to_string())?;
+        super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new)?;
+        // Restore seq so V1 reuses the same values V2 just bumped.
         unsafe { (*ext_data).seq = saved_seq; }
     }
 

@@ -9,7 +9,7 @@ use sqlite_nostd as sqlite;
 use sqlite_nostd::Value;
 
 use crate::compare_values::crsql_compare_sqlite_values;
-use crate::{c::crsql_ExtData, tableinfo::{TableInfo, SchemaVersion}, config, consts};
+use crate::{c::crsql_ExtData, tableinfo::TableInfo, config, consts};
 
 use super::trigger_fn_preamble;
 
@@ -82,8 +82,8 @@ fn after_update(
     rowid_val: Option<&*mut value>,
 ) -> Result<ResultCode, String> {
     // Enforce rowid range for rowid-key tables
-    if let Some(rowid) = rowid_val {
-        let rowid = (*rowid).int64();
+    if tbl_info.key_is_rowid {
+        let rowid = (*rowid_val.ok_or("rowid-key table missing rowid value")?).int64();
         if rowid < 0 || rowid >= consts::MAX_ROWID_KEY {
             return Err(format!(
                 "rowid out of cr-sqlite safe range [0, {})",
@@ -94,15 +94,18 @@ fn after_update(
 
     let mwv = unsafe { (*ext_data).metadataWriteVersion };
 
-    // Mode 3 (V2-only): write to V2 only, even if V1 tables still exist during cleanup
-    if mwv == config::METADATA_VERSION_V2 {
-        let mut changed_indices = Vec::new();
-        for (i, (new, old)) in non_pks_new.iter().zip(non_pks_old.iter()).enumerate() {
-            if crsql_compare_sqlite_values(*new, *old) != 0 {
-                changed_indices.push(i);
-            }
+    // Compute changed column indices (needed for both V2-only and dual-write paths)
+    let mut changed_indices = Vec::new();
+    for (i, (new, old)) in non_pks_new.iter().zip(non_pks_old.iter()).enumerate() {
+        if crsql_compare_sqlite_values(*new, *old) != 0 {
+            changed_indices.push(i);
         }
-        if crate::compare_values::any_value_changed(pks_new, pks_old)? {
+    }
+    let pk_changed = crate::compare_values::any_value_changed(pks_new, pks_old)?;
+
+    // Mode 3 (V2-only): write to V2 only
+    if mwv == config::METADATA_VERSION_V2 {
+        if pk_changed {
             super::v2::v2_after_delete(db, ext_data, tbl_info, pks_old)?;
             super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new)?;
             return Ok(ResultCode::OK);
@@ -110,59 +113,23 @@ fn after_update(
         return super::v2::v2_after_update(db, ext_data, tbl_info, pks_new, &changed_indices);
     }
 
-    // Mode 1 (V1-only): write to V1 only, even if V2 tables still exist from rollback
-    let mut v2_ran = false;
-    let saved_seq = unsafe { (*ext_data).seq };
-    if mwv == config::METADATA_VERSION_V1 {
-        // fall through to V1 write logic below, skipping V2
-    } else {
-        // V2-only schema: just write to V2 tables
-        if tbl_info.schema_version == SchemaVersion::V2 {
-            // Compute changed column indices
-            let mut changed_indices = Vec::new();
-            for (i, (new, old)) in non_pks_new.iter().zip(non_pks_old.iter()).enumerate() {
-                if crsql_compare_sqlite_values(*new, *old) != 0 {
-                    changed_indices.push(i);
-                }
-            }
-            // Also handle PK changes as delete+insert in V2
-            if crate::compare_values::any_value_changed(pks_new, pks_old)? {
-                // PK changed: do delete of old + insert of new
-                super::v2::v2_after_delete(db, ext_data, tbl_info, pks_old)?;
-                super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new)?;
-                return Ok(ResultCode::OK);
-            }
-            return super::v2::v2_after_update(db, ext_data, tbl_info, pks_new, &changed_indices);
+    // Mode 1 (V1-only): write to V1 only
+    if mwv == config::METADATA_VERSION_V2_AND_V1 {
+        // Dual-write: hydrate V2 from V1 on-demand, then write to V2 first
+        let saved_seq = unsafe { (*ext_data).seq };
+        if pk_changed {
+            unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_old) }
+                .map_err(|_| "V1 to V2 hydration failed".to_string())?;
+            unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_new) }
+                .map_err(|_| "V1 to V2 hydration failed".to_string())?;
+            super::v2::v2_after_delete(db, ext_data, tbl_info, pks_old)?;
+            super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new)?;
+        } else {
+            unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_new) }
+                .map_err(|_| "V1 to V2 hydration failed".to_string())?;
+            super::v2::v2_after_update(db, ext_data, tbl_info, pks_new, &changed_indices)?;
         }
-
-        // V2AndV1 mode: write to V2 tables first, then fall through to V1
-        if tbl_info.schema_version == SchemaVersion::V2AndV1 {
-            let mut changed_indices = Vec::new();
-            for (i, (new, old)) in non_pks_new.iter().zip(non_pks_old.iter()).enumerate() {
-                if crsql_compare_sqlite_values(*new, *old) != 0 {
-                    changed_indices.push(i);
-                }
-            }
-            if crate::compare_values::any_value_changed(pks_new, pks_old)? {
-                // Hydrate both old and new PKs before delete+insert
-                unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_old) }
-                    .map_err(|_| "V1 to V2 hydration failed".to_string())?;
-                unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_new) }
-                    .map_err(|_| "V1 to V2 hydration failed".to_string())?;
-                super::v2::v2_after_delete(db, ext_data, tbl_info, pks_old)?;
-                super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new)?;
-            } else {
-                // Hydrate the row being updated
-                unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_new) }
-                    .map_err(|_| "V1 to V2 hydration failed".to_string())?;
-                super::v2::v2_after_update(db, ext_data, tbl_info, pks_new, &changed_indices)?;
-            }
-            v2_ran = true;
-        }
-    }
-
-    // Restore seq so V1 reuses the same values V2 just bumped.
-    if v2_ran {
+        // Restore seq so V1 reuses the same values V2 just bumped.
         unsafe { (*ext_data).seq = saved_seq; }
     }
 
