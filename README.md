@@ -242,6 +242,18 @@ This automatically resets `metadata-use-version` and `sync-log-version` to 1 as 
 
 0.18.0 requires **SQLite 3.44.0 or later** (for `ORDER BY` in aggregate functions). The extension checks at load time. If loading into an external SQLite, verify with `SELECT sqlite_version();`.
 
+### `INSERT OR REPLACE` Behavior
+
+Starting in 0.18.0, cr-sqlite enables `PRAGMA recursive_triggers = ON` at initialization. This changes the behavior of `INSERT OR REPLACE` on CRR tables:
+
+- **DELETE trigger fires first** — moves the old row to tombstones (CL→even, emits a delete sentinel for replication)
+- **INSERT trigger fires second** — resurrects the row (CL→odd, creates fresh clock entries)
+
+This ensures metadata consistency and correct replication — peers see both the deletion and the re-insertion. Applications using `INSERT OR REPLACE` will see delete sentinels (`cid = -1`) in `crsql_changes` for replaced rows.
+
+- Use `INSERT ... ON CONFLICT DO UPDATE` for true upsert behavior that does not create delete sentinels.
+- Use `INSERT OR REPLACE` as a forced update/recreation mode when you need to replace a row globally across all nodes.
+
 ## Usage
 
 ```sql

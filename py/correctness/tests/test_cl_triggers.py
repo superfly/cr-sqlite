@@ -129,17 +129,14 @@ def test_upsert_currently_existing():
 
     c.execute("INSERT INTO foo VALUES (1, 2)")
     c.commit()
-    # A replace acts as an insert.
-    # A `do update` acts as an update.
-    # So we test both ways of upserting.
+    # INSERT OR REPLACE fires DELETE then INSERT (recursive_triggers ON).
+    # The DELETE creates a sentinel (cl=2), the INSERT resurrects (cl=3).
     c.execute("INSERT OR REPLACE INTO foo VALUES (1, 3)")
     c.commit()
 
     changes = c.execute(
         "SELECT pk, cid, cl FROM crsql_changes").fetchall()
-    # Causal length bumps up to the next odd number given we are requesting to re-insert an existing row.
-    # Nope ^^ -- we're keeping it stable given the optimization to infer causal length records.
-    assert (changes == [(b'\x01\t\x01', 'b', 1)])
+    assert (changes == [(b'\x01\t\x01', '-1', 2), (b'\x01\t\x01', 'b', 3)])
 
     c.execute(
         "INSERT INTO foo VALUES (1, 4) ON CONFLICT DO UPDATE set b = b")
@@ -147,8 +144,8 @@ def test_upsert_currently_existing():
 
     changes = c.execute(
         "SELECT pk, cid, cl FROM crsql_changes").fetchall()
-    # Causal length remains stable given we asked to update, rather than re-insert, on conflict
-    assert (changes == [(b'\x01\t\x01', 'b', 1)])
+    # ON CONFLICT DO UPDATE is a true upsert — no delete, CL stays at 3.
+    assert (changes == [(b'\x01\t\x01', '-1', 2), (b'\x01\t\x01', 'b', 3)])
 
 
 # Run of the mill update against a row that exists
@@ -361,12 +358,13 @@ def test_change_primary_key_to_currently_existing():
         "SELECT pk, cid, cl FROM crsql_changes").fetchall()
     changes2 = c2.execute(
         "SELECT pk, cid, cl FROM crsql_changes").fetchall()
-    # pk 2 is alive as we `update or replaced` to it
-    # and it is alive at version 3 given it iassert (changes2 == changes)s a re-insertion of the currently existing row
+    # pk 2 is alive as we `update or replaced` to it.
+    # With recursive_triggers ON, UPDATE OR REPLACE fires DELETE then INSERT
+    # on pk=2, so pk=2 goes through delete (cl=2) → resurrect (cl=3).
     # pk 1 is dead (cl of 2) given we mutated / updated away from it. E.g.,
     # set a = 2 where a = 1
-    assert (changes == [(b'\x01\t\x01', '-1', 2), (b'\x01\t\x02', '-1', 1),
-                        (b'\x01\t\x02', 'b', 1)])
+    assert (changes == [(b'\x01\t\x01', '-1', 2), (b'\x01\t\x02', '-1', 3),
+                        (b'\x01\t\x02', 'b', 3)])
     # TODO: The change from second node is missing the sentinel row for the
     # existing row because we skip inserts if cl hasn't changed and we assume
     # an existing row has a cl of 1.
