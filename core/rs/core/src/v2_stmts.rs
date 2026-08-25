@@ -91,6 +91,8 @@ pub struct V2Stmts {
     // --- v2_col_map ---
     /// SELECT col_id FROM v2_col_map WHERE col_name = ?
     col_id_lookup: ManagedStmt,
+    /// SELECT col_id FROM v2_col_map (all columns, for clock entry creation)
+    col_ids_all: ManagedStmt,
 
     // --- Base table ---
     /// INSERT INTO base table (pk_cols) VALUES (?, ...) — for merge new row creation
@@ -296,6 +298,11 @@ impl V2Stmts {
             consts::V2_COL_MAP_SUFFIX
         ), sqlite::PREPARE_PERSISTENT)?;
 
+        let col_ids_all = db.prepare_v3(&format!(
+            "SELECT col_id FROM \"{escaped}{}\" ORDER BY col_id",
+            consts::V2_COL_MAP_SUFFIX
+        ), sqlite::PREPARE_PERSISTENT)?;
+
         // --- Base table ---
 
         let base_insert = db.prepare_v3(&format!(
@@ -496,6 +503,7 @@ impl V2Stmts {
             clock_zero_fill,
             clock_merge_upserts: alloc::collections::BTreeMap::new(),
             col_id_lookup,
+            col_ids_all,
             base_insert,
             base_delete_rowid,
             base_delete_nonrowid,
@@ -576,6 +584,7 @@ impl V2Stmts {
     pub fn clock_delete_range(&mut self) -> StmtGuard { StmtGuard::new(&mut self.clock_delete_range) }
     pub fn clock_zero_fill(&mut self) -> StmtGuard { StmtGuard::new(&mut self.clock_zero_fill) }
     pub fn col_id_lookup(&mut self) -> StmtGuard { StmtGuard::new(&mut self.col_id_lookup) }
+    pub fn col_ids_all(&mut self) -> StmtGuard { StmtGuard::new(&mut self.col_ids_all) }
     pub fn base_insert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.base_insert) }
     pub fn base_delete_rowid(&mut self) -> StmtGuard { StmtGuard::new(&mut self.base_delete_rowid) }
     pub fn pk_lookup_by_key(&mut self) -> StmtGuard { StmtGuard::new(&mut self.pk_lookup_by_key) }
