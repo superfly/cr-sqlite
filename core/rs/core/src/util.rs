@@ -166,6 +166,18 @@ pub unsafe fn clear_master_key(db: *mut sqlite3, key: &str) -> Result<(), Result
     Ok(())
 }
 
+/// Get a text value from crsql_master by exact key.
+/// Returns None if the key does not exist.
+pub unsafe fn get_master_text_value(db: *mut sqlite3, key: &str) -> Result<Option<alloc::string::String>, ResultCode> {
+    let sql = "SELECT value FROM crsql_master WHERE key = ?\0";
+    let stmt = db.prepare_v2(sql)?;
+    stmt.bind_text(1, key, Destructor::STATIC)?;
+    if stmt.step()? == ResultCode::ROW {
+        return Ok(Some(stmt.column_text(0)?.to_string()));
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

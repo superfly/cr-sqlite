@@ -44,10 +44,7 @@ pub fn create_crr(
         table_info.key_is_rowid = false;
         // Persist the without_rowid preference so migration path can read it
         // when creating v2_tables before v2_pks exists.
-        let key = format!("without_rowid_{}\0", table);
-        let stmt = db.prepare_v2("INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, 1)\0")?;
-        stmt.bind_text(1, &key, sqlite::Destructor::TRANSIENT)?;
-        stmt.step()?;
+        unsafe { crate::util::set_master_value(db, &format!("without_rowid_{}", table), 1) }?;
     }
 
     // Persist skip_hash preference so migration path and subsequent pull_table_info
@@ -60,11 +57,7 @@ pub fn create_crr(
     // For explicitly enabled/disabled tables, we need to persist.
     let directive = crate::schema_directive::read_skip_hash_directive_opt(db, table).unwrap_or(None);
     if directive.is_some() {
-        let key = format!("skip_hash_{}\0", table);
-        let stmt = db.prepare_v2("INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, ?)\0")?;
-        stmt.bind_text(1, &key, sqlite::Destructor::TRANSIENT)?;
-        stmt.bind_int(2, skip_hash_val)?;
-        stmt.step()?;
+        unsafe { crate::util::set_master_value(db, &format!("skip_hash_{}", table), skip_hash_val as i64) }?;
     }
 
     let metadata_write_version = get_metadata_write_version(db);
