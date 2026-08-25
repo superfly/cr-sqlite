@@ -262,7 +262,7 @@ fn write_clock_entries(
         }
         ids
     };
-    let mut stmt = v2_stmts.clock_insert();
+    let mut stmt = v2_stmts.clock_set_initial();
     for col_id in col_ids {
         let seq = bump_seq(ext_data);
         let cell_key = (key << consts::CRSQL_COL_ID_BITS as i64) | col_id;
@@ -309,15 +309,14 @@ pub fn v2_after_update(
     };
 
     // Update clock entries for each changed column
-    let mut stmt = v2_stmts.clock_upsert();
+    let mut stmt = v2_stmts.clock_bump_version();
     for &col_idx in changed_col_indices {
         let seq = bump_seq(ext_data);
         let cell_key = (key << consts::CRSQL_COL_ID_BITS as i64) | col_idx as i64;
         stmt.bind_int64(1, cell_key).map_err(|e| format!("bind: {:?}", e))?;
-        stmt.bind_int64(2, cell_key).map_err(|e| format!("bind: {:?}", e))?;
-        stmt.bind_int64(3, db_version).map_err(|e| format!("bind: {:?}", e))?;
-        stmt.bind_int(4, seq).map_err(|e| format!("bind: {:?}", e))?;
-        stmt.bind_int64(5, ts_val).map_err(|e| format!("bind: {:?}", e))?;
+        stmt.bind_int64(2, db_version).map_err(|e| format!("bind: {:?}", e))?;
+        stmt.bind_int(3, seq).map_err(|e| format!("bind: {:?}", e))?;
+        stmt.bind_int64(4, ts_val).map_err(|e| format!("bind: {:?}", e))?;
         stmt.step().map_err(|e| format!("step: {:?}", e))?;
         stmt.clear_bindings().map_err(|e| format!("clear_bindings: {:?}", e))?;
         stmt.reset().map_err(|e| format!("reset: {:?}", e))?;
@@ -377,7 +376,7 @@ pub fn v2_after_delete(
 
     // Insert tombstone
     {
-        let mut ins = v2_stmts.tomb_insert();
+        let mut ins = v2_stmts.tomb_insert_local();
         ins.bind_int(1, 0).map_err(bind_err)?;
         ins.bind_int64(2, db_version).map_err(bind_err)?;
         ins.bind_int(3, seq).map_err(bind_err)?;
