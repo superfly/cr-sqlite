@@ -1221,7 +1221,7 @@ pub unsafe fn v1_to_v2_hydrate_row(
 
         // Insert tombstone (site_id is a bind param — 0 for local writes, actual site for hydration)
         {
-            let mut ins = v2.tomb_insert();
+            let mut ins = v2.tomb_insert_local();
             ins.bind_int64(1, site_id)?;
             ins.bind_int64(2, db_version)?;
             ins.bind_int64(3, seq)?;
@@ -1459,7 +1459,7 @@ unsafe fn v2_merge_insert_tombstone(
 
     // Upsert tombstone with conflict resolution (merge_equal baked into SQL at prep time)
     {
-        let mut stmt = v2.tomb_upsert();
+        let mut stmt = v2.tomb_merge_upsert();
         stmt.bind_int64(1, site_ordinal as i64)?;
         stmt.bind_int64(2, insert_db_vrsn)?;
         stmt.bind_int64(3, insert_seq)?;
@@ -1482,7 +1482,7 @@ unsafe fn v2_merge_insert_tombstone(
         // Look up PK values once — used for both tombstone_pks insert and v2_nuke_local_row.
         let mut local_pks: Vec<ColumnValue> = Vec::new();
         {
-            let mut stmt = v2.pk_lookup_by_key();
+            let mut stmt = v2.base_lookup_pks_by_key();
             stmt.bind_int64(1, local_key)?;
             if stmt.step()? == ResultCode::ROW {
                 local_pks = collect_pks_from_stmt(stmt.stmt, tbl_info.pks.len())?;

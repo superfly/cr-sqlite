@@ -65,20 +65,22 @@ pub struct V2Stmts {
     // --- v2_tombstones mutations ---
     /// DELETE FROM v2_tombstones WHERE ... (local writes)
     tomb_delete: ManagedStmt,
-    /// INSERT OR REPLACE INTO v2_tombstones ... (site_id is always a bind param)
-    tomb_insert: ManagedStmt,
+    /// INSERT INTO v2_tombstones ... (local delete path, site_id always 0)
+    tomb_insert_local: ManagedStmt,
     /// Upsert with ON CONFLICT + merge_equal WHERE clause (merge path)
-    tomb_upsert: ManagedStmt,
+    tomb_merge_upsert: ManagedStmt,
     /// hash mode only
     tomb_pks_delete: Option<ManagedStmt>,
     /// hash mode only
     tomb_pks_insert: Option<ManagedStmt>,
 
     // --- v2_clock mutations ---
-    /// INSERT OR REPLACE ... VALUES (?, 1, ...) (local insert path)
-    clock_insert: ManagedStmt,
-    /// INSERT OR REPLACE ... VALUES (?, COALESCE(...), ...) (local update path)
-    clock_upsert: ManagedStmt,
+    /// Insert col_version=1 for a column on local insert (plain INSERT — clock entries
+    /// are always fresh: new row, or delete trigger cleared them before resurrect)
+    clock_set_initial: ManagedStmt,
+    /// Bump col_version+1 for a column on local update (INSERT ... ON CONFLICT DO UPDATE).
+    /// Uses upsert to handle ALTER-added columns that have no clock entry yet.
+    clock_bump_version: ManagedStmt,
     /// DELETE FROM v2_clock WHERE cell_key >= ? AND <= ?
     clock_delete_range: ManagedStmt,
     /// INSERT INTO v2_clock SELECT ? + col_id ... FROM v2_col_map (ensure alive row)
@@ -103,7 +105,8 @@ pub struct V2Stmts {
     base_lookup_rowid: Option<ManagedStmt>,
     /// SELECT pk_cols FROM base table WHERE rowid_alias = ? (rowid-key) or
     /// SELECT pk_cols FROM v2_pks WHERE __crsql_key = ? (non-rowid) — merge PK lookup
-    pk_lookup_by_key: ManagedStmt,
+    base_lookup_pks_by_key: ManagedStmt,
+    /// Per-column base table UPDATE statements. Keyed by column name.
     /// Per-column base table UPDATE statements. Keyed by column name.
     /// For rowid-key tables: UPDATE base SET "col" = ? WHERE rowid_alias = ?
     /// For non-rowid tables: UPDATE base SET "col" = ? WHERE pk1 = ? AND pk2 = ? ...
@@ -209,7 +212,7 @@ impl V2Stmts {
         ), sqlite::PREPARE_PERSISTENT)?;
 
         // site_id is always a bind param (0 for local writes, actual site for hydration/merge)
-        let tomb_insert = db.prepare_v3(&format!(
+        let tomb_insert_local = db.prepare_v3(&format!(
             "INSERT OR REPLACE INTO \"{escaped}{}\" (site_id, db_version, seq, \"{pk_col}\", cl, ts) \
              VALUES (?, ?, ?, ?, ?, ?)",
             consts::V2_TOMBSTONES_SUFFIX,
@@ -227,7 +230,7 @@ impl V2Stmts {
         } else {
             format!("WHERE excluded.cl > \"{escaped}{}\".cl", consts::V2_TOMBSTONES_SUFFIX)
         };
-        let tomb_upsert = if tbl_info.skip_hash {
+        let tomb_merge_upsert = if tbl_info.skip_hash {
             db.prepare_v3(&format!(
                 "INSERT INTO \"{escaped}{}\" (site_id, db_version, seq, \"{pk_col}\", cl, ts) \
                 VALUES (?, ?, ?, ?, ?, ?) \
@@ -266,16 +269,19 @@ impl V2Stmts {
 
         // --- v2_clock mutations ---
 
-        let clock_insert = db.prepare_v3(&format!(
-            "INSERT OR REPLACE INTO \"{escaped}{}\" (cell_key, col_version, site_id, db_version, seq, ts) \
+        let clock_set_initial = db.prepare_v3(&format!(
+            "INSERT INTO \"{escaped}{}\" (cell_key, col_version, site_id, db_version, seq, ts) \
              VALUES (?, 1, 0, ?, ?, ?)",
             consts::V2_CLOCK_SUFFIX
         ), sqlite::PREPARE_PERSISTENT)?;
 
-        let clock_upsert = db.prepare_v3(&format!(
-            "INSERT OR REPLACE INTO \"{escaped}{}\" (cell_key, col_version, site_id, db_version, seq, ts) \
-             VALUES (?, COALESCE((SELECT col_version + 1 FROM \"{escaped}{}\" WHERE cell_key = ?), 1), 0, ?, ?, ?)",
-            consts::V2_CLOCK_SUFFIX, consts::V2_CLOCK_SUFFIX
+        let clock_bump_version = db.prepare_v3(&format!(
+            "INSERT INTO \"{escaped}{}\" (cell_key, col_version, site_id, db_version, seq, ts) \
+             VALUES (?, 1, 0, ?, ?, ?) \
+             ON CONFLICT(cell_key) DO UPDATE SET \
+             col_version = col_version + 1, db_version = excluded.db_version, \
+             seq = excluded.seq, ts = excluded.ts",
+            consts::V2_CLOCK_SUFFIX
         ), sqlite::PREPARE_PERSISTENT)?;
 
         let clock_delete_range = db.prepare_v3(&format!(
@@ -338,8 +344,8 @@ impl V2Stmts {
             None
         };
 
-        // pk_lookup_by_key: used in merge to look up PK values from v2_pks or base table
-        let pk_lookup_by_key = if tbl_info.key_is_rowid {
+        // base_lookup_pks_by_key: used in merge to look up PK values from v2_pks or base table
+        let base_lookup_pks_by_key = if tbl_info.key_is_rowid {
             let pk_list: Vec<String> = tbl_info.pks.iter()
                 .map(|c| crate::util::escape_ident(&c.name))
                 .collect();
@@ -491,12 +497,12 @@ impl V2Stmts {
             pks_insert,
             pks_delete,
             tomb_delete,
-            tomb_insert,
-            tomb_upsert,
+            tomb_insert_local,
+            tomb_merge_upsert,
             tomb_pks_delete,
             tomb_pks_insert,
-            clock_insert,
-            clock_upsert,
+            clock_set_initial,
+            clock_bump_version,
             clock_delete_range,
             clock_zero_fill,
             clock_merge_upserts: {
@@ -513,7 +519,7 @@ impl V2Stmts {
             base_delete_rowid,
             base_delete_nonrowid,
             base_lookup_rowid,
-            pk_lookup_by_key,
+            base_lookup_pks_by_key,
             base_updates: {
                 let mut map = alloc::collections::BTreeMap::new();
                 for col in &tbl_info.non_pks {
@@ -556,17 +562,17 @@ impl V2Stmts {
     pub fn pks_insert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.pks_insert) }
     pub fn pks_delete(&mut self) -> StmtGuard { StmtGuard::new(&mut self.pks_delete) }
     pub fn tomb_delete(&mut self) -> StmtGuard { StmtGuard::new(&mut self.tomb_delete) }
-    pub fn tomb_insert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.tomb_insert) }
-    pub fn tomb_upsert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.tomb_upsert) }
-    pub fn clock_insert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.clock_insert) }
-    pub fn clock_upsert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.clock_upsert) }
+    pub fn tomb_insert_local(&mut self) -> StmtGuard { StmtGuard::new(&mut self.tomb_insert_local) }
+    pub fn tomb_merge_upsert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.tomb_merge_upsert) }
+    pub fn clock_set_initial(&mut self) -> StmtGuard { StmtGuard::new(&mut self.clock_set_initial) }
+    pub fn clock_bump_version(&mut self) -> StmtGuard { StmtGuard::new(&mut self.clock_bump_version) }
     pub fn clock_delete_range(&mut self) -> StmtGuard { StmtGuard::new(&mut self.clock_delete_range) }
     pub fn clock_zero_fill(&mut self) -> StmtGuard { StmtGuard::new(&mut self.clock_zero_fill) }
     pub fn col_id_lookup(&mut self) -> StmtGuard { StmtGuard::new(&mut self.col_id_lookup) }
     pub fn col_ids_all(&mut self) -> StmtGuard { StmtGuard::new(&mut self.col_ids_all) }
     pub fn base_insert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.base_insert) }
     pub fn base_delete_rowid(&mut self) -> StmtGuard { StmtGuard::new(&mut self.base_delete_rowid) }
-    pub fn pk_lookup_by_key(&mut self) -> StmtGuard { StmtGuard::new(&mut self.pk_lookup_by_key) }
+    pub fn base_lookup_pks_by_key(&mut self) -> StmtGuard { StmtGuard::new(&mut self.base_lookup_pks_by_key) }
     /// Get a per-column base table UPDATE statement.
     /// All statements are pre-prepared at V2Stmts construction time.
     pub fn base_update(&mut self, col_name: &str) -> Result<StmtGuard, ResultCode> {
