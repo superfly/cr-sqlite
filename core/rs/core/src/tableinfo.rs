@@ -994,56 +994,20 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
 
 fn pull_all_table_infos(
     db: *mut sqlite::sqlite3,
-    ext_data: *mut crsql_ExtData,
+    _ext_data: *mut crsql_ExtData,
     err: *mut *mut c_char,
 ) -> Result<Vec<TableInfo>, ResultCode> {
-    let mut clock_table_names = vec![];
-    let stmt = unsafe { (*ext_data).pSelectClockTablesStmt };
-    loop {
-        match stmt.step() {
-            Ok(ResultCode::ROW) => {
-                clock_table_names.push(stmt.column_text(0).to_string());
-            }
-            Ok(ResultCode::DONE) => {
-                stmt.reset()?;
-                break;
-            }
-            Ok(rc) | Err(rc) => {
-                stmt.reset()?;
-                return Err(rc);
-            }
-        }
-    }
-
-    // Also discover V2-only CRR tables (mode 3 creates no V1 clock tables)
-    let v2_stmt = db.prepare_v2(
-        "SELECT tbl_name FROM sqlite_master WHERE type='table' AND tbl_name LIKE '%__crsql_v2_clock'",
-    )?;
-    loop {
-        match v2_stmt.step() {
-            Ok(ResultCode::ROW) => {
-                clock_table_names.push(v2_stmt.column_text(0)?.to_string());
-            }
-            Ok(ResultCode::DONE) => {
-                break;
-            }
-            Ok(rc) | Err(rc) => {
-                return Err(rc);
-            }
-        }
-    }
+    // Discover CRR tables via their clock tables. V1 tables use the
+    // __crsql_clock suffix; V2 tables use __crsql_v2_clock (consts::V2_CLOCK_SUFFIX).
+    // find_tables_with_suffix returns base table names with the suffix already stripped.
+    // Note: LIKE '%__crsql_clock' does not match '__crsql_v2_clock' tables, so the
+    // two queries are disjoint.
+    let mut clock_table_names = crate::config::find_tables_with_suffix(db, "__crsql_clock")?;
+    clock_table_names.extend(crate::config::find_tables_with_suffix(db, consts::V2_CLOCK_SUFFIX)?);
 
     let mut seen = alloc::collections::BTreeSet::new();
     let mut ret = vec![];
-    for name in clock_table_names {
-        // Strip either __crsql_clock (V1) or __crsql_v2_clock (V2) suffix
-        let base_name = if name.ends_with("__crsql_v2_clock") {
-            name[0..(name.len() - "__crsql_v2_clock".len())].to_string()
-        } else if name.ends_with("__crsql_clock") {
-            name[0..(name.len() - "__crsql_clock".len())].to_string()
-        } else {
-            continue;
-        };
+    for base_name in clock_table_names {
         if seen.contains(base_name.as_str()) {
             continue;
         }
@@ -1203,16 +1167,10 @@ pub fn pull_table_info(
     } else {
         // v2_pks doesn't exist yet — check crsql_master for skip_hash flag
         // persisted by create_crr, or check schema directive in sqlite_master
-        let skip_hash_key = format!("skip_hash_{}\0", table);
-        let stmt = db.prepare_v2("SELECT value FROM crsql_master WHERE key = ?\0");
-        let mut persisted: Option<bool> = None;
-        if let Ok(stmt) = stmt {
-            if stmt.bind_text(1, &skip_hash_key, sqlite::Destructor::TRANSIENT).is_ok() {
-                if stmt.step().unwrap_or(ResultCode::DONE) == ResultCode::ROW {
-                    persisted = Some(stmt.column_int(0) == 1);
-                }
-            }
-        }
+        let persisted: Option<bool> = unsafe { crate::util::get_master_value(db, &format!("skip_hash_{}", table)) }
+            .ok()
+            .flatten()
+            .map(|v| v == 1);
         if let Some(p) = persisted {
             Some(p)
         } else {
@@ -1278,14 +1236,12 @@ pub fn pull_table_info(
     } else {
         // v2_pks doesn't exist yet — check crsql_master for without_rowid flag
         // persisted by create_crr when the without_rowid option was used.
-        let without_rowid_key = format!("without_rowid_{}\0", table);
-        let stmt = db.prepare_v2("SELECT value FROM crsql_master WHERE key = ?\0");
-        if let Ok(stmt) = stmt {
-            if stmt.bind_text(1, &without_rowid_key, sqlite::Destructor::TRANSIENT).is_ok() {
-                if stmt.step().unwrap_or(ResultCode::DONE) == ResultCode::ROW {
-                    key_is_rowid = false;
-                }
-            }
+        if unsafe { crate::util::get_master_value(db, &format!("without_rowid_{}", table)) }
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            key_is_rowid = false;
         }
     }
     let has_v1 = {

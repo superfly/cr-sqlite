@@ -306,9 +306,7 @@ pub fn drop_v2_tables(
 
     // Clean up PK info from crsql_master
     let pk_key = format!("v2_pks_{}", table);
-    let stmt = db.prepare_v2("DELETE FROM crsql_master WHERE key = ?")?;
-    stmt.bind_text(1, &pk_key, sqlite::Destructor::TRANSIENT)?;
-    stmt.step()?;
+    unsafe { crate::util::clear_master_key(db, &pk_key) }?;
 
     Ok(ResultCode::OK)
 }

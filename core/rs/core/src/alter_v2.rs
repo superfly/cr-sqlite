@@ -82,15 +82,11 @@ unsafe fn check_pk_changed_v2(
     tbl_info: &TableInfo,
 ) -> Result<bool, ResultCode> {
     let pk_key = format!("v2_pks_{}", tbl_name);
-    let stmt = db.prepare_v2("SELECT value FROM crsql_master WHERE key = ?\0")?;
-    stmt.bind_text(1, &pk_key, sqlite_nostd::Destructor::TRANSIENT)?;
-    let stored = match stmt.step()? {
-        ResultCode::ROW => stmt.column_text(0)?.to_string(),
-        _ => return Ok(false),
-    };
-    drop(stmt);
-
-    Ok(stored != crate::bootstrap_v2::compute_pk_signature(tbl_info))
+    let stored = unsafe { crate::util::get_master_text_value(db, &pk_key) }?;
+    match stored {
+        Some(s) => Ok(s != crate::bootstrap_v2::compute_pk_signature(tbl_info)),
+        None => Ok(false),
+    }
 }
 
 /// Sync v2_col_map with the current table schema.

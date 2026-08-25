@@ -22,6 +22,45 @@ use crate::tableinfo::{crsql_ensure_table_infos_are_up_to_date, TableInfo, Schem
 use crate::util::slab_rowid;
 use crate::consts;
 
+/// Set the sync bit, run `f`, then clear the sync bit.
+/// Ensures the clear always runs even if `f` returns an error.
+unsafe fn with_sync_bit<F, T>(ext_data: *mut crsql_ExtData, f: F) -> Result<T, ResultCode>
+where
+    F: FnOnce() -> Result<T, ResultCode>,
+{
+    (*ext_data).pSetSyncBitStmt.step()?;
+    (*ext_data).pSetSyncBitStmt.reset()?;
+    let result = f();
+    (*ext_data).pClearSyncBitStmt.step()?;
+    (*ext_data).pClearSyncBitStmt.reset()?;
+    result
+}
+
+/// Get site ordinal, or 0 if site_id is empty (local site).
+unsafe fn get_site_ordinal_or_zero(
+    ext_data: *mut crsql_ExtData,
+    site_id: &[u8],
+) -> Result<i64, ResultCode> {
+    if site_id.is_empty() {
+        Ok(0)
+    } else {
+        get_or_set_site_ordinal(ext_data, site_id)
+    }
+}
+
+/// Collect PK values from the first N columns of a stmt into a Vec<ColumnValue>.
+unsafe fn collect_pks_from_stmt(
+    stmt: *mut sqlite::stmt,
+    n_pks: usize,
+) -> Result<Vec<ColumnValue>, ResultCode> {
+    let mut result = Vec::with_capacity(n_pks);
+    for i in 0..n_pks {
+        let val = <_ as sqlite::Stmt>::column_value(&stmt, i as i32);
+        result.push(sqlite_value_to_column_value(val));
+    }
+    Ok(result)
+}
+
 /**
  * did_cid_win does not take into account the causal length.
  * The expectation is that all causal length concerns have already been handle
@@ -1273,14 +1312,12 @@ unsafe fn v2_insert_base_row(
 ) -> Result<(), ResultCode> {
     let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
     let v2 = v2_ref.as_mut().unwrap();
-    (*ext_data).pSetSyncBitStmt.step()?;
-    (*ext_data).pSetSyncBitStmt.reset()?;
-    let mut base_stmt = v2.base_insert();
-    bind_package_to_stmt(base_stmt.stmt, unpacked_pks, 0)?;
-    base_stmt.step()?;
-    (*ext_data).pClearSyncBitStmt.step()?;
-    (*ext_data).pClearSyncBitStmt.reset()?;
-    Ok(())
+    with_sync_bit(ext_data, || {
+        let mut base_stmt = v2.base_insert();
+        bind_package_to_stmt(base_stmt.stmt, unpacked_pks, 0)?;
+        base_stmt.step()?;
+        Ok(())
+    })
 }
 
 /// Insert a new PK row into v2_pks and return the __crsql_key.
@@ -1405,11 +1442,7 @@ unsafe fn v2_merge_insert_tombstone(
     }
 
     let merge_equal = unsafe { (*ext_data).mergeEqualValues };
-    let site_ordinal = if insert_site_id.is_empty() {
-        0
-    } else {
-        get_or_set_site_ordinal(ext_data, insert_site_id)?
-    };
+    let site_ordinal = get_site_ordinal_or_zero(ext_data, insert_site_id)?;
 
     let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
     let v2 = v2_ref.as_mut().unwrap();
@@ -1442,10 +1475,7 @@ unsafe fn v2_merge_insert_tombstone(
             let mut stmt = v2.pk_lookup_by_key();
             stmt.bind_int64(1, local_key)?;
             if stmt.step()? == ResultCode::ROW {
-                for i in 0..tbl_info.pks.len() {
-                    let val = stmt.column_value(i as i32)?;
-                    local_pks.push(sqlite_value_to_column_value(val));
-                }
+                local_pks = collect_pks_from_stmt(stmt.stmt, tbl_info.pks.len())?;
             }
         }
 
@@ -1510,11 +1540,7 @@ unsafe fn v2_packed_merge(
 
     // Ensure alive row exists at incoming_cl. Handles stale bail, resurrection,
     // skipped-delete cleanup, and new row creation in one shot.
-    let site_ordinal = if site_id.is_empty() {
-        0
-    } else {
-        get_or_set_site_ordinal(ext_data, site_id)?
-    };
+    let site_ordinal = get_site_ordinal_or_zero(ext_data, site_id)?;
     let (local_key, local_cl) = match v2_ensure_alive_row_at_cl(
         db, ext_data, tbl_info, unpacked_pks, hashed_pk, incoming_cl,
         db_vrsn, site_ordinal,
@@ -1569,19 +1595,18 @@ unsafe fn v2_nuke_local_row(
     }
 
     // Delete from base table (with sync bit to prevent trigger recursion)
-    (*ext_data).pSetSyncBitStmt.step()?;
-    (*ext_data).pSetSyncBitStmt.reset()?;
-    if tbl_info.key_is_rowid {
-        let mut stmt = v2.base_delete_rowid();
-        stmt.bind_int64(1, key)?;
-        stmt.step()?;
-    } else {
-        let mut stmt = v2.base_delete_nonrowid()?;
-        bind_package_to_stmt(stmt.stmt, unpacked_pks, 0)?;
-        stmt.step()?;
-    }
-    (*ext_data).pClearSyncBitStmt.step()?;
-    (*ext_data).pClearSyncBitStmt.reset()?;
+    with_sync_bit(ext_data, || {
+        if tbl_info.key_is_rowid {
+            let mut stmt = v2.base_delete_rowid();
+            stmt.bind_int64(1, key)?;
+            stmt.step()?;
+        } else {
+            let mut stmt = v2.base_delete_nonrowid()?;
+            bind_package_to_stmt(stmt.stmt, unpacked_pks, 0)?;
+            stmt.step()?;
+        }
+        Ok(())
+    })?;
 
     Ok(())
 }
@@ -1643,11 +1668,7 @@ unsafe fn v2_lookup_pks_for_v1_copy(
         let mut stmt = v2.lookup_pks_tomb()?;
         stmt.bind_blob(1, hashed_pk, sqlite::Destructor::STATIC)?;
         if stmt.step()? == ResultCode::ROW {
-            let mut result = Vec::new();
-            for i in 0..tbl_info.pks.len() {
-                result.push(sqlite_value_to_column_value(stmt.column_value(i as i32)?));
-            }
-            return Ok(result);
+            return Ok(collect_pks_from_stmt(stmt.stmt, tbl_info.pks.len())?);
         }
     }
 
@@ -1656,11 +1677,7 @@ unsafe fn v2_lookup_pks_for_v1_copy(
         let mut stmt = v2.lookup_pks_alive()?;
         stmt.bind_blob(1, hashed_pk, sqlite::Destructor::STATIC)?;
         if stmt.step()? == ResultCode::ROW {
-            let mut result = Vec::new();
-            for i in 0..tbl_info.pks.len() {
-                result.push(sqlite_value_to_column_value(stmt.column_value(i as i32)?));
-            }
-            return Ok(result);
+            return Ok(collect_pks_from_stmt(stmt.stmt, tbl_info.pks.len())?);
         }
     }
 
@@ -1782,11 +1799,7 @@ unsafe fn v2_apply_value_change_colval(
     col_id_bits: u32,
 ) -> Result<(), ResultCode> {
     // Get site ordinal
-    let site_ordinal = if site_id.is_empty() {
-        0
-    } else {
-        get_or_set_site_ordinal(ext_data, site_id)?
-    };
+    let site_ordinal = get_site_ordinal_or_zero(ext_data, site_id)?;
 
     // Get col_id
     let col_id = v2_get_col_id(db, tbl_info, ext_data, col_name)?;
@@ -1843,32 +1856,27 @@ unsafe fn v2_apply_value_change_colval(
 
     // Change won — update the actual user table.
     // Set sync bit to suppress triggers that would overwrite V2 clock with local site_id.
-    (*ext_data).pSetSyncBitStmt.step()?;
-    (*ext_data).pSetSyncBitStmt.reset()?;
-
-    let merge_stmt_ref = tbl_info.get_merge_insert_stmt(db, col_name)?;
-    let merge_stmt = merge_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
-    bind_package_to_stmt(merge_stmt.stmt, unpacked_pks, 0)?;
-    let raw_stmt = merge_stmt.stmt;
-    match val {
-        ColumnValue::Integer(i) => { raw_stmt.bind_int64(pk_len + 1, *i)?; }
-        ColumnValue::Float(f) => { raw_stmt.bind_double(pk_len + 1, *f)?; }
-        ColumnValue::Text(t) => { raw_stmt.bind_text(pk_len + 1, t, sqlite::Destructor::STATIC)?; }
-        ColumnValue::Blob(b) => { raw_stmt.bind_blob(pk_len + 1, b, sqlite::Destructor::STATIC)?; }
-        ColumnValue::Null => { raw_stmt.bind_null(pk_len + 1)?; }
-    }
-    match val {
-        ColumnValue::Integer(i) => { raw_stmt.bind_int64(pk_len + 2, *i)?; }
-        ColumnValue::Float(f) => { raw_stmt.bind_double(pk_len + 2, *f)?; }
-        ColumnValue::Text(t) => { raw_stmt.bind_text(pk_len + 2, t, sqlite::Destructor::STATIC)?; }
-        ColumnValue::Blob(b) => { raw_stmt.bind_blob(pk_len + 2, b, sqlite::Destructor::STATIC)?; }
-        ColumnValue::Null => { raw_stmt.bind_null(pk_len + 2)?; }
-    }
-    raw_stmt.step()?;
-    raw_stmt.reset()?;
-
-    (*ext_data).pClearSyncBitStmt.step()?;
-    (*ext_data).pClearSyncBitStmt.reset()?;
-
-    Ok(())
+    with_sync_bit(ext_data, || {
+        let merge_stmt_ref = tbl_info.get_merge_insert_stmt(db, col_name)?;
+        let merge_stmt = merge_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
+        bind_package_to_stmt(merge_stmt.stmt, unpacked_pks, 0)?;
+        let raw_stmt = merge_stmt.stmt;
+        match val {
+            ColumnValue::Integer(i) => { raw_stmt.bind_int64(pk_len + 1, *i)?; }
+            ColumnValue::Float(f) => { raw_stmt.bind_double(pk_len + 1, *f)?; }
+            ColumnValue::Text(t) => { raw_stmt.bind_text(pk_len + 1, t, sqlite::Destructor::STATIC)?; }
+            ColumnValue::Blob(b) => { raw_stmt.bind_blob(pk_len + 1, b, sqlite::Destructor::STATIC)?; }
+            ColumnValue::Null => { raw_stmt.bind_null(pk_len + 1)?; }
+        }
+        match val {
+            ColumnValue::Integer(i) => { raw_stmt.bind_int64(pk_len + 2, *i)?; }
+            ColumnValue::Float(f) => { raw_stmt.bind_double(pk_len + 2, *f)?; }
+            ColumnValue::Text(t) => { raw_stmt.bind_text(pk_len + 2, t, sqlite::Destructor::STATIC)?; }
+            ColumnValue::Blob(b) => { raw_stmt.bind_blob(pk_len + 2, b, sqlite::Destructor::STATIC)?; }
+            ColumnValue::Null => { raw_stmt.bind_null(pk_len + 2)?; }
+        }
+        raw_stmt.step()?;
+        raw_stmt.reset()?;
+        Ok(())
+    })
 }

@@ -312,7 +312,7 @@ fn validate_sync_log_transition(old: c_int, new: c_int, use_version: c_int, writ
 
 /// Find all tables in sqlite_master whose name ends with `suffix`,
 /// returning the base table names (with the suffix stripped).
-fn find_tables_with_suffix(
+pub fn find_tables_with_suffix(
     db: *mut sqlite_nostd::sqlite3,
     suffix: &str,
 ) -> Result<Vec<alloc::string::String>, ResultCode> {

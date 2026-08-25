@@ -269,9 +269,9 @@ unsafe fn migrate_v1_to_v2_chunk(
 
     // Process a chunk of rows
     let (pk_cols_list, _) = crate::v2_stmts::pk_cols_and_values(&tbl_info.pks);
-    let pk_cols_p_list: String = tbl_info.pks.iter().map(|c| format!("p.\"{}\"", crate::util::escape_ident(&c.name))).collect::<Vec<_>>().join(", ");
+    let pk_cols_p_list = crate::util::as_identifier_list(&tbl_info.pks, Some("p."))?;
     // PK columns qualified with t. (backing table alias) for rowid-key tables
-    let pk_cols_t_list: String = tbl_info.pks.iter().map(|c| format!("t.\"{}\"", crate::util::escape_ident(&c.name))).collect::<Vec<_>>().join(", ");
+    let pk_cols_t_list = crate::util::as_identifier_list(&tbl_info.pks, Some("t."))?;
 
     let sentinel = crate::c::INSERT_SENTINEL;
     let col_id_bits = consts::CRSQL_COL_ID_BITS as i64;
