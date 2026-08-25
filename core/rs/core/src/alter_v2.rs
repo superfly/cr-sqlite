@@ -185,7 +185,7 @@ unsafe fn sync_col_map_v2(
         }
     }
 
-    // Batch insert all new columns in a single statement
+    // Insert all new columns
     if !new_col_rows.is_empty() {
         let placeholders = new_col_rows.iter().map(|_| "(?, ?)").collect::<Vec<_>>().join(", ");
         let stmt = db.prepare_v2(&format!(
