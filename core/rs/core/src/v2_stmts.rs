@@ -104,6 +104,12 @@ pub struct V2Stmts {
     /// SELECT pk_cols FROM base table WHERE rowid_alias = ? (rowid-key) or
     /// SELECT pk_cols FROM v2_pks WHERE __crsql_key = ? (non-rowid) — merge PK lookup
     pk_lookup_by_key: ManagedStmt,
+    /// Per-column base table UPDATE statements. Keyed by column name.
+    /// For rowid-key tables: UPDATE base SET "col" = ? WHERE rowid_alias = ?
+    /// For non-rowid tables: UPDATE base SET "col" = ? WHERE pk1 = ? AND pk2 = ? ...
+    /// V2 guarantees the row exists (created by v2_ensure_alive_row_at_cl),
+    /// so a plain UPDATE is more efficient than INSERT ... ON CONFLICT DO UPDATE.
+    base_updates: alloc::collections::BTreeMap<String, ManagedStmt>,
 
     // --- V1 interop (hydration + mirror) ---
     // --- V1 interop (only prepared when SchemaVersion::V2AndV1) ---
@@ -508,6 +514,14 @@ impl V2Stmts {
             base_delete_nonrowid,
             base_lookup_rowid,
             pk_lookup_by_key,
+            base_updates: {
+                let mut map = alloc::collections::BTreeMap::new();
+                for col in &tbl_info.non_pks {
+                    let sql = base_update_sql(tbl_info, &escaped, &col.name);
+                    map.insert(col.name.clone(), db.prepare_v3(&sql, sqlite::PREPARE_PERSISTENT)?);
+                }
+                map
+            },
             v1_sentinel_lookup,
             v1_any_clock_lookup,
             v1_sentinel_detail,
@@ -553,6 +567,11 @@ impl V2Stmts {
     pub fn base_insert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.base_insert) }
     pub fn base_delete_rowid(&mut self) -> StmtGuard { StmtGuard::new(&mut self.base_delete_rowid) }
     pub fn pk_lookup_by_key(&mut self) -> StmtGuard { StmtGuard::new(&mut self.pk_lookup_by_key) }
+    /// Get a per-column base table UPDATE statement.
+    /// All statements are pre-prepared at V2Stmts construction time.
+    pub fn base_update(&mut self, col_name: &str) -> Result<StmtGuard, ResultCode> {
+        Ok(StmtGuard::new(self.base_updates.get_mut(col_name).ok_or(ResultCode::ERROR)?))
+    }
     pub fn v1_sentinel_lookup(&mut self) -> Result<StmtGuard, ResultCode> {
         self.v1_sentinel_lookup.as_mut().map(StmtGuard::new).ok_or(ResultCode::ERROR)
     }
@@ -634,6 +653,22 @@ fn clock_merge_upsert_sql(tbl_info: &TableInfo, escaped: &str, col_name: &str) -
         suffix = consts::V2_CLOCK_SUFFIX,
         subquery = subquery,
     )
+}
+
+/// Build a per-column base table UPDATE statement.
+/// V2 guarantees the row exists, so a plain UPDATE is more efficient than
+/// INSERT ... ON CONFLICT DO UPDATE (no failed INSERT attempt).
+fn base_update_sql(tbl_info: &TableInfo, escaped: &str, col_name: &str) -> String {
+    let escaped_col = crate::util::escape_ident(col_name);
+    if tbl_info.key_is_rowid {
+        let alias = crate::util::escape_ident(&tbl_info.rowid_alias);
+        format!("UPDATE \"{escaped}\" SET \"{escaped_col}\" = ? WHERE \"{alias}\" = ?")
+    } else {
+        let pk_where: Vec<String> = tbl_info.pks.iter()
+            .map(|c| format!("\"{}\" = ?", crate::util::escape_ident(&c.name)))
+            .collect();
+        format!("UPDATE \"{escaped}\" SET \"{escaped_col}\" = ? WHERE {}", pk_where.join(" AND "))
+    }
 }
 
 fn v2_pk_lookup_where(tbl_info: &TableInfo, is_pks_table: bool) -> (String, bool) {
