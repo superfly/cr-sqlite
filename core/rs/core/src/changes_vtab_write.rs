@@ -1858,7 +1858,7 @@ unsafe fn v2_apply_value_change_colval(
     stmt.bind_int(9 + subquery_param_count, merge_equal)?;
 
     let won = stmt.step()? == ResultCode::ROW;
-    // StmtGuard auto-resets on drop
+    drop(stmt); // Release borrow on v2 before getting base_update
 
     if !won {
         return Ok(());
@@ -1866,27 +1866,32 @@ unsafe fn v2_apply_value_change_colval(
 
     // Change won — update the actual user table.
     // Set sync bit to suppress triggers that would overwrite V2 clock with local site_id.
+    // V2 guarantees the row exists (created by v2_ensure_alive_row_at_cl),
+    // so we use a plain UPDATE instead of INSERT ... ON CONFLICT DO UPDATE.
+    //
+    // TODO(0.19): Batch multi-column changes into a single UPDATE statement
+    // when all columns are available (V2 wire format coalesced changes).
+    // Instead of N per-column UPDATEs, do one:
+    //   UPDATE base SET col1 = ?, col2 = ?, ... WHERE rowid = ?
+    // This requires hoisting the per-column conflict resolution to determine
+    // all winning columns first, then issuing a single base table write.
     with_sync_bit(ext_data, || {
-        let merge_stmt_ref = tbl_info.get_merge_insert_stmt(db, col_name)?;
-        let merge_stmt = merge_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
-        bind_package_to_stmt(merge_stmt.stmt, unpacked_pks, 0)?;
-        let raw_stmt = merge_stmt.stmt;
+        let mut update_stmt = v2.base_update(col_name)?;
+        // Bind value as param 1
         match val {
-            ColumnValue::Integer(i) => { raw_stmt.bind_int64(pk_len + 1, *i)?; }
-            ColumnValue::Float(f) => { raw_stmt.bind_double(pk_len + 1, *f)?; }
-            ColumnValue::Text(t) => { raw_stmt.bind_text(pk_len + 1, t, sqlite::Destructor::STATIC)?; }
-            ColumnValue::Blob(b) => { raw_stmt.bind_blob(pk_len + 1, b, sqlite::Destructor::STATIC)?; }
-            ColumnValue::Null => { raw_stmt.bind_null(pk_len + 1)?; }
+            ColumnValue::Integer(i) => { update_stmt.bind_int64(1, *i)?; }
+            ColumnValue::Float(f) => { update_stmt.bind_double(1, *f)?; }
+            ColumnValue::Text(t) => { update_stmt.bind_text(1, t, sqlite::Destructor::STATIC)?; }
+            ColumnValue::Blob(b) => { update_stmt.bind_blob(1, b, sqlite::Destructor::STATIC)?; }
+            ColumnValue::Null => { update_stmt.bind_null(1)?; }
         }
-        match val {
-            ColumnValue::Integer(i) => { raw_stmt.bind_int64(pk_len + 2, *i)?; }
-            ColumnValue::Float(f) => { raw_stmt.bind_double(pk_len + 2, *f)?; }
-            ColumnValue::Text(t) => { raw_stmt.bind_text(pk_len + 2, t, sqlite::Destructor::STATIC)?; }
-            ColumnValue::Blob(b) => { raw_stmt.bind_blob(pk_len + 2, b, sqlite::Destructor::STATIC)?; }
-            ColumnValue::Null => { raw_stmt.bind_null(pk_len + 2)?; }
+        // Bind rowid or PKs as params 2..
+        if tbl_info.key_is_rowid {
+            update_stmt.bind_int64(2, key)?;
+        } else {
+            bind_package_to_stmt(update_stmt.stmt, unpacked_pks, 1)?;
         }
-        raw_stmt.step()?;
-        raw_stmt.reset()?;
+        update_stmt.step()?;
         Ok(())
     })
 }
