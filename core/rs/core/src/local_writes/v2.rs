@@ -30,6 +30,7 @@ fn bind_row_state_lookup(
         stmt.bind_blob(2, blob, Destructor::STATIC)
             .map_err(|e| format!("bind: {:?}", e))?;
     } else {
+        // In skip_hash mode, we can only have one PK column
         stmt.bind_value(1, pks[0])
             .map_err(|e| format!("bind: {:?}", e))?;
         stmt.bind_value(2, pks[0])
@@ -38,28 +39,79 @@ fn bind_row_state_lookup(
     Ok(())
 }
 
+/// Result of looking up a row's state in v2_pks / v2_tombstones.
+enum RowState {
+    Alive(i64, i64),    // (key, cl) — row is in v2_pks
+    Dead(i64),          // cl — row is in v2_tombstones (key is NULL)
+    NotFound,           // row doesn't exist in either table
+}
+
+/// Bind PKs to lookup_row_state and return the row state.
+fn lookup_row_state(
+    v2_stmts: &mut crate::v2_stmts::V2Stmts,
+    pks: &[*mut sqlite::value],
+    hashed_pk: &Option<alloc::vec::Vec<u8>>,
+    use_hash: bool,
+) -> Result<RowState, String> {
+    let mut stmt = v2_stmts.lookup_row_state();
+    bind_row_state_lookup(&mut stmt, pks, hashed_pk, use_hash)?;
+    match stmt.step().map_err(|e| format!("step: {:?}", e))? {
+        ResultCode::ROW => {
+            if stmt.column_type(0).map_err(|e| format!("column_type: {:?}", e))? == sqlite::ColumnType::Null {
+                Ok(RowState::Dead(stmt.column_int64(1)))
+            } else {
+                Ok(RowState::Alive(stmt.column_int64(0), stmt.column_int64(1)))
+            }
+        }
+        ResultCode::DONE => Ok(RowState::NotFound),
+        _ => Err("unexpected result from lookup_row_state".to_string()),
+    }
+}
+
 /// Bind PK values (and hashed_pk if hash mode) to a v2_pks INSERT statement.
 /// Returns the next bind slot index (for optional cl bind in resurrection).
+/// For key_is_rowid tables, `rowid` is used as __crsql_key (slot 1).
+/// For has_integer_pk tables, pks[0] IS the rowid so rowid is redundant.
+/// For key_is_rowid && !has_integer_pk, rowid must be provided explicitly
+/// since pks[0] is the PK column value, not the rowid.
 fn bind_pks_insert(
     stmt: &mut StmtGuard,
     tbl_info: &TableInfo,
     pks: &[*mut sqlite::value],
     hashed_pk: &Option<alloc::vec::Vec<u8>>,
+    rowid: Option<i64>,
 ) -> Result<i32, String> {
     let bind_err = |e: sqlite::ResultCode| format!("bind: {:?}", e);
-    if tbl_info.skip_hash && tbl_info.key_is_rowid {
-        stmt.bind_value(1, pks[0]).map_err(bind_err)?;
-        Ok(2)
+    if tbl_info.key_is_rowid {
+        // __crsql_key = rowid. For has_integer_pk, pks[0] == rowid so either works.
+        // For !has_integer_pk, we must use the explicit rowid.
+        let key_val = if tbl_info.has_integer_pk {
+            pks[0]
+        } else {
+            // Use the explicit rowid — bind as int64
+            stmt.bind_int64(1, rowid.ok_or("rowid-key table missing rowid for pks_insert")?);
+            // Still need to bind PK columns for the index (skip_hash) or hashed_pk
+            if tbl_info.skip_hash {
+                return Ok(2);
+            }
+            stmt.bind_blob(2, hashed_pk.as_ref().unwrap(), Destructor::STATIC)
+                .map_err(bind_err)?;
+            return Ok(3);
+        };
+        if tbl_info.skip_hash {
+            stmt.bind_value(1, key_val).map_err(bind_err)?;
+            Ok(2)
+        } else {
+            stmt.bind_value(1, key_val).map_err(bind_err)?;
+            stmt.bind_blob(2, hashed_pk.as_ref().unwrap(), Destructor::STATIC)
+                .map_err(bind_err)?;
+            Ok(3)
+        }
     } else if tbl_info.skip_hash {
         for (i, pk) in pks.iter().enumerate() {
             stmt.bind_value(i as i32 + 1, *pk).map_err(bind_err)?;
         }
         Ok(pks.len() as i32 + 1)
-    } else if tbl_info.key_is_rowid {
-        stmt.bind_value(1, pks[0]).map_err(bind_err)?;
-        stmt.bind_blob(2, hashed_pk.as_ref().unwrap(), Destructor::STATIC)
-            .map_err(bind_err)?;
-        Ok(3)
     } else {
         for (i, pk) in pks.iter().enumerate() {
             stmt.bind_value(i as i32 + 1, *pk).map_err(bind_err)?;
@@ -86,11 +138,14 @@ fn compute_hashed_pk(
 }
 
 /// V2 after_insert: write to v2_pks and v2_clock tables.
+/// `rowid` is the actual rowid for key_is_rowid tables (needed when
+/// !has_integer_pk since pks[0] is the PK value, not the rowid).
 pub fn v2_after_insert(
     db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
     tbl_info: &TableInfo,
     pks_new: &[*mut sqlite::value],
+    rowid: Option<i64>,
 ) -> Result<ResultCode, String> {
     // V2 clock tables require a non-zero ts. Error early if not set.
     if unsafe { (*ext_data).timestamp } == 0 {
@@ -110,40 +165,27 @@ pub fn v2_after_insert(
 
     // Single lookup: alive (key, cl) from v2_pks or dead (NULL, cl) from v2_tombstones.
     let use_hash = !skip_hash;
-    let (key_opt, cl) = {
-        let mut stmt = v2_stmts.lookup_row_state();
-        bind_row_state_lookup(&mut stmt, pks_new, &hashed_pk, use_hash)?;
-        match stmt.step().map_err(|e| format!("step: {:?}", e))? {
-            ResultCode::ROW => {
-                if stmt.column_type(0).map_err(|e| format!("column_type: {:?}", e))? == sqlite::ColumnType::Null {
-                    (None, stmt.column_int64(1)) // dead — in tombstones
-                } else {
-                    (Some(stmt.column_int64(0)), stmt.column_int64(1)) // alive — in v2_pks
-                }
-            }
-            ResultCode::DONE => (None, 0), // truly new row
-            _ => return Err("unexpected result from lookup_row_state".to_string()),
+    // Row must be Dead (resurrection) or NotFound (fresh insert). Alive is a
+    // logic error: with recursive_triggers ON (which cr-sqlite enforces),
+    // INSERT OR REPLACE fires DELETE then INSERT, so the row should be in
+    // v2_tombstones by the time we get here. Reaching Alive means either
+    // recursive_triggers was turned off or data is corrupt.
+    let cl = match lookup_row_state(v2_stmts, pks_new, &hashed_pk, use_hash)? {
+        RowState::Alive(..) => {
+            return Err("v2_after_insert: row already alive in v2_pks — recursive_triggers may be disabled or data is corrupt".to_string());
         }
-        // guard drops here → auto reset + clear_bindings
+        RowState::Dead(cl) => cl,
+        RowState::NotFound => 0,
     };
 
-    if let Some(k) = key_opt {
-        // Row exists in v2_pks — update CL if it was previously dead (even CL)
-        if cl % 2 == 0 {
-            let _ = bump_seq(ext_data);
-            let new_cl = cl + 1;
-            let mut upd = v2_stmts.pks_update_cl();
-            upd.bind_int64(1, new_cl).map_err(|e| format!("bind: {:?}", e))?;
-            upd.bind_int64(2, k).map_err(|e| format!("bind: {:?}", e))?;
-            upd.step().map_err(|e| format!("step: {:?}", e))?;
-        }
-        return finish_insert(db, ext_data, tbl_info, v2_stmts, k, db_version, ts_val);
-    }
-
     // Row is either dead (in tombstones) or truly new.
-    let key = if cl > 0 {
-        // Resurrection: row was in tombstones (cl > 0 means we found a tombstone entry)
-        let new_cl = cl + 1; // even→odd = resurrection
+    // cl=0 for NotFound (fresh insert → cl=1), cl=even for Dead (resurrection → cl+1).
+    let new_cl = cl + 1;
+
+    // Resurrection: remove tombstone entries before re-inserting into v2_pks.
+    if cl > 0 {
+        // Bump seq to stay in sync with V1, which bumps seq for the delete
+        // trigger's tombstone insert before the insert trigger runs.
         let _ = bump_seq(ext_data);
 
         // Remove from v2_tombstones
@@ -167,30 +209,24 @@ pub fn v2_after_insert(
                 .map_err(|e| format!("bind: {:?}", e))?;
             del.step().map_err(|e| format!("step: {:?}", e))?;
         }
+    }
 
-        // Re-insert into v2_pks with resurrected CL
-        let mut ins = v2_stmts.pks_insert();
-        let cl_slot = bind_pks_insert(&mut ins, tbl_info, pks_new, &hashed_pk)?;
-        ins.bind_int64(cl_slot, new_cl).map_err(|e| format!("bind: {:?}", e))?;
-        ins.step().map_err(|e| format!("step: {:?}", e))?;
-        ins.column_int64(0)
-    } else {
-        // Truly new row — insert into v2_pks with cl=1
-        let mut ins = v2_stmts.pks_insert();
-        let cl_slot = bind_pks_insert(&mut ins, tbl_info, pks_new, &hashed_pk)?;
-        ins.bind_int64(cl_slot, 1).map_err(|e| format!("bind: {:?}", e))?;
-        ins.step().map_err(|e| {
-            let errmsg = db.errmsg().unwrap_or_else(|_| "unknown".to_string());
-            format!("step: {:?} - {}", e, errmsg)
-        })?;
-        ins.column_int64(0)
-    };
+    // Insert into v2_pks and get the assigned __crsql_key
+    let mut ins = v2_stmts.pks_insert();
+    let cl_slot = bind_pks_insert(&mut ins, tbl_info, pks_new, &hashed_pk, rowid)?;
+    ins.bind_int64(cl_slot, new_cl).map_err(|e| format!("bind: {:?}", e))?;
+    ins.step().map_err(|e| {
+        let errmsg = db.errmsg().unwrap_or_else(|_| "unknown".to_string());
+        format!("step: {:?} - {}", e, errmsg)
+    })?;
+    let key = ins.column_int64(0);
+    drop(ins);
 
-    finish_insert(db, ext_data, tbl_info, v2_stmts, key, db_version, ts_val)
+    write_clock_entries(db, ext_data, tbl_info, v2_stmts, key, db_version, ts_val)
 }
 
 /// Write clock entries for each non-PK column (or sentinel for pk-only tables).
-fn finish_insert(
+fn write_clock_entries(
     _db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
     tbl_info: &TableInfo,
@@ -244,18 +280,10 @@ pub fn v2_after_update(
     let v2_stmts = v2_stmts_ref.as_mut().unwrap();
 
     // Lookup __crsql_key — row must be alive (in v2_pks). Dead or missing = error.
-    let key = {
-        let mut stmt = v2_stmts.lookup_row_state();
-        bind_row_state_lookup(&mut stmt, pks_new, &hashed_pk, !skip_hash)?;
-        match stmt.step().map_err(|e| format!("step: {:?}", e))? {
-            ResultCode::ROW => {
-                if stmt.column_type(0).map_err(|e| format!("column_type: {:?}", e))? == sqlite::ColumnType::Null {
-                    return Err("row is dead (in tombstones) — cannot update a deleted row".to_string());
-                }
-                stmt.column_int64(0)
-            }
-            _ => return Err("row not found in v2_pks for update".to_string()),
-        }
+    let key = match lookup_row_state(v2_stmts, pks_new, &hashed_pk, !skip_hash)? {
+        RowState::Alive(key, _) => key,
+        RowState::Dead(_) => return Err("row is dead (in tombstones) — cannot update a deleted row".to_string()),
+        RowState::NotFound => return Err("row not found in v2_pks for update".to_string()),
     };
 
     // Update clock entries for each changed column
@@ -299,29 +327,20 @@ pub fn v2_after_delete(
     let v2_stmts = v2_stmts_ref.as_mut().unwrap();
 
     // Lookup __crsql_key and cl — row must be alive (in v2_pks). Dead or missing = no-op.
-    let (key, cl) = {
-        let mut stmt = v2_stmts.lookup_row_state();
-        bind_row_state_lookup(&mut stmt, pks_old, &hashed_pk, !skip_hash)?;
-        match stmt.step().map_err(|e| format!("step: {:?}", e))? {
-            ResultCode::ROW => {
-                if stmt.column_type(0).map_err(|e| format!("column_type: {:?}", e))? == sqlite::ColumnType::Null {
-                    // Row is already dead (in tombstones) — nothing to do.
-                    return Ok(ResultCode::OK);
-                }
-                (stmt.column_int64(0), stmt.column_int64(1))
-            }
-            // Not in v2_pks or v2_tombstones — never tracked. No-op.
-            _ => return Ok(ResultCode::OK),
-        }
+    let (key, cl) = match lookup_row_state(v2_stmts, pks_old, &hashed_pk, !skip_hash)? {
+        RowState::Alive(key, cl) => (key, cl),
+        // Row is already dead (in tombstones) or never tracked — nothing to do.
+        RowState::Dead(_) | RowState::NotFound => return Ok(ResultCode::OK),
     };
 
     let new_cl = cl + 1;
     let seq = bump_seq(ext_data);
+    let bind_err = |e: sqlite::ResultCode| format!("bind: {:?}", e);
 
     // Delete from v2_pks
     {
         let mut del = v2_stmts.pks_delete();
-        del.bind_int64(1, key).map_err(|e| format!("bind: {:?}", e))?;
+        del.bind_int64(1, key).map_err(bind_err)?;
         del.step().map_err(|e| format!("step: {:?}", e))?;
     }
 
@@ -329,24 +348,24 @@ pub fn v2_after_delete(
     {
         let mut del = v2_stmts.clock_delete_range();
         let base = key << consts::CRSQL_COL_ID_BITS as i64;
-        del.bind_int64(1, base).map_err(|e| format!("bind: {:?}", e))?;
-        del.bind_int64(2, base | consts::CRSQL_COL_ID_MASK as i64).map_err(|e| format!("bind: {:?}", e))?;
+        del.bind_int64(1, base).map_err(bind_err)?;
+        del.bind_int64(2, base | consts::CRSQL_COL_ID_MASK as i64).map_err(bind_err)?;
         del.step().map_err(|e| format!("step: {:?}", e))?;
     }
 
     // Insert tombstone
     {
         let mut ins = v2_stmts.tomb_insert();
-        ins.bind_int(1, 0).map_err(|e| format!("bind: {:?}", e))?;
-        ins.bind_int64(2, db_version).map_err(|e| format!("bind: {:?}", e))?;
-        ins.bind_int(3, seq).map_err(|e| format!("bind: {:?}", e))?;
+        ins.bind_int(1, 0).map_err(bind_err)?;
+        ins.bind_int64(2, db_version).map_err(bind_err)?;
+        ins.bind_int(3, seq).map_err(bind_err)?;
         if skip_hash {
-            ins.bind_value(4, pks_old[0]).map_err(|e| format!("bind: {:?}", e))?;
+            ins.bind_value(4, pks_old[0]).map_err(bind_err)?;
         } else {
-            ins.bind_blob(4, hashed_pk.as_ref().unwrap(), Destructor::STATIC).map_err(|e| format!("bind: {:?}", e))?;
+            ins.bind_blob(4, hashed_pk.as_ref().unwrap(), Destructor::STATIC).map_err(bind_err)?;
         }
-        ins.bind_int64(5, new_cl).map_err(|e| format!("bind: {:?}", e))?;
-        ins.bind_int64(6, ts_val).map_err(|e| format!("bind: {:?}", e))?;
+        ins.bind_int64(5, new_cl).map_err(bind_err)?;
+        ins.bind_int64(6, ts_val).map_err(bind_err)?;
         ins.step().map_err(|e| format!("step: {:?}", e))?;
     }
 
@@ -354,10 +373,9 @@ pub fn v2_after_delete(
     if !skip_hash {
         let mut ins = v2_stmts.tomb_pks_insert()
             .map_err(|e| format!("tomb_pks_insert: {:?}", e))?;
-        ins.bind_blob(1, hashed_pk.as_ref().unwrap(), Destructor::STATIC)
-            .map_err(|e| format!("bind: {:?}", e))?;
+        ins.bind_blob(1, hashed_pk.as_ref().unwrap(), Destructor::STATIC).map_err(bind_err)?;
         for (i, pk) in pks_old.iter().enumerate() {
-            ins.bind_value(i as i32 + 2, *pk).map_err(|e| format!("bind: {:?}", e))?;
+            ins.bind_value(i as i32 + 2, *pk).map_err(bind_err)?;
         }
         ins.step().map_err(|e| format!("step: {:?}", e))?;
     }
