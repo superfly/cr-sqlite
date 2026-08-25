@@ -140,10 +140,6 @@ unsafe fn compact_post_alter(
         db.exec_safe(&sql)?;
     }
 
-    let stmt = db.prepare_v2(
-        "INSERT OR REPLACE INTO crsql_master (key, value) VALUES ('pre_compact_dbversion', ?)",
-    )?;
-    stmt.bind_int64(1, current_db_version)?;
-    stmt.step()?;
+    crate::util::set_master_value(db, "pre_compact_dbversion", current_db_version)?;
     Ok(ResultCode::OK)
 }

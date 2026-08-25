@@ -168,11 +168,8 @@ fn maybe_update_db_inner(
     if is_blank_slate {
         recorded_version = consts::CRSQLITE_VERSION;
     } else {
-        let stmt =
-            db.prepare_v2("SELECT value FROM crsql_master WHERE key = 'crsqlite_version'")?;
-        let step_result = stmt.step()?;
-        if step_result == ResultCode::ROW {
-            recorded_version = stmt.column_int(0);
+        if let Some(v) = unsafe { crate::util::get_master_value(db, "crsqlite_version") }? {
+            recorded_version = v as c_int;
         }
     }
     // libc_print::libc_println!("recorded_version: {}", recorded_version);
@@ -203,10 +200,7 @@ fn maybe_update_db_inner(
             recreate_all_triggers(db, err_msg)?;
         }
 
-        let stmt =
-            db.prepare_v2("INSERT OR REPLACE INTO crsql_master VALUES ('crsqlite_version', ?)")?;
-        stmt.bind_int(1, consts::CRSQLITE_VERSION)?;
-        stmt.step()?;
+        unsafe { crate::util::set_master_value(db, "crsqlite_version", consts::CRSQLITE_VERSION as i64) }?;
     }
 
     Ok(ResultCode::OK)
@@ -240,14 +234,8 @@ fn validate_or_store_compile_constants(
     err_msg: *mut *mut c_char,
 ) -> Result<ResultCode, ResultCode> {
     for (key, compile_val) in COMPILE_CONST_KEYS {
-        let stmt = db.prepare_v2(&format!(
-            "SELECT value FROM crsql_master WHERE key = '{}'",
-            key
-        ))?;
-        let step_result = stmt.step()?;
-        if step_result == ResultCode::ROW {
-            let stored_val = stmt.column_int(0);
-            if stored_val != *compile_val {
+        match unsafe { crate::util::get_master_value(db, key) }? {
+            Some(stored_val) if stored_val != *compile_val as i64 => {
                 let cstring = CString::new(format!(
                     "cr-sqlite compile-time constant mismatch: '{}' was compiled as {} but the database expects {}. \
                     The on-disk data format is incompatible with this build of the extension.",
@@ -258,14 +246,11 @@ fn validate_or_store_compile_constants(
                 }
                 return Err(ResultCode::ERROR);
             }
-        } else {
-            // Key not stored yet (blank slate or upgrading from 0.17): store the compile-time value
-            let stmt = db.prepare_v2(&format!(
-                "INSERT OR REPLACE INTO crsql_master VALUES ('{}', ?)",
-                key
-            ))?;
-            stmt.bind_int(1, *compile_val)?;
-            stmt.step()?;
+            Some(_) => {} // matches
+            None => {
+                // Key not stored yet (blank slate or upgrading from 0.17): store the compile-time value
+                unsafe { crate::util::set_master_value(db, key, *compile_val as i64) }?;
+            }
         }
     }
     Ok(ResultCode::OK)

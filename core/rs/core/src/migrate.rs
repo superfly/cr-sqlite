@@ -145,11 +145,8 @@ unsafe fn process_cleanup_tasks(
     suffixes: &[&str],
 ) -> Result<(), ResultCode> {
     let like_pattern = format!("{}_%", marker_prefix);
-    let sql = format!(
-        "SELECT key FROM crsql_master WHERE key LIKE '{like_pattern}'\0",
-        like_pattern = like_pattern
-    );
-    let stmt = db.prepare_v2(&sql)?;
+    let stmt = db.prepare_v2("SELECT key FROM crsql_master WHERE key LIKE ?\0")?;
+    stmt.bind_text(1, &like_pattern, sqlite_nostd::Destructor::TRANSIENT)?;
     let strip = format!("{}_", marker_prefix);
     let mut tables: Vec<String> = Vec::new();
     while stmt.step()? == ResultCode::ROW {

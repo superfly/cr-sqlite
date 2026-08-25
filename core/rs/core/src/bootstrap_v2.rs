@@ -231,12 +231,7 @@ pub fn create_v2_tables(
     // Store PK column info in crsql_master for alter detection.
     let pk_key = format!("v2_pks_{}", table_name);
     let pk_value = compute_pk_signature(table_info);
-    let stmt = db.prepare_v2(
-        "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, ?)",
-    )?;
-    stmt.bind_text(1, &pk_key, sqlite::Destructor::TRANSIENT)?;
-    stmt.bind_text(2, &pk_value, sqlite::Destructor::TRANSIENT)?;
-    stmt.step()?;
+    unsafe { crate::util::set_master_text_value(db, &pk_key, &pk_value) }?;
 
     Ok(ResultCode::OK)
 }
