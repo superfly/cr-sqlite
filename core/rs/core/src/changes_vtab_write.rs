@@ -1062,6 +1062,15 @@ unsafe fn v2_ensure_alive_row_at_cl(
         // Create zero-version clock entries for all mapped columns so they appear in sync logs.
         // Use the incoming change's site_id and db_version since it created this row.
         // seq=0 for placeholders; the packed column updates will overwrite specific entries.
+        //
+        // col_version=0 here (not 1 like local inserts) because these are placeholders
+        // for columns we haven't received yet. The actual column changes arrive as
+        // separate change rows and overwrite specific entries with col_version=1+.
+        // With V1 wire format, col_version=0 entries appear in the feed but lose to
+        // any local col_version > 0 on merge — safe but potentially wasteful.
+        //
+        // TODO(0.19): In V2-wire-only mode, we can skip zero-fill entirely and only
+        // create clock entries for columns that were actually received in the change.
         let col_id_bits = consts::CRSQL_COL_ID_BITS as i64;
         let base = new_key << col_id_bits;
         let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;

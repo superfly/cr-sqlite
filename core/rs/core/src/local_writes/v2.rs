@@ -226,6 +226,21 @@ pub fn v2_after_insert(
 }
 
 /// Write clock entries for each non-PK column (or sentinel for pk-only tables).
+/// Queries actual col_ids from v2_col_map to handle holes from dropped columns.
+///
+/// All columns get col_version=1 because the insert trigger only receives PK
+/// values, not non-PK column values — we can't distinguish explicitly-set
+/// columns from default-valued ones. Treating the entire row as "explicitly
+/// written" is safe: peers either have no row (accept) or lower CL (accept).
+///
+/// This uses col_version=1 (not 0 like clock_zero_fill) because these are real
+/// local writes, not placeholders. With V1 wire format, col_version=0 entries
+/// would still appear in the feed and be sent to peers as if they were real
+/// changes — wasteful and semantically wrong for a local insert.
+///
+/// TODO(0.19): In V2-wire-only mode, we can optimize this with a single
+/// INSERT INTO ... SELECT FROM v2_col_map statement (like clock_zero_fill but
+/// with col_version=1), avoiding the per-column Rust loop.
 fn write_clock_entries(
     _db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
@@ -235,15 +250,22 @@ fn write_clock_entries(
     db_version: i64,
     ts_val: i64,
 ) -> Result<ResultCode, String> {
-    let col_ids: vec::Vec<usize> = if tbl_info.non_pks.is_empty() {
-        vec![0] // sentinel for pk-only tables
+    // For pk-only tables, use col_id=0 as sentinel. Otherwise, query actual
+    // col_ids from v2_col_map (may have holes from dropped columns).
+    let col_ids: vec::Vec<i64> = if tbl_info.non_pks.is_empty() {
+        vec![0]
     } else {
-        (0..tbl_info.non_pks.len()).collect()
+        let mut lookup = v2_stmts.col_ids_all();
+        let mut ids = vec::Vec::new();
+        while lookup.step().map_err(|e| format!("step: {:?}", e))? == ResultCode::ROW {
+            ids.push(lookup.column_int64(0));
+        }
+        ids
     };
     let mut stmt = v2_stmts.clock_insert();
     for col_id in col_ids {
         let seq = bump_seq(ext_data);
-        let cell_key = (key << consts::CRSQL_COL_ID_BITS as i64) | col_id as i64;
+        let cell_key = (key << consts::CRSQL_COL_ID_BITS as i64) | col_id;
         stmt.bind_int64(1, cell_key).map_err(|e| format!("bind: {:?}", e))?;
         stmt.bind_int64(2, db_version).map_err(|e| format!("bind: {:?}", e))?;
         stmt.bind_int(3, seq).map_err(|e| format!("bind: {:?}", e))?;
