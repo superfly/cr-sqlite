@@ -183,17 +183,8 @@ fn validate_rowid_range(
 /// Read the persisted metadata-write-version config from crsql_master.
 /// Returns METADATA_WRITE_VERSION_DEFAULT (1) if not set or table doesn't exist.
 fn get_metadata_write_version(db: *mut sqlite::sqlite3) -> core::ffi::c_int {
-    let stmt = db.prepare_v2(
-        "SELECT value FROM crsql_master WHERE key = 'config.metadata-write-version'"
-    );
-    match stmt {
-        Ok(stmt) => {
-            if stmt.step().unwrap_or(ResultCode::DONE) == ResultCode::ROW {
-                stmt.column_int(0)
-            } else {
-                config::METADATA_WRITE_VERSION_DEFAULT
-            }
-        }
-        Err(_) => config::METADATA_WRITE_VERSION_DEFAULT,
+    match unsafe { crate::util::get_master_value(db, "config.metadata-write-version") } {
+        Ok(Some(v)) => v as core::ffi::c_int,
+        _ => config::METADATA_WRITE_VERSION_DEFAULT,
     }
 }

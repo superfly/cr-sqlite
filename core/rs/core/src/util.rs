@@ -178,6 +178,16 @@ pub unsafe fn get_master_text_value(db: *mut sqlite3, key: &str) -> Result<Optio
     Ok(None)
 }
 
+/// Set a text value in crsql_master by exact key (insert or replace).
+pub unsafe fn set_master_text_value(db: *mut sqlite3, key: &str, value: &str) -> Result<(), ResultCode> {
+    let sql = "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, ?)\0";
+    let stmt = db.prepare_v2(sql)?;
+    stmt.bind_text(1, key, Destructor::TRANSIENT)?;
+    stmt.bind_text(2, value, Destructor::TRANSIENT)?;
+    stmt.step()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

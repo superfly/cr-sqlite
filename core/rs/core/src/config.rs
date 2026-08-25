@@ -339,11 +339,7 @@ fn queue_task(
     table_name: &str,
 ) -> Result<(), ResultCode> {
     let key = format!("{}_{}", key_prefix, table_name);
-    let sql = "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, 0)\0";
-    let stmt = db.prepare_v2(sql)?;
-    stmt.bind_text(1, &key, sqlite::Destructor::TRANSIENT)?;
-    stmt.step()?;
-    Ok(())
+    unsafe { crate::util::set_master_value(db, &key, 0) }
 }
 
 /// Check that all migration tasks are complete, setting an error on the
