@@ -280,6 +280,7 @@ mod tests {
                 &["pk.old"] as &[&str],
                 &["c.new"] as &[&str],
                 &["c.old"] as &[&str],
+                None,
                 None
             ))
         );
@@ -290,6 +291,7 @@ mod tests {
                 &["pk.old"] as &[&str],
                 &[] as &[&str],
                 &[] as &[&str],
+                None,
                 None
             ))
         );
@@ -300,6 +302,7 @@ mod tests {
                 &["pk1.old", "pk2.old"] as &[&str],
                 &[] as &[&str],
                 &[] as &[&str],
+                None,
                 None
             ))
         );
@@ -310,6 +313,7 @@ mod tests {
                 &["pk1.old", "pk2.old"] as &[&str],
                 &["c.new", "d.new"] as &[&str],
                 &["c.old", "d.old"] as &[&str],
+                None,
                 None
             ))
         );
