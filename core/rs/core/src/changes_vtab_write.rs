@@ -1101,6 +1101,7 @@ unsafe fn v2_lookup_key_and_cl(
     let v2 = v2_ref.as_mut().unwrap();
     let mut stmt = v2.lookup_row_state();
     if tbl_info.skip_hash {
+        // We enforce that in skip_hash mode, there is only one PK column
         let pk_val = &unpacked_pks[0];
         crate::pack_columns::bind_slot(1, pk_val, stmt.stmt)?;
         crate::pack_columns::bind_slot(2, pk_val, stmt.stmt)?;

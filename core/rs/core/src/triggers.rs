@@ -20,6 +20,16 @@ pub fn create_triggers(
     create_delete_trigger(db, table_info, err)
 }
 
+/// Create the AFTER INSERT trigger for a CRR table.
+///
+/// INSERT OR REPLACE intricacies:
+/// SQLite's REPLACE conflict resolution deletes the conflicting row, then
+/// inserts the new one. With recursive_triggers ON (which cr-sqlite enforces),
+/// this fires AFTER DELETE then AFTER INSERT. The DELETE trigger cleans up
+/// V2 metadata (moves row to tombstones), and the INSERT trigger sees a Dead
+/// row and performs a resurrection. Without recursive_triggers, only the
+/// INSERT trigger fires, leaving stale metadata — cr-sqlite treats this as
+/// a logic error.
 fn create_insert_trigger(
     db: *mut sqlite3,
     table_info: &TableInfo,
@@ -58,7 +68,7 @@ fn create_update_trigger(
 
     let rowid_expr = if table_info.key_is_rowid {
         let alias = crate::util::escape_ident(&table_info.rowid_alias);
-        format!(", NEW.\"{alias}\"")
+        format!(", NEW.\"{alias}\", OLD.\"{alias}\"")
     } else {
         String::new()
     };

@@ -162,6 +162,21 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         return null_mut();
     }
 
+    // Enable recursive triggers. This is required for correct behavior with
+    // INSERT OR REPLACE: SQLite's REPLACE conflict resolution deletes the
+    // conflicting row, and the AFTER DELETE trigger must fire to clean up
+    // V2 metadata before the AFTER INSERT trigger runs. Without recursive
+    // triggers, only the INSERT trigger fires, leaving stale metadata.
+    if db.exec_safe("PRAGMA recursive_triggers = ON;").is_err() {
+        let cstring = alloc::ffi::CString::new("cr-sqlite: failed to enable recursive_triggers").unwrap();
+        unsafe {
+            if !err_msg.is_null() {
+                *err_msg = cstring.into_raw();
+            }
+        }
+        return null_mut();
+    }
+
     let rc = db
         .create_function_v2(
             "crsql_set_debug",

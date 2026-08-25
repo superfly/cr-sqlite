@@ -20,7 +20,7 @@ pub unsafe extern "C" fn x_crsql_after_update(
 ) {
     let result = trigger_fn_preamble(ctx, argc, argv, |table_info, values, ext_data| {
         let has_rowid = table_info.key_is_rowid;
-        let (pks_new, pks_old, non_pks_new, non_pks_old, rowid_val) =
+        let (pks_new, pks_old, non_pks_new, non_pks_old, rowid_new, rowid_old) =
             partition_values(values, 1, table_info.pks.len(), table_info.non_pks.len(), has_rowid)?;
 
         after_update(
@@ -31,7 +31,8 @@ pub unsafe extern "C" fn x_crsql_after_update(
             pks_old,
             non_pks_new,
             non_pks_old,
-            rowid_val,
+            rowid_new,
+            rowid_old,
         )
     });
 
@@ -51,8 +52,8 @@ fn partition_values<T>(
     num_pks: usize,
     num_non_pks: usize,
     has_rowid: bool,
-) -> Result<(&[T], &[T], &[T], &[T], Option<&T>), String> {
-    let expected_len = offset + num_pks * 2 + num_non_pks * 2 + if has_rowid { 1 } else { 0 };
+) -> Result<(&[T], &[T], &[T], &[T], Option<&T>, Option<&T>), String> {
+    let expected_len = offset + num_pks * 2 + num_non_pks * 2 + if has_rowid { 2 } else { 0 };
     if values.len() != expected_len {
         return Err(format!(
             "expected {} values, got {}",
@@ -61,13 +62,18 @@ fn partition_values<T>(
         ));
     }
     let core_end = offset + num_pks * 2 + num_non_pks * 2;
-    let rowid_val = if has_rowid { Some(&values[core_end]) } else { None };
+    let (rowid_new, rowid_old) = if has_rowid {
+        (Some(&values[core_end]), Some(&values[core_end + 1]))
+    } else {
+        (None, None)
+    };
     Ok((
         &values[offset..num_pks + offset],
         &values[num_pks + offset..num_pks * 2 + offset],
         &values[num_pks * 2 + offset..num_pks * 2 + num_non_pks + offset],
         &values[num_pks * 2 + num_non_pks + offset..core_end],
-        rowid_val,
+        rowid_new,
+        rowid_old,
     ))
 }
 
@@ -79,11 +85,12 @@ fn after_update(
     pks_old: &[*mut value],
     non_pks_new: &[*mut value],
     non_pks_old: &[*mut value],
-    rowid_val: Option<&*mut value>,
+    rowid_new: Option<&*mut value>,
+    rowid_old: Option<&*mut value>,
 ) -> Result<ResultCode, String> {
     // Enforce rowid range for rowid-key tables
     if tbl_info.key_is_rowid {
-        let rowid = (*rowid_val.ok_or("rowid-key table missing rowid value")?).int64();
+        let rowid = (*rowid_new.ok_or("rowid-key table missing new rowid value")?).int64();
         if rowid < 0 || rowid >= consts::MAX_ROWID_KEY {
             return Err(format!(
                 "rowid out of cr-sqlite safe range [0, {})",
@@ -102,37 +109,52 @@ fn after_update(
         }
     }
     let pk_changed = crate::compare_values::any_value_changed(pks_new, pks_old)?;
+    // For rowid-key tables without INTEGER PRIMARY KEY, the rowid can change
+    // without the PK columns changing. A rowid change means __crsql_key changed,
+    // so treat it as delete+insert.
+    let rowid_changed = if tbl_info.key_is_rowid && !tbl_info.has_integer_pk {
+        let new_r = (*rowid_new.ok_or("rowid-key table missing new rowid value")?).int64();
+        let old_r = (*rowid_old.ok_or("rowid-key table missing old rowid value")?).int64();
+        new_r != old_r
+    } else {
+        false
+    };
+    let key_changed = pk_changed || rowid_changed;
 
     // Mode 3 (V2-only): write to V2 only
     if mwv == config::METADATA_VERSION_V2 {
-        if pk_changed {
+        if key_changed {
             super::v2::v2_after_delete(db, ext_data, tbl_info, pks_old)?;
-            super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new)?;
+            let new_rowid = if tbl_info.key_is_rowid {
+                Some((*rowid_new.ok_or("rowid-key table missing new rowid value")?).int64())
+            } else { None };
+            super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new, new_rowid)?;
             return Ok(ResultCode::OK);
         }
         return super::v2::v2_after_update(db, ext_data, tbl_info, pks_new, &changed_indices);
     }
 
-    // Mode 1 (V1-only): write to V1 only
     if mwv == config::METADATA_VERSION_V2_AND_V1 {
-        // Dual-write: hydrate V2 from V1 on-demand, then write to V2 first
+        // Mode 2 (Dual-write): hydrate V2 from V1 on-demand, then write to V2 first
         let saved_seq = unsafe { (*ext_data).seq };
-        if pk_changed {
+        let new_rowid = if tbl_info.key_is_rowid {
+            Some((*rowid_new.ok_or("rowid-key table missing new rowid value")?).int64())
+        } else { None };
+        unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_new) }
+            .map_err(|_| "V1 to V2 hydration failed".to_string())?;
+        if key_changed {
             unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_old) }
                 .map_err(|_| "V1 to V2 hydration failed".to_string())?;
-            unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_new) }
-                .map_err(|_| "V1 to V2 hydration failed".to_string())?;
             super::v2::v2_after_delete(db, ext_data, tbl_info, pks_old)?;
-            super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new)?;
+            super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new, new_rowid)?;
         } else {
-            unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_new) }
-                .map_err(|_| "V1 to V2 hydration failed".to_string())?;
             super::v2::v2_after_update(db, ext_data, tbl_info, pks_new, &changed_indices)?;
         }
         // Restore seq so V1 reuses the same values V2 just bumped.
         unsafe { (*ext_data).seq = saved_seq; }
     }
 
+    // V1 code path (write to V1)
     let ts = unsafe { (*ext_data).timestamp.to_string() };
     let next_db_version = crate::db_version::peek_next_db_version(db, ext_data)?;
     let new_key = tbl_info

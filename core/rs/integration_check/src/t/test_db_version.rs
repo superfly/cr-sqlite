@@ -252,9 +252,11 @@ fn test_get_or_set_pk_cl() -> Result<(), ResultCode> {
     insert_or_replace.step()?;
     reset_cached_stmt(&insert_or_replace)?;
 
-    // insert of pk with no clock row gets no update
+    // INSERT OR REPLACE on existing pk=4: with recursive_triggers ON,
+    // DELETE trigger fires first (marking row deleted, cl→2), then INSERT
+    // trigger fires (re-inserting, cl→3).
     let key4 = get_pk_key(&get_pk_key_stmt, 4).expect("get pk key");
-    assert_eq!(-1, get_cache_cl(&get_cache_cl_stmt, "foo", key4)?);
+    assert_eq!(3, get_cache_cl(&get_cache_cl_stmt, "foo", key4)?);
 
     db.db.exec_safe("COMMIT;")?;
 
@@ -267,17 +269,17 @@ fn test_get_or_set_pk_cl() -> Result<(), ResultCode> {
     db.db.exec_safe("SAVEPOINT test;")?;
 
     // new site_id in crsql_changes table
-    // pk number is 4
+    // pk number is 4 — note: pk=4 already has cl=3 from the INSERT OR REPLACE above.
     let pk: [u8; 3] = [1, 9, 4];
 
-    // insert should update the cache.
+    // remote insert with cl=1 loses to local cl=3 — cache should not update.
     insert_crsql_changes_row(db.db, &pk, "b", "e", 1, 1, 1).expect("insert crsql changes row");
     let key4 = get_pk_key(&get_pk_key_stmt, 4).expect("get pk key");
-    assert_eq!(1, get_cache_cl(&get_cache_cl_stmt, "foo", key4)?);
+    assert_eq!(3, get_cache_cl(&get_cache_cl_stmt, "foo", key4)?);
 
-    // a delete should also update the cache.
-    insert_crsql_changes_row(db.db, &pk, "-1", "", 2, 2, 2)?;
-    assert_eq!(2, get_cache_cl(&get_cache_cl_stmt, "foo", key4)?);
+    // a delete with cl=4 should update the cache (wins over local cl=3).
+    insert_crsql_changes_row(db.db, &pk, "-1", "", 2, 2, 4)?;
+    assert_eq!(4, get_cache_cl(&get_cache_cl_stmt, "foo", key4)?);
 
     // test that a resurrected cache would also get updated.
     insert_crsql_changes_row(db.db, &pk, "b", "f", 1, 3, 5)?;
