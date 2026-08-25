@@ -877,6 +877,13 @@ unsafe extern "C" fn x_crsql_finalize(
  *
  * Optional flags (after table name):
  *   'without_rowid' - treat a rowid table as WITHOUT ROWID for V2 metadata (uses hashed_pk instead of rowid as key)
+ *   'skip_hash' - use raw PK value as lookup key instead of hashing (requires single integer PK)
+ *
+ * skip_hash mode is also auto-detected: for tables with a single integer PK,
+ * the raw PK value is used directly as the lookup key instead of hashing it.
+ * This avoids the hashed_pk column and blob storage overhead.
+ * Auto-qualified when pks.len() == 1 AND PK type contains "INT".
+ * Use the 'skip_hash' flag or `/* crsql: skip_hash=0 */` schema comment to override.
  */
 unsafe extern "C" fn x_crsql_as_crr(
     ctx: *mut sqlite::context,
@@ -892,7 +899,7 @@ unsafe extern "C" fn x_crsql_as_crr(
     }
 
     let args = sqlite::args!(argc, argv);
-    let known_flags = ["without_rowid"];
+    let known_flags = ["without_rowid", "skip_hash"];
 
     // Parse args: (table) | (schema, table) | (table, flags...) | (schema, table, flags...)
     let (schema_name, table_name, flags) = if argc >= 2 && known_flags.contains(&args[1].text()) {
@@ -910,6 +917,7 @@ unsafe extern "C" fn x_crsql_as_crr(
     };
 
     let without_rowid = flags.iter().any(|f| f.text() == "without_rowid");
+    let skip_hash = flags.iter().any(|f| f.text() == "skip_hash");
 
     let db = ctx.db_handle();
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
@@ -933,6 +941,7 @@ unsafe extern "C" fn x_crsql_as_crr(
         0,
         0,
         if without_rowid { 1 } else { 0 },
+        if skip_hash { 1 } else { 0 },
         &mut err_msg as *mut _,
     );
     if rc != ResultCode::OK as c_int {
@@ -1108,6 +1117,7 @@ unsafe extern "C" fn x_crsql_commit_alter(
                 schema_name.as_ptr() as *const c_char,
                 table_name.as_ptr() as *const c_char,
                 1,
+                0,
                 0,
                 0,
                 &mut err_msg as *mut _,
@@ -1526,6 +1536,7 @@ pub extern "C" fn crsql_create_crr(
     is_commit_alter: c_int,
     no_tx: c_int,
     without_rowid: c_int,
+    skip_hash: c_int,
     err: *mut *mut c_char,
 ) -> c_int {
     let schema = unsafe { CStr::from_ptr(schema).to_str() };
@@ -1533,7 +1544,7 @@ pub extern "C" fn crsql_create_crr(
 
     match (table, schema) {
         (Ok(table), Ok(schema)) => {
-            create_crr(db, schema, table, is_commit_alter != 0, no_tx != 0, without_rowid != 0, err)
+            create_crr(db, schema, table, is_commit_alter != 0, no_tx != 0, without_rowid != 0, skip_hash != 0, err)
                 .unwrap_or_else(|err| err) as c_int
         }
         _ => ResultCode::NOMEM as c_int,

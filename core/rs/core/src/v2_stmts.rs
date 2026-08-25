@@ -493,7 +493,14 @@ impl V2Stmts {
             clock_upsert,
             clock_delete_range,
             clock_zero_fill,
-            clock_merge_upserts: alloc::collections::BTreeMap::new(),
+            clock_merge_upserts: {
+                let mut map = alloc::collections::BTreeMap::new();
+                for col in &tbl_info.non_pks {
+                    let sql = clock_merge_upsert_sql(tbl_info, &escaped, &col.name);
+                    map.insert(col.name.clone(), db.prepare_v3(&sql, sqlite::PREPARE_PERSISTENT)?);
+                }
+                map
+            },
             col_id_lookup,
             col_ids_all,
             base_insert,
@@ -515,51 +522,18 @@ impl V2Stmts {
         })
     }
 
-    /// Get or prepare a per-column clock merge upsert.
-    /// These are dynamic because the subquery includes the column name.
+    /// Get a per-column clock merge upsert.
+    /// Each column needs its own prepared statement because the subquery
+    /// embeds the column name to fetch the current value for crsql_change_wins.
+    /// All statements are pre-prepared at V2Stmts construction time.
     pub fn clock_merge_upsert(
         &mut self,
-        db: *mut sqlite3,
-        tbl_info: &TableInfo,
-        escaped: &str,
+        _db: *mut sqlite3,
+        _tbl_info: &TableInfo,
+        _escaped: &str,
         col_name: &str,
     ) -> Result<StmtGuard, ResultCode> {
-        if !self.clock_merge_upserts.contains_key(col_name) {
-            let escaped_col = crate::util::escape_ident(col_name);
-            let (subquery, _param_count) = if tbl_info.key_is_rowid {
-                let alias = crate::util::escape_ident(&tbl_info.rowid_alias);
-                (
-                    format!("SELECT \"{escaped_col}\" FROM \"{escaped}\" WHERE \"{alias}\" = ?"),
-                    1
-                )
-            } else {
-                let pk_where: Vec<String> = tbl_info.pks.iter()
-                    .map(|c| format!("\"{}\" = ?", crate::util::escape_ident(&c.name)))
-                    .collect();
-                (
-                    format!("SELECT \"{escaped_col}\" FROM \"{escaped}\" WHERE {}", pk_where.join(" AND ")),
-                    tbl_info.pks.len() as i32
-                )
-            };
-            let sql = format!(
-                "INSERT INTO \"{escaped}{suffix}\" (cell_key, col_version, site_id, db_version, seq, ts) \
-                VALUES (?, ?, ?, ?, ?, ?) \
-                ON CONFLICT(cell_key) DO UPDATE SET \
-                col_version = excluded.col_version, site_id = excluded.site_id, \
-                db_version = excluded.db_version, seq = excluded.seq, ts = excluded.ts \
-                WHERE excluded.col_version > col_version \
-                OR (excluded.col_version = col_version AND \
-                crsql_change_wins(?, ({subquery}), \
-                ? > (SELECT site_id FROM crsql_site_id WHERE ordinal = site_id), ?)) \
-                RETURNING cell_key",
-                escaped = escaped,
-                suffix = consts::V2_CLOCK_SUFFIX,
-                subquery = subquery,
-            );
-            let stmt = db.prepare_v3(&sql, sqlite::PREPARE_PERSISTENT)?;
-            self.clock_merge_upserts.insert(col_name.to_string(), stmt);
-        }
-        Ok(StmtGuard::new(self.clock_merge_upserts.get_mut(col_name).unwrap()))
+        Ok(StmtGuard::new(self.clock_merge_upserts.get_mut(col_name).ok_or(ResultCode::ERROR)?))
     }
 
     // --- Getters ---
@@ -630,6 +604,37 @@ impl V2Stmts {
 }
 
 // --- SQL builder helpers ---
+
+/// Build the per-column clock merge upsert SQL.
+/// Each column needs its own statement because the subquery embeds the column name
+/// to fetch the current value for crsql_change_wins.
+fn clock_merge_upsert_sql(tbl_info: &TableInfo, escaped: &str, col_name: &str) -> String {
+    let escaped_col = crate::util::escape_ident(col_name);
+    let subquery = if tbl_info.key_is_rowid {
+        let alias = crate::util::escape_ident(&tbl_info.rowid_alias);
+        format!("SELECT \"{escaped_col}\" FROM \"{escaped}\" WHERE \"{alias}\" = ?")
+    } else {
+        let pk_where: Vec<String> = tbl_info.pks.iter()
+            .map(|c| format!("\"{}\" = ?", crate::util::escape_ident(&c.name)))
+            .collect();
+        format!("SELECT \"{escaped_col}\" FROM \"{escaped}\" WHERE {}", pk_where.join(" AND "))
+    };
+    format!(
+        "INSERT INTO \"{escaped}{suffix}\" (cell_key, col_version, site_id, db_version, seq, ts) \
+        VALUES (?, ?, ?, ?, ?, ?) \
+        ON CONFLICT(cell_key) DO UPDATE SET \
+        col_version = excluded.col_version, site_id = excluded.site_id, \
+        db_version = excluded.db_version, seq = excluded.seq, ts = excluded.ts \
+        WHERE excluded.col_version > col_version \
+        OR (excluded.col_version = col_version AND \
+        crsql_change_wins(?, ({subquery}), \
+        ? > (SELECT site_id FROM crsql_site_id WHERE ordinal = site_id), ?)) \
+        RETURNING cell_key",
+        escaped = escaped,
+        suffix = consts::V2_CLOCK_SUFFIX,
+        subquery = subquery,
+    )
+}
 
 fn v2_pk_lookup_where(tbl_info: &TableInfo, is_pks_table: bool) -> (String, bool) {
     if tbl_info.skip_hash {

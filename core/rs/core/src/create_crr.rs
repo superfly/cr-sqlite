@@ -22,6 +22,7 @@ pub fn create_crr(
     is_commit_alter: bool,
     no_tx: bool,
     without_rowid: bool,
+    skip_hash_flag: bool,
     err: *mut *mut c_char,
 ) -> Result<ResultCode, ResultCode> {
     if !is_table_compatible(db, table, err)? {
@@ -47,16 +48,24 @@ pub fn create_crr(
         unsafe { crate::util::set_master_value(db, &format!("without_rowid_{}", table), 1) }?;
     }
 
+    // Override skip_hash if explicitly requested via flag.
+    // The flag forces skip_hash on (even for non-integer PKs, though that would
+    // be unusual). To force skip_hash off on an auto-qualified table, use the
+    // schema comment `/* crsql: skip_hash=0 */` instead.
+    if skip_hash_flag && !table_info.skip_hash {
+        table_info.skip_hash = true;
+    }
+
     // Persist skip_hash preference so migration path and subsequent pull_table_info
     // calls can read it when v2_pks doesn't exist yet.
     // Always persist (0 or 1) so the value is deterministic — auto-qualification
     // alone isn't persisted, but explicit directives are.
     let skip_hash_val: i32 = if table_info.skip_hash { 1 } else { 0 };
-    // Only persist if there was an explicit directive (not just auto-qualified).
+    // Only persist if there was an explicit directive or flag (not just auto-qualified).
     // For auto-qualified tables, the auto rule will re-apply on reload.
     // For explicitly enabled/disabled tables, we need to persist.
     let directive = crate::schema_directive::read_skip_hash_directive_opt(db, table).unwrap_or(None);
-    if directive.is_some() {
+    if directive.is_some() || skip_hash_flag {
         unsafe { crate::util::set_master_value(db, &format!("skip_hash_{}", table), skip_hash_val as i64) }?;
     }
 
