@@ -131,12 +131,14 @@ def test_upsert_currently_existing():
     c.commit()
     # INSERT OR REPLACE fires DELETE then INSERT (recursive_triggers ON).
     # The DELETE creates a sentinel (cl=2), the INSERT resurrects (cl=3).
+    # In V1, the insert's update_create_record bumps the sentinel row to cl=3
+    # as well (same key), so both sentinel and column change are at cl=3.
     c.execute("INSERT OR REPLACE INTO foo VALUES (1, 3)")
     c.commit()
 
     changes = c.execute(
         "SELECT pk, cid, cl FROM crsql_changes").fetchall()
-    assert (changes == [(b'\x01\t\x01', '-1', 2), (b'\x01\t\x01', 'b', 3)])
+    assert (changes == [(b'\x01\t\x01', '-1', 3), (b'\x01\t\x01', 'b', 3)])
 
     c.execute(
         "INSERT INTO foo VALUES (1, 4) ON CONFLICT DO UPDATE set b = b")
