@@ -59,8 +59,6 @@ pub struct V2Stmts {
     // --- v2_pks mutations ---
     /// INSERT ... cl=? with RETURNING __crsql_key (used for new rows, resurrections, hydration, merge)
     pks_insert: ManagedStmt,
-    /// UPDATE v2_pks SET cl = ? WHERE __crsql_key = ?
-    pks_update_cl: ManagedStmt,
     /// DELETE FROM v2_pks WHERE __crsql_key = ?
     pks_delete: ManagedStmt,
 
@@ -191,11 +189,6 @@ impl V2Stmts {
         let pks_insert = db.prepare_v3(
             &v2_pks_insert_sql(tbl_info.skip_hash, tbl_info.key_is_rowid, &escaped, &pk_cols, &pk_values, "?"),
             sqlite::PREPARE_PERSISTENT)?;
-
-        let pks_update_cl = db.prepare_v3(&format!(
-            "UPDATE \"{escaped}{}\" SET cl = ? WHERE __crsql_key = ?",
-            consts::V2_PKS_SUFFIX
-        ), sqlite::PREPARE_PERSISTENT)?;
 
         let pks_delete = db.prepare_v3(&format!(
             "DELETE FROM \"{escaped}{}\" WHERE __crsql_key = ?",
@@ -490,7 +483,6 @@ impl V2Stmts {
         Ok(Self {
             lookup_row_state,
             pks_insert,
-            pks_update_cl,
             pks_delete,
             tomb_delete,
             tomb_insert,
@@ -574,7 +566,6 @@ impl V2Stmts {
 
     pub fn lookup_row_state(&mut self) -> StmtGuard { StmtGuard::new(&mut self.lookup_row_state) }
     pub fn pks_insert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.pks_insert) }
-    pub fn pks_update_cl(&mut self) -> StmtGuard { StmtGuard::new(&mut self.pks_update_cl) }
     pub fn pks_delete(&mut self) -> StmtGuard { StmtGuard::new(&mut self.pks_delete) }
     pub fn tomb_delete(&mut self) -> StmtGuard { StmtGuard::new(&mut self.tomb_delete) }
     pub fn tomb_insert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.tomb_insert) }
