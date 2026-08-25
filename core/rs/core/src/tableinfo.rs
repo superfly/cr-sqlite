@@ -47,14 +47,16 @@ pub struct TableInfo {
     pub pks: Vec<ColumnInfo>,
     pub non_pks: Vec<ColumnInfo>,
     pub schema_version: SchemaVersion,
-    /// True when the main table is a rowid table with accessible rowid.
     /// True when __crsql_key in v2_pks is the SQLite rowid of the base table.
-    /// This means v2_pks uses the compact schema (__crsql_key, [pk_cols], hashed_pk, cl)
+    /// This means v2_pks uses the compact schema (__crsql_key, [hashed_pk], cl)
     /// where __crsql_key = rowid, and PK values are fetched from the base table via
-    /// SELECT pk_cols WHERE rowid = ?.
+    /// SELECT pk_cols WHERE rowid = ? when needed.
     ///
-    /// When false (WITHOUT ROWID tables), __crsql_key is an auto-incremented integer
-    /// and PK columns are stored directly in v2_pks.
+    /// Can be explicitly disabled for rowid tables (via `without_rowid` option to
+    /// crsql_as_crr), but cannot be enabled for WITHOUT ROWID tables (no rowid to use).
+    ///
+    /// When false (WITHOUT ROWID tables or explicitly disabled), __crsql_key is an
+    /// auto-incremented integer and PK columns are stored directly in v2_pks.
     ///
     /// Relationship with has_integer_pk:
     ///   key_is_rowid = true  → __crsql_key = rowid
@@ -1119,18 +1121,18 @@ pub fn pull_table_info(
     let rowid_accessible = integer_pk.is_some() || !all_aliases_shadowed;
     let has_integer_pk = integer_pk.is_some();
 
-    // Verify rowid is actually accessible (table is not WITHOUT ROWID)
-    let mut key_is_rowid = if integer_pk.is_some() {
-        // INTEGER PRIMARY KEY: the PK column IS the rowid alias.
-        // Verify it's accessible (table is not WITHOUT ROWID).
+    // key_is_rowid: use the table's rowid as __crsql_key.
+    // True for any rowid table (not WITHOUT ROWID) where rowid is accessible.
+    // This is independent of whether the PK is INTEGER (has_integer_pk) —
+    // a rowid table with a TEXT PK still has a usable rowid.
+    let mut key_is_rowid = if rowid_accessible {
+        // Verify rowid is actually accessible (table is not WITHOUT ROWID)
         db.prepare_v2(&format!(
             "SELECT \"{alias}\" FROM \"{escaped}\" LIMIT 0",
             alias = crate::util::escape_ident(&rowid_alias),
             escaped = crate::util::escape_ident(table),
         )).is_ok()
     } else {
-        // No INTEGER PRIMARY KEY — the PK is NOT the rowid.
-        // We can still use the hidden rowid as __crsql_key, but we must store PK columns separately.
         false
     };
 
@@ -1209,41 +1211,28 @@ pub fn pull_table_info(
         String::new()
     };
 
-    // If v2_pks table exists, infer key_is_rowid from its schema.
-    // The inference must account for skip_hash mode:
-    // - Hash mode, rowid-key: 3 cols (__crsql_key, hashed_pk, cl)
-    // - Hash mode, non-rowid: 3+N cols (__crsql_key, [pk_cols...], hashed_pk, cl)
-    // - Skip-hash, rowid-key: 2 cols (__crsql_key, cl)
-    // - Skip-hash, non-rowid: 2+N cols (__crsql_key, [pk_col], cl)
-    if has_v2 {
-        let v2_pks_name = format!("{}{}", crate::util::escape_ident_as_value(table), consts::V2_PKS_SUFFIX);
-        let pks_count_stmt = db.prepare_v2(&format!(
-            "SELECT count(*) FROM pragma_table_info('{name}')",
-            name = v2_pks_name,
-        ));
-        if let Ok(stmt) = pks_count_stmt {
-            if stmt.step().unwrap_or(ResultCode::DONE) == ResultCode::ROW {
-                let col_count = stmt.column_int(0);
-                if skip_hash {
-                    // Skip-hash: 2 cols = rowid-key, >2 = non-rowid
-                    key_is_rowid = col_count == 2;
-                } else {
-                    // Hash mode: 3 cols = rowid-key, >3 = non-rowid
-                    key_is_rowid = col_count == 3;
-                }
-            }
-        }
-    } else {
-        // v2_pks doesn't exist yet — check crsql_master for without_rowid flag
-        // persisted by create_crr when the without_rowid option was used.
-        if unsafe { crate::util::get_master_value(db, &format!("without_rowid_{}", table)) }
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            key_is_rowid = false;
-        }
+    // Check crsql_master for explicit without_rowid flag first (persisted by create_crr).
+    // This overrides schema inference — a rowid table can be explicitly set to without_rowid mode.
+    let explicit_without_rowid = unsafe {
+        crate::util::get_master_value(db, &format!("without_rowid_{}", table))
     }
+    .ok()
+    .flatten()
+    .is_some();
+
+    if explicit_without_rowid {
+        key_is_rowid = false;
+    } else if has_v2 {
+        // v2_pks exists and no explicit flag — infer from base table schema.
+        // Use pragma_table_list which has a `wr` column (1 = WITHOUT ROWID, 0 = rowid table).
+        let without_rowid = db.count(&format!(
+            "SELECT wr FROM pragma_table_list('{name}')",
+            name = crate::util::escape_ident_as_value(table),
+        ));
+        key_is_rowid = without_rowid.map(|v| v == 0).unwrap_or(false);
+    }
+    // else: no v2_pks yet and no explicit flag — use key_is_rowid as computed above
+    // from rowid_accessible (INTEGER PK or unshadowed rowid aliases).
     let has_v1 = {
         let stmt = db.prepare_v2(&format!(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND tbl_name = '{escaped}{suffix}'",

@@ -89,7 +89,9 @@ fn test_auto_qualified_int_pk() -> Result<(), ResultCode> {
 }
 
 /// TEXT PRIMARY KEY → not auto-qualified (no INT in type).
-/// Non-rowid table (TEXT PK can't be rowid alias) → hash + non-rowid → 4 columns.
+/// Rowid table (TEXT PK can't be rowid alias, but table still has rowid) →
+/// hash + rowid → 3 columns (__crsql_key, hashed_pk, cl).
+/// __crsql_key = rowid, hashed_pk stores the hash of the TEXT PK.
 fn test_text_pk_not_auto_qualified() -> Result<(), ResultCode> {
     let db = crate::opendb()?;
     db.db.exec_safe("CREATE TABLE foo (id TEXT PRIMARY KEY NOT NULL, x TEXT)")?;
@@ -98,10 +100,10 @@ fn test_text_pk_not_auto_qualified() -> Result<(), ResultCode> {
     migrate_to_v2(&db.db)?;
 
     let col_count = v2_pks_col_count(&db.db, "foo");
-    // hash + non-rowid: __crsql_key, id, hashed_pk, cl = 4 cols
-    assert!(col_count == 4, "text PK: expected 4 cols, got {}", col_count);
+    // hash + rowid: __crsql_key, hashed_pk, cl = 3 cols
+    assert!(col_count == 3, "text PK: expected 3 cols, got {}", col_count);
     assert!(v2_pks_has_hashed_pk(&db.db, "foo"), "text PK: should have hashed_pk");
-    libc_println!("  text PK: 4 cols, has hashed_pk — PASS");
+    libc_println!("  text PK: 3 cols, has hashed_pk — PASS");
     Ok(())
 }
 

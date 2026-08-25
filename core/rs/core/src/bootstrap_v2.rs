@@ -63,14 +63,17 @@ pub fn create_v2_tables(
     ))?;
 
     // 3. Alive PKs
-    // If key_is_rowid (single INTEGER PRIMARY KEY on rowid table), __crsql_key = rowid.
-    // No need to store PK columns separately since rowid IS the PK.
-    // STRICT always used. For non-rowid tables, dynamic PK columns use ANY type
+    // If key_is_rowid (table is a rowid table, not WITHOUT ROWID), __crsql_key = rowid.
+    // PK is NOT stored in v2_pks — it's fetched from the base table via JOIN when needed.
+    // key_is_rowid can be explicitly disabled/enabled for rowid tables via schema comments or at as_crr time,
+    // but cannot be enabled for WITHOUT ROWID tables (they have no rowid to use).
+    // STRICT always used. For !key_is_rowid tables, dynamic PK columns use ANY type
     // (https://www.sqlite.org/stricttables.html) so STRICT works regardless of base table type.
     //
-    // skip_hash mode: no hashed_pk column. PK value used directly for lookups.
-    // skip_hash requires a single-column PK (enforced at as_crr time).
-    // - skip_hash + key_is_rowid: 2 cols (__crsql_key, cl) — PK fetched from main table
+    // skip_hash mode: no hashed_pk column. PK or rowid value used directly for lookups.
+    // skip_hash requires a single-column PK (enforced at as_crr time), tables with compound PK's are always using hashing.
+    // - skip_hash + key_is_rowid: 2 cols (__crsql_key, cl) — __crsql_key = rowid, PK fetched from base table via JOIN (uses sqlite's autoindex on PK)
+    // - skip_hash + key_is_rowid + is_integer_pk: 2 cols (__crsql_key, cl) — __crsql_key = pk = rowid, no JOIN needed
     // - skip_hash + !key_is_rowid: 3 cols (__crsql_key, "pk_col", cl) — PK stored in v2_pks
     // - hash + key_is_rowid: 3 cols (__crsql_key, hashed_pk, cl)
     // - hash + !key_is_rowid: 3+N cols (__crsql_key, [pk_cols...], hashed_pk, cl)
