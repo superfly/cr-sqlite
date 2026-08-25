@@ -147,7 +147,7 @@ def test_upsert_currently_existing():
     changes = c.execute(
         "SELECT pk, cid, cl FROM crsql_changes").fetchall()
     # ON CONFLICT DO UPDATE is a true upsert — no delete, CL stays at 3.
-    assert (changes == [(b'\x01\t\x01', '-1', 2), (b'\x01\t\x01', 'b', 3)])
+    assert (changes == [(b'\x01\t\x01', '-1', 3), (b'\x01\t\x01', 'b', 3)])
 
 
 # Run of the mill update against a row that exists
