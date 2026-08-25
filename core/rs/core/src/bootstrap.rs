@@ -195,12 +195,35 @@ fn maybe_update_db_inner(
 
     // write the db version if we migrated to a new one or we are a blank slate db
     if recorded_version < consts::CRSQLITE_VERSION || is_blank_slate {
+        // Recreate all CRR triggers when upgrading versions.
+        // Trigger SQL may have changed (e.g., rowid arg added in 0.18).
+        // CREATE TRIGGER IF NOT EXISTS won't update existing triggers, so we
+        // must drop and recreate them.
+        if !is_blank_slate && recorded_version < consts::CRSQLITE_VERSION {
+            recreate_all_triggers(db, err_msg)?;
+        }
+
         let stmt =
             db.prepare_v2("INSERT OR REPLACE INTO crsql_master VALUES ('crsqlite_version', ?)")?;
         stmt.bind_int(1, consts::CRSQLITE_VERSION)?;
         stmt.step()?;
     }
 
+    Ok(ResultCode::OK)
+}
+
+/// Drop and recreate all CRR triggers on version upgrade.
+/// Trigger SQL may change between versions (e.g., rowid arg added in 0.18),
+/// and CREATE TRIGGER IF NOT EXISTS won't update existing triggers.
+fn recreate_all_triggers(
+    db: *mut sqlite3,
+    err_msg: *mut *mut c_char,
+) -> Result<ResultCode, ResultCode> {
+    let table_infos = crate::tableinfo::pull_all_table_infos(db, core::ptr::null_mut(), err_msg)?;
+    for tbl_info in &table_infos {
+        crate::teardown::remove_crr_triggers_if_exist(db, &tbl_info.tbl_name)?;
+        crate::triggers::create_triggers(db, tbl_info, err_msg)?;
+    }
     Ok(ResultCode::OK)
 }
 

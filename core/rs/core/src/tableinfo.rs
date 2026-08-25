@@ -992,7 +992,7 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
     return ResultCode::OK as c_int;
 }
 
-fn pull_all_table_infos(
+pub fn pull_all_table_infos(
     db: *mut sqlite::sqlite3,
     _ext_data: *mut crsql_ExtData,
     err: *mut *mut c_char,
