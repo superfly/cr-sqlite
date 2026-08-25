@@ -84,26 +84,15 @@ pub fn create_crr(
     remove_crr_triggers_if_exist(db, table)?;
     create_triggers(db, &table_info, err)?;
 
-    // For rowid tables (not converted to without_rowid), validate rowid range
-    // and add enforcement triggers.
+    // For rowid tables (not converted to without_rowid), validate rowid range.
+    // Enforcement is done within the existing triggers, not separate ones.
     if table_info.key_is_rowid {
         validate_rowid_range(db, table, &table_info.rowid_alias, err)?;
     }
 
-    // Backfill appropriate metadata tables based on write mode
-    if metadata_write_version == config::METADATA_VERSION_V2 {
-        crate::backfill_v2::backfill_table_v2(
-            db,
-            table,
-            &table_info.pks,
-            &table_info.non_pks,
-            table_info.key_is_rowid,
-            &table_info.rowid_alias,
-            table_info.skip_hash,
-            no_tx,
-        )?;
-    } else if metadata_write_version == config::METADATA_VERSION_V2_AND_V1 {
-        // Dual-write: backfill both V1 and V2
+    // Backfill appropriate metadata tables based on write mode.
+    // V1=1, V2_AND_V1=2, V2=3. Dual-write (2) backfills both.
+    if metadata_write_version <= config::METADATA_VERSION_V2_AND_V1 {
         backfill_table(
             db,
             table,
@@ -112,6 +101,8 @@ pub fn create_crr(
             is_commit_alter,
             no_tx,
         )?;
+    }
+    if metadata_write_version >= config::METADATA_VERSION_V2_AND_V1 {
         crate::backfill_v2::backfill_table_v2(
             db,
             table,
@@ -120,16 +111,6 @@ pub fn create_crr(
             table_info.key_is_rowid,
             &table_info.rowid_alias,
             table_info.skip_hash,
-            no_tx,
-        )?;
-    } else {
-        // V1-only: backfill V1 tables only
-        backfill_table(
-            db,
-            table,
-            &table_info.pks,
-            &table_info.non_pks,
-            is_commit_alter,
             no_tx,
         )?;
     }
