@@ -342,6 +342,25 @@ unsafe fn migrate_v1_to_v2_chunk(
     let pk_join_cond = pk_join_conds.join(" AND ");
 
     let result = (|| {
+        // Step 0: Select the chunk of keys ONCE into a temp table.
+        // This avoids re-scanning __crsql_pks with ORDER BY + LIMIT in each of the 5 steps below.
+        db.exec_safe("DROP TABLE IF EXISTS temp.migration_chunk")?;
+        db.exec_safe("CREATE TEMP TABLE migration_chunk (__crsql_key INTEGER PRIMARY KEY)")?;
+        db.exec_safe(&format!(
+            "INSERT INTO temp.migration_chunk
+             SELECT __crsql_key FROM \"{escaped}__crsql_pks\"
+             WHERE __crsql_key > {start_key}
+             ORDER BY __crsql_key LIMIT {chunk_size}",
+            escaped = escaped,
+            start_key = start_key,
+            chunk_size = chunk_size,
+        ))?;
+        let chunk_rows = db.changes64();
+        if chunk_rows == 0 {
+            // No rows to migrate — done
+            return Ok(0i64);
+        }
+
         // Step 1: Batch insert alive PKs into v2_pks.
         // Build column list and SELECT expressions conditionally based on skip_hash / key_is_rowid.
         let rowid_alias = crate::util::escape_ident(&tbl_info.rowid_alias);
@@ -376,7 +395,7 @@ unsafe fn migrate_v1_to_v2_chunk(
             "INSERT OR IGNORE INTO \"{escaped}{v2_pks}\" ({pks_cols})
              SELECT {pks_select}, COALESCE(s.col_version, 1)
              FROM \"{escaped}__crsql_pks\" p
-             JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
+             JOIN temp.migration_chunk chunk
                ON p.__crsql_key = chunk.__crsql_key
              {pks_join}
              LEFT JOIN \"{escaped}__crsql_clock\" s
@@ -388,12 +407,7 @@ unsafe fn migrate_v1_to_v2_chunk(
             pks_select = pks_select,
             pks_join = pks_join,
             sentinel = sentinel,
-            start_key = start_key,
-            chunk_size = chunk_size,
         ))?;
-        // Capture actual rows inserted into v2_pks (Step 1) for progress tracking.
-        // Subsequent steps (tombstones, clock) may insert different row counts.
-        let pks_inserted = db.changes64();
 
         // Step 2: Batch insert tombstones (dead rows).
         // skip_hash: PK column replaces hashed_pk. No v2_tombstone_pks needed.
@@ -406,9 +420,9 @@ unsafe fn migrate_v1_to_v2_chunk(
             "INSERT OR REPLACE INTO \"{escaped}{v2_tomb}\"
              (site_id, db_version, seq, {tomb_pk_col}, cl, ts)
              SELECT s.site_id, s.db_version, s.seq, {tomb_pk_select}, s.col_version,
-               CASE WHEN s.ts > 0 THEN s.ts ELSE {ts_fallback} END
+               CASE WHEN CAST(s.ts AS INTEGER) > 0 THEN CAST(s.ts AS INTEGER) ELSE {ts_fallback} END
              FROM \"{escaped}__crsql_pks\" p
-             JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
+             JOIN temp.migration_chunk chunk
                ON p.__crsql_key = chunk.__crsql_key
              JOIN \"{escaped}__crsql_clock\" s
                ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
@@ -418,8 +432,6 @@ unsafe fn migrate_v1_to_v2_chunk(
             tomb_pk_col = tomb_pk_col,
             tomb_pk_select = tomb_pk_select,
             sentinel = sentinel,
-            start_key = start_key,
-            chunk_size = chunk_size,
             ts_fallback = ts_fallback,
         ))?;
 
@@ -429,7 +441,7 @@ unsafe fn migrate_v1_to_v2_chunk(
                 "INSERT OR REPLACE INTO \"{escaped}{v2_tomb_pks}\" ({pk_cols}, hashed_pk)
                  SELECT {pk_cols_p}, crsql_hash_pk({pk_cols_p})
                  FROM \"{escaped}__crsql_pks\" p
-                 JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
+                 JOIN temp.migration_chunk chunk
                    ON p.__crsql_key = chunk.__crsql_key
                  JOIN \"{escaped}__crsql_clock\" s
                    ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
@@ -439,8 +451,6 @@ unsafe fn migrate_v1_to_v2_chunk(
                 pk_cols = pk_cols_list,
                 pk_cols_p = pk_cols_p_list,
                 sentinel = sentinel,
-                start_key = start_key,
-                chunk_size = chunk_size,
             ))?;
         }
 
@@ -468,9 +478,9 @@ unsafe fn migrate_v1_to_v2_chunk(
              (cell_key, col_version, site_id, db_version, seq, ts)
              SELECT {cell_key_base} | m.col_id,
                c.col_version, c.site_id, c.db_version, c.seq,
-               CASE WHEN c.ts > 0 THEN c.ts ELSE {ts_fallback} END
+               CASE WHEN CAST(c.ts AS INTEGER) > 0 THEN CAST(c.ts AS INTEGER) ELSE {ts_fallback} END
              FROM \"{escaped}__crsql_clock\" c
-             JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
+             JOIN temp.migration_chunk chunk
                ON c.key = chunk.__crsql_key
              JOIN \"{escaped}__crsql_pks\" p ON c.key = p.__crsql_key
              {base_join}
@@ -482,66 +492,56 @@ unsafe fn migrate_v1_to_v2_chunk(
             cell_key_base = cell_key_base,
             base_join = base_join,
             sentinel = sentinel,
-            start_key = start_key,
-            chunk_size = chunk_size,
             ts_fallback = ts_fallback,
         ))?;
 
-        // Step 4b: For PK-only tables, migrate sentinel clock entries at col_id=0.
+        // Step 4b: For PK-only tables, migrate/create sentinel clock entries at col_id=0.
         // The normal clock migration (step 4) skips sentinels. For PK-only tables, the sentinel
         // is the only clock entry, so we need to migrate it separately.
+        //
+        // Mirrors Step 1's alive detection: LEFT JOIN on sentinel, filter alive
+        // (col_version IS NULL OR col_version % 2 != 0). For rows with no V1 sentinel
+        // but alive in the base table, create a new sentinel with col_version=1.
         if tbl_info.non_pks.is_empty() {
             db.exec_safe(&format!(
                 "INSERT OR REPLACE INTO \"{escaped}{v2_clock}\"
                  (cell_key, col_version, site_id, db_version, seq, ts)
                  SELECT {cell_key_base} | 0,
-                   1, c.site_id, c.db_version, c.seq,
-                   CASE WHEN c.ts > 0 THEN c.ts ELSE {ts_fallback} END
-                 FROM \"{escaped}__crsql_clock\" c
-                 JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
-                   ON c.key = chunk.__crsql_key
-                 JOIN \"{escaped}__crsql_pks\" p ON c.key = p.__crsql_key
+                   COALESCE(s.col_version, 1), COALESCE(s.site_id, 0),
+                   COALESCE(s.db_version, 0), COALESCE(s.seq, 0),
+                   CASE WHEN CAST(COALESCE(s.ts, '0') AS INTEGER) > 0 THEN CAST(s.ts AS INTEGER) ELSE {ts_fallback} END
+                 FROM \"{escaped}__crsql_pks\" p
+                 JOIN temp.migration_chunk chunk
+                   ON p.__crsql_key = chunk.__crsql_key
                  {base_join}
-                 WHERE c.col_name = '{sentinel}'",
+                 LEFT JOIN \"{escaped}__crsql_clock\" s
+                   ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
+                 WHERE s.col_version IS NULL OR s.col_version % 2 != 0",
                 escaped = escaped,
                 v2_clock = consts::V2_CLOCK_SUFFIX,
                 cell_key_base = cell_key_base,
                 base_join = base_join,
                 sentinel = sentinel,
-                start_key = start_key,
-                chunk_size = chunk_size,
                 ts_fallback = ts_fallback,
             ))?;
         }
 
         // Step 5: Get max key from chunk to update cursor.
-        // NULL means the chunk was empty — migration is done.
-        let max_key_sql = format!(
-            "SELECT max(__crsql_key) FROM (
-                SELECT __crsql_key FROM \"{escaped}__crsql_pks\"
-                WHERE __crsql_key > {start_key}
-                ORDER BY __crsql_key
-                LIMIT {chunk_size}
-            )\0",
-            escaped = escaped,
-            start_key = start_key,
-            chunk_size = chunk_size,
-        );
+        // Chunk is guaranteed non-empty (checked above via changes64()).
+        let max_key_sql = "SELECT max(__crsql_key) FROM temp.migration_chunk\0";
         let max_key_stmt = db.prepare_v2(&max_key_sql)?;
         max_key_stmt.step()?;
         let last_key = max_key_stmt.column_int64(0);
 
-        if last_key == 0 {
-            // Chunk was empty — migration complete
-            Ok(0i64)
-        } else {
-            // Update progress marker to last key processed
-            crate::util::set_master_value(db, &progress_key, last_key)?;
-            // Use actual rows inserted into v2_pks (Step 1) as processed count.
-            // This is more accurate than chunk_size which over-counts due to orphans/IGNORE.
-            Ok(pks_inserted)
-        }
+        // Update progress marker to last key processed
+        crate::util::set_master_value(db, &progress_key, last_key)?;
+        // Use chunk_rows (total __crsql_pks rows processed, alive + dead) as processed count.
+        // This accurately reflects how many rows we consumed from the cursor.
+        Ok(chunk_rows)
     })();
+
+    // Clean up temp table
+    let _ = db.exec_safe("DROP TABLE IF EXISTS temp.migration_chunk");
 
     match result {
         Ok(processed) => {
