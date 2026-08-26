@@ -344,13 +344,6 @@ unsafe fn migrate_v1_to_v2_chunk(
     }).collect();
     let base_join_cond = base_join_conds.join(" AND ");
 
-    // Build PK join condition between temp table (chunk) and base table (t).
-    // Used in Step 1 for key_is_rowid tables to get the rowid value.
-    let chunk_base_join_conds: Vec<String> = tbl_info.pks.iter().map(|c| {
-        format!("t.\"{col}\" = chunk.\"{col}\"", col = crate::util::escape_ident(&c.name))
-    }).collect();
-    let pk_join_cond_rowid = chunk_base_join_conds.join(" AND ");
-
     let result = (|| {
         // Step 0: Select the chunk ONCE into a temp table, enriched with precomputed:
         // - PK column values (from __crsql_pks)
@@ -370,6 +363,7 @@ unsafe fn migrate_v1_to_v2_chunk(
             .collect();
         let pk_cols_schema_str = pk_cols_schema.join(", ");
         let hash_schema = if skip_hash { "" } else { ", hashed_pk BLOB" };
+        let rowid_schema = if key_is_rowid { ", rowid_val INTEGER" } else { "" };
         db.exec_safe(&format!(
             "CREATE TEMP TABLE migration_chunk (
                __crsql_key INTEGER PRIMARY KEY,
@@ -380,12 +374,13 @@ unsafe fn migrate_v1_to_v2_chunk(
                sentinel_seq INTEGER,
                sentinel_ts TEXT,
                is_alive INTEGER,
-               in_base INTEGER{hash_schema}
+               in_base INTEGER{hash_schema}{rowid_schema}
              )",
             pk_cols_schema = pk_cols_schema_str,
             hash_schema = hash_schema,
         ))?;
         let hash_select = if skip_hash { "".to_string() } else { format!(", crsql_hash_pk({}) as hashed_pk", pk_cols_p_list) };
+        let rowid_select = if key_is_rowid { ", b.rowid as rowid_val" } else { "" };
         db.exec_safe(&format!(
             "INSERT INTO temp.migration_chunk
              SELECT p.__crsql_key, {pk_cols_aliased},
@@ -394,7 +389,7 @@ unsafe fn migrate_v1_to_v2_chunk(
                s.ts as sentinel_ts,
                CASE WHEN s.col_version IS NULL OR s.col_version % 2 != 0 THEN 1 ELSE 0 END as is_alive,
                CASE WHEN b.\"{first_pk_col}\" IS NOT NULL THEN 1 ELSE 0 END as in_base
-               {hash_select}
+               {hash_select}{rowid_select}
              FROM \"{escaped}__crsql_pks\" p
              LEFT JOIN \"{escaped}__crsql_clock\" s
                ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
@@ -403,6 +398,7 @@ unsafe fn migrate_v1_to_v2_chunk(
              ORDER BY p.__crsql_key LIMIT {chunk_size}",
             pk_cols_aliased = pk_cols_p_aliased_str,
             hash_select = hash_select,
+            rowid_select = rowid_select,
             escaped = escaped,
             first_pk_col = crate::util::escape_ident(&tbl_info.pks[0].name),
             start_key = start_key,
@@ -418,60 +414,39 @@ unsafe fn migrate_v1_to_v2_chunk(
         }
 
         // Step 1: Batch insert alive PKs into v2_pks.
-        // Uses precomputed hashed_pk, PK values, is_alive, and in_base from temp table.
-        // For key_is_rowid tables, still need base table JOIN to get the rowid value
-        // (V1 __crsql_key is auto-incremented, NOT the rowid).
-        let rowid_alias = crate::util::escape_ident(&tbl_info.rowid_alias);
-        let (pks_cols, pks_select, pks_from) = if skip_hash && key_is_rowid {
+        // Uses precomputed hashed_pk, PK values, is_alive, in_base, and rowid_val from temp table.
+        // No JOINs needed — everything is precomputed.
+        let (pks_cols, pks_select) = if skip_hash && key_is_rowid {
             (
                 "__crsql_key, cl".to_string(),
-                format!("t.\"{}\"", rowid_alias),
-                // Need base table JOIN to get rowid
-                format!(
-                    "FROM temp.migration_chunk chunk JOIN \"{escaped}\" t ON {pk_join_cond}",
-                    escaped = escaped,
-                    pk_join_cond = pk_join_cond_rowid,
-                ),
+                "chunk.rowid_val".to_string(),
             )
         } else if skip_hash {
             (
                 format!("{}, cl", pk_cols_list),
                 pk_cols_chunk_list.clone(),
-                "FROM temp.migration_chunk chunk".to_string(),
             )
         } else if key_is_rowid {
             (
                 "__crsql_key, hashed_pk, cl".to_string(),
-                format!("t.\"{}\", chunk.hashed_pk", rowid_alias),
-                format!(
-                    "FROM temp.migration_chunk chunk JOIN \"{escaped}\" t ON {pk_join_cond}",
-                    escaped = escaped,
-                    pk_join_cond = pk_join_cond_rowid,
-                ),
+                "chunk.rowid_val, chunk.hashed_pk".to_string(),
             )
         } else {
             (
                 format!("{}, hashed_pk, cl", pk_cols_list),
                 format!("{}, chunk.hashed_pk", pk_cols_chunk_list),
-                "FROM temp.migration_chunk chunk".to_string(),
             )
         };
-        let pks_where = if key_is_rowid {
-            // Base table JOIN already filters orphans (INNER JOIN)
-            "WHERE chunk.is_alive = 1"
-        } else {
-            "WHERE chunk.is_alive = 1 AND chunk.in_base = 1"
-        };
+        let pks_where = "WHERE chunk.is_alive = 1 AND chunk.in_base = 1";
         db.exec_safe(&format!(
             "INSERT OR IGNORE INTO \"{escaped}{v2_pks}\" ({pks_cols})
              SELECT {pks_select}, COALESCE(chunk.sentinel_version, 1)
-             {pks_from}
+             FROM temp.migration_chunk chunk
              {pks_where}",
             escaped = escaped,
             v2_pks = consts::V2_PKS_SUFFIX,
             pks_cols = pks_cols,
             pks_select = pks_select,
-            pks_from = pks_from,
             pks_where = pks_where,
         ))?;
 
@@ -518,13 +493,9 @@ unsafe fn migrate_v1_to_v2_chunk(
         // Both steps share the same structure; only the col_id source, col_version, WHERE, and
         // the v2_col_map JOIN differ. We build conditionally and run both in a loop.
         let clock_joins = if key_is_rowid {
-            // For rowid-key tables, need base table JOIN to get rowid for cell_key.
-            let base_join = format!(
-                "JOIN \"{escaped}\" t ON {pk_join_cond}",
-                escaped = escaped, pk_join_cond = pk_join_cond_rowid
-            );
-            let cell_key_base = format!("(t.\"{}\" << {col_id_bits})", rowid_alias, col_id_bits = col_id_bits);
-            (cell_key_base, base_join)
+            // rowid_val precomputed in temp table — no base table JOIN needed.
+            let cell_key_base = format!("(chunk.rowid_val << {col_id_bits})", col_id_bits = col_id_bits);
+            (cell_key_base, "".to_string())
         } else {
             // Use chunk. prefix for PK values (from temp table, not __crsql_pks)
             let v2_pks_join = v2_pks_join_clause(tbl_info, &escaped, &pk_cols_chunk_list);
