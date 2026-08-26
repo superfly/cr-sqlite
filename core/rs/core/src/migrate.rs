@@ -127,7 +127,7 @@ unsafe fn incremental_maintenance(
             if tbl_info.schema_version != SchemaVersion::V2 {
                 let has_v2 = crate::bootstrap_v2::has_v2_tables(db, &tbl_info.tbl_name)?;
                 if has_v2 {
-                    let progress_key = format!("migration_v1_to_v2_progress_{}", tbl_info.tbl_name);
+                    let progress_key = format!("migration_v1_to_v2_migration_{}", tbl_info.tbl_name);
                     let progress = crate::util::get_master_value(db, &progress_key)?;
                     if progress.is_some() {
                         // Table is being migrated — count remaining
@@ -343,12 +343,18 @@ unsafe fn migrate_v1_to_v2_chunk(
     let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
     let ts_fallback = unsafe { (*ext_data).timestamp as i64 };
 
-    db.exec_safe("SAVEPOINT migration_chunk")?;
-
-    // Get progress marker from crsql_master
+    // Get progress marker from crsql_master.
+    // No progress marker = table not queued for migration (either not started or already done).
+    // Migration is only queued by queue_migration_tasks() during the V1→V2&V1 config change.
     let progress_key = format!("migration_v1_to_v2_migration_{}", tbl_info.tbl_name);
     let progress = crate::util::get_master_value(db, &progress_key)?;
+    if progress.is_none() {
+        // Not queued — skip
+        return Ok((0, 0));
+    }
     let start_key = progress.unwrap_or(0);
+
+    db.exec_safe("SAVEPOINT migration_chunk")?;
 
     // One-time count of remaining rows to migrate (cached in crsql_master).
     let total_key = format!("migration_v1_to_v2_total_{}", tbl_info.tbl_name);
