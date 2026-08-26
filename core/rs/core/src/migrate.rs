@@ -322,39 +322,95 @@ unsafe fn migrate_v1_to_v2_chunk(
     let pk_cols_p_list = crate::util::as_identifier_list(&tbl_info.pks, Some("p."))?;
     // PK columns qualified with t. (backing table alias) for rowid-key tables
     let pk_cols_t_list = crate::util::as_identifier_list(&tbl_info.pks, Some("t."))?;
+    // PK columns from p. with alias to column name (for temp table SELECT)
+    let pk_cols_p_aliased: Vec<String> = tbl_info.pks.iter()
+        .map(|c| format!("p.\"{}\" as \"{}\"", crate::util::escape_ident(&c.name), crate::util::escape_ident(&c.name)))
+        .collect();
+    let pk_cols_p_aliased_str = pk_cols_p_aliased.join(", ");
+    // PK columns prefixed with chunk. (for reading from temp table)
+    let pk_cols_chunk_list = crate::util::as_identifier_list(&tbl_info.pks, Some("chunk."))?;
 
     let sentinel = crate::c::INSERT_SENTINEL;
     let col_id_bits = consts::CRSQL_COL_ID_BITS as i64;
     let key_is_rowid = tbl_info.key_is_rowid;
     let skip_hash = tbl_info.skip_hash;
 
-    // Build PK join condition between pks table and backing table.
-    // The backing table is aliased as `t` in rowid-key queries and un-aliased in non-rowid queries.
-    // For rowid-key tables: use t."col" = p."col"
-    // For non-rowid tables: use "{escaped}"."col" = p."col"
-    let pk_join_conds: Vec<String> = tbl_info.pks.iter().map(|c| {
-        if key_is_rowid {
-            format!("t.\"{col}\" = p.\"{col}\"", col = crate::util::escape_ident(&c.name))
-        } else {
-            format!("\"{escaped}\".\"{col}\" = p.\"{col}\"", escaped = escaped, col = crate::util::escape_ident(&c.name))
-        }
+    // Build PK join condition for temp table INSERT: __crsql_pks (p) to base table (b).
+    // Used to precompute the in_base flag.
+    // For key_is_rowid tables: __crsql_key is NOT the rowid (it's auto-incremented),
+    // so we must JOIN on the PK columns to check base table existence.
+    let base_join_conds: Vec<String> = tbl_info.pks.iter().map(|c| {
+        format!("b.\"{col}\" = p.\"{col}\"", col = crate::util::escape_ident(&c.name))
     }).collect();
-    let pk_join_cond = pk_join_conds.join(" AND ");
+    let base_join_cond = base_join_conds.join(" AND ");
+
+    // Build PK join condition between temp table (chunk) and base table (t).
+    // Used in Step 1 for key_is_rowid tables to get the rowid value.
+    let chunk_base_join_conds: Vec<String> = tbl_info.pks.iter().map(|c| {
+        format!("t.\"{col}\" = chunk.\"{col}\"", col = crate::util::escape_ident(&c.name))
+    }).collect();
+    let pk_join_cond_rowid = chunk_base_join_conds.join(" AND ");
 
     let result = (|| {
-        // Step 0: Select the chunk of keys ONCE into a temp table.
-        // This avoids re-scanning __crsql_pks with ORDER BY + LIMIT in each of the 5 steps below.
+        // Step 0: Select the chunk ONCE into a temp table, enriched with precomputed:
+        // - PK column values (from __crsql_pks)
+        // - hashed_pk (hash mode only — avoids computing it 2-3 times per dead row)
+        // - sentinel clock data (col_version, site_id, db_version, seq, ts)
+        // - is_alive flag (avoids re-evaluating the sentinel JOIN + WHERE in each step)
+        //
+        // With PK values cached, steps 1-3 no longer need to JOIN __crsql_pks at all.
+        // The in_base flag precomputes the base table existence check, so steps 1 and 4b
+        // no longer need to JOIN the base table either.
         db.exec_safe("DROP TABLE IF EXISTS temp.migration_chunk")?;
-        db.exec_safe("CREATE TEMP TABLE migration_chunk (__crsql_key INTEGER PRIMARY KEY)")?;
+
+        // Use CREATE (empty schema) + INSERT ... SELECT so changes64() reports the row count.
+        // CREATE TABLE AS SELECT is DDL — changes64() does not reflect rows inserted.
+        let pk_cols_schema: Vec<String> = tbl_info.pks.iter()
+            .map(|c| format!("\"{}\"", crate::util::escape_ident(&c.name)))
+            .collect();
+        let pk_cols_schema_str = pk_cols_schema.join(", ");
+        let hash_schema = if skip_hash { "" } else { ", hashed_pk BLOB" };
+        db.exec_safe(&format!(
+            "CREATE TEMP TABLE migration_chunk (
+               __crsql_key INTEGER PRIMARY KEY,
+               {pk_cols_schema},
+               sentinel_version INTEGER,
+               sentinel_site_id INTEGER,
+               sentinel_db_version INTEGER,
+               sentinel_seq INTEGER,
+               sentinel_ts TEXT,
+               is_alive INTEGER,
+               in_base INTEGER{hash_schema}
+             )",
+            pk_cols_schema = pk_cols_schema_str,
+            hash_schema = hash_schema,
+        ))?;
+        let hash_select = if skip_hash { "".to_string() } else { format!(", crsql_hash_pk({}) as hashed_pk", pk_cols_p_list) };
         db.exec_safe(&format!(
             "INSERT INTO temp.migration_chunk
-             SELECT __crsql_key FROM \"{escaped}__crsql_pks\"
-             WHERE __crsql_key > {start_key}
-             ORDER BY __crsql_key LIMIT {chunk_size}",
+             SELECT p.__crsql_key, {pk_cols_aliased},
+               s.col_version as sentinel_version, s.site_id as sentinel_site_id,
+               s.db_version as sentinel_db_version, s.seq as sentinel_seq,
+               s.ts as sentinel_ts,
+               CASE WHEN s.col_version IS NULL OR s.col_version % 2 != 0 THEN 1 ELSE 0 END as is_alive,
+               CASE WHEN b.\"{first_pk_col}\" IS NOT NULL THEN 1 ELSE 0 END as in_base
+               {hash_select}
+             FROM \"{escaped}__crsql_pks\" p
+             LEFT JOIN \"{escaped}__crsql_clock\" s
+               ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
+             LEFT JOIN \"{escaped}\" b ON {base_join_cond}
+             WHERE p.__crsql_key > {start_key}
+             ORDER BY p.__crsql_key LIMIT {chunk_size}",
+            pk_cols_aliased = pk_cols_p_aliased_str,
+            hash_select = hash_select,
             escaped = escaped,
+            first_pk_col = crate::util::escape_ident(&tbl_info.pks[0].name),
             start_key = start_key,
             chunk_size = chunk_size,
+            sentinel = sentinel,
+            base_join_cond = base_join_cond,
         ))?;
+        // Index for JOINs in steps 1-4b
         let chunk_rows = db.changes64();
         if chunk_rows == 0 {
             // No rows to migrate — done
@@ -362,95 +418,98 @@ unsafe fn migrate_v1_to_v2_chunk(
         }
 
         // Step 1: Batch insert alive PKs into v2_pks.
-        // Build column list and SELECT expressions conditionally based on skip_hash / key_is_rowid.
+        // Uses precomputed hashed_pk, PK values, is_alive, and in_base from temp table.
+        // For key_is_rowid tables, still need base table JOIN to get the rowid value
+        // (V1 __crsql_key is auto-incremented, NOT the rowid).
         let rowid_alias = crate::util::escape_ident(&tbl_info.rowid_alias);
-        let (pks_cols, pks_select) = if skip_hash && key_is_rowid {
+        let (pks_cols, pks_select, pks_from) = if skip_hash && key_is_rowid {
             (
                 "__crsql_key, cl".to_string(),
                 format!("t.\"{}\"", rowid_alias),
+                // Need base table JOIN to get rowid
+                format!(
+                    "FROM temp.migration_chunk chunk JOIN \"{escaped}\" t ON {pk_join_cond}",
+                    escaped = escaped,
+                    pk_join_cond = pk_join_cond_rowid,
+                ),
             )
         } else if skip_hash {
             (
                 format!("{}, cl", pk_cols_list),
-                pk_cols_p_list.clone(),
+                pk_cols_chunk_list.clone(),
+                "FROM temp.migration_chunk chunk".to_string(),
             )
         } else if key_is_rowid {
             (
                 "__crsql_key, hashed_pk, cl".to_string(),
-                format!("t.\"{}\", crsql_hash_pk({})", rowid_alias, pk_cols_t_list),
+                format!("t.\"{}\", chunk.hashed_pk", rowid_alias),
+                format!(
+                    "FROM temp.migration_chunk chunk JOIN \"{escaped}\" t ON {pk_join_cond}",
+                    escaped = escaped,
+                    pk_join_cond = pk_join_cond_rowid,
+                ),
             )
         } else {
             (
                 format!("{}, hashed_pk, cl", pk_cols_list),
-                format!("{}, crsql_hash_pk({})", pk_cols_p_list, pk_cols_p_list),
+                format!("{}, chunk.hashed_pk", pk_cols_chunk_list),
+                "FROM temp.migration_chunk chunk".to_string(),
             )
         };
-        // Backing table JOIN: aliased as `t` for rowid-key, un-aliased for non-rowid.
-        let pks_join = if key_is_rowid {
-            format!("JOIN \"{escaped}\" t ON {pk_join_cond}", escaped = escaped, pk_join_cond = pk_join_cond)
+        let pks_where = if key_is_rowid {
+            // Base table JOIN already filters orphans (INNER JOIN)
+            "WHERE chunk.is_alive = 1"
         } else {
-            format!("JOIN \"{escaped}\" ON {pk_join_cond}", escaped = escaped, pk_join_cond = pk_join_cond)
+            "WHERE chunk.is_alive = 1 AND chunk.in_base = 1"
         };
         db.exec_safe(&format!(
             "INSERT OR IGNORE INTO \"{escaped}{v2_pks}\" ({pks_cols})
-             SELECT {pks_select}, COALESCE(s.col_version, 1)
-             FROM \"{escaped}__crsql_pks\" p
-             JOIN temp.migration_chunk chunk
-               ON p.__crsql_key = chunk.__crsql_key
-             {pks_join}
-             LEFT JOIN \"{escaped}__crsql_clock\" s
-               ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
-             WHERE s.col_version IS NULL OR s.col_version % 2 != 0",
+             SELECT {pks_select}, COALESCE(chunk.sentinel_version, 1)
+             {pks_from}
+             {pks_where}",
             escaped = escaped,
             v2_pks = consts::V2_PKS_SUFFIX,
             pks_cols = pks_cols,
             pks_select = pks_select,
-            pks_join = pks_join,
-            sentinel = sentinel,
+            pks_from = pks_from,
+            pks_where = pks_where,
         ))?;
 
         // Step 2: Batch insert tombstones (dead rows).
-        // skip_hash: PK column replaces hashed_pk. No v2_tombstone_pks needed.
+        // Uses precomputed hashed_pk, PK values, and sentinel data from temp table.
+        // No JOIN to __crsql_pks or base table needed — dead rows don't need orphan filtering.
         let (tomb_pk_col, tomb_pk_select) = if skip_hash {
-            (format!("\"{}\"", tbl_info.skip_hash_pk_col), pk_cols_p_list.clone())
+            (format!("\"{}\"", tbl_info.skip_hash_pk_col), pk_cols_chunk_list.clone())
         } else {
-            ("hashed_pk".to_string(), format!("crsql_hash_pk({})", pk_cols_p_list))
+            ("hashed_pk".to_string(), "chunk.hashed_pk".to_string())
         };
         db.exec_safe(&format!(
             "INSERT OR REPLACE INTO \"{escaped}{v2_tomb}\"
              (site_id, db_version, seq, {tomb_pk_col}, cl, ts)
-             SELECT s.site_id, s.db_version, s.seq, {tomb_pk_select}, s.col_version,
-               CASE WHEN CAST(s.ts AS INTEGER) > 0 THEN CAST(s.ts AS INTEGER) ELSE {ts_fallback} END
-             FROM \"{escaped}__crsql_pks\" p
-             JOIN temp.migration_chunk chunk
-               ON p.__crsql_key = chunk.__crsql_key
-             JOIN \"{escaped}__crsql_clock\" s
-               ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
-             WHERE s.col_version % 2 = 0",
+             SELECT chunk.sentinel_site_id, chunk.sentinel_db_version, chunk.sentinel_seq,
+               {tomb_pk_select}, chunk.sentinel_version,
+               CASE WHEN CAST(chunk.sentinel_ts AS INTEGER) > 0 THEN CAST(chunk.sentinel_ts AS INTEGER) ELSE {ts_fallback} END
+             FROM temp.migration_chunk chunk
+             WHERE chunk.is_alive = 0",
             escaped = escaped,
             v2_tomb = consts::V2_TOMBSTONES_SUFFIX,
             tomb_pk_col = tomb_pk_col,
             tomb_pk_select = tomb_pk_select,
-            sentinel = sentinel,
             ts_fallback = ts_fallback,
         ))?;
 
         // Step 3: Batch insert tombstone PKs (hash mode only — skip_hash stores PK directly in tombstone)
+        // Uses precomputed hashed_pk and PK values from temp table.
         if !skip_hash {
             db.exec_safe(&format!(
                 "INSERT OR REPLACE INTO \"{escaped}{v2_tomb_pks}\" ({pk_cols}, hashed_pk)
-                 SELECT {pk_cols_p}, crsql_hash_pk({pk_cols_p})
-                 FROM \"{escaped}__crsql_pks\" p
-                 JOIN temp.migration_chunk chunk
-                   ON p.__crsql_key = chunk.__crsql_key
-                 JOIN \"{escaped}__crsql_clock\" s
-                   ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
-                 WHERE s.col_version % 2 = 0",
+                 SELECT {pk_cols_chunk}, chunk.hashed_pk
+                 FROM temp.migration_chunk chunk
+                 WHERE chunk.is_alive = 0",
                 escaped = escaped,
                 v2_tomb_pks = consts::V2_TOMBSTONE_PKS_SUFFIX,
                 pk_cols = pk_cols_list,
-                pk_cols_p = pk_cols_p_list,
-                sentinel = sentinel,
+                pk_cols_chunk = pk_cols_chunk_list,
             ))?;
         }
 
@@ -459,14 +518,16 @@ unsafe fn migrate_v1_to_v2_chunk(
         // Both steps share the same structure; only the col_id source, col_version, WHERE, and
         // the v2_col_map JOIN differ. We build conditionally and run both in a loop.
         let clock_joins = if key_is_rowid {
+            // For rowid-key tables, need base table JOIN to get rowid for cell_key.
             let base_join = format!(
                 "JOIN \"{escaped}\" t ON {pk_join_cond}",
-                escaped = escaped, pk_join_cond = pk_join_cond
+                escaped = escaped, pk_join_cond = pk_join_cond_rowid
             );
             let cell_key_base = format!("(t.\"{}\" << {col_id_bits})", rowid_alias, col_id_bits = col_id_bits);
             (cell_key_base, base_join)
         } else {
-            let v2_pks_join = v2_pks_join_clause(tbl_info, &escaped, &pk_cols_p_list);
+            // Use chunk. prefix for PK values (from temp table, not __crsql_pks)
+            let v2_pks_join = v2_pks_join_clause(tbl_info, &escaped, &pk_cols_chunk_list);
             let cell_key_base = format!("(vp.__crsql_key << {col_id_bits})", col_id_bits = col_id_bits);
             (cell_key_base, v2_pks_join)
         };
@@ -482,7 +543,6 @@ unsafe fn migrate_v1_to_v2_chunk(
              FROM \"{escaped}__crsql_clock\" c
              JOIN temp.migration_chunk chunk
                ON c.key = chunk.__crsql_key
-             JOIN \"{escaped}__crsql_pks\" p ON c.key = p.__crsql_key
              {base_join}
              JOIN \"{escaped}{v2_col_map}\" m ON c.col_name = m.col_name
              WHERE c.col_name != '{sentinel}'",
@@ -507,21 +567,16 @@ unsafe fn migrate_v1_to_v2_chunk(
                 "INSERT OR REPLACE INTO \"{escaped}{v2_clock}\"
                  (cell_key, col_version, site_id, db_version, seq, ts)
                  SELECT {cell_key_base} | 0,
-                   COALESCE(s.col_version, 1), COALESCE(s.site_id, 0),
-                   COALESCE(s.db_version, 0), COALESCE(s.seq, 0),
-                   CASE WHEN CAST(COALESCE(s.ts, '0') AS INTEGER) > 0 THEN CAST(s.ts AS INTEGER) ELSE {ts_fallback} END
-                 FROM \"{escaped}__crsql_pks\" p
-                 JOIN temp.migration_chunk chunk
-                   ON p.__crsql_key = chunk.__crsql_key
+                   COALESCE(chunk.sentinel_version, 1), COALESCE(chunk.sentinel_site_id, 0),
+                   COALESCE(chunk.sentinel_db_version, 0), COALESCE(chunk.sentinel_seq, 0),
+                   CASE WHEN CAST(COALESCE(chunk.sentinel_ts, '0') AS INTEGER) > 0 THEN CAST(chunk.sentinel_ts AS INTEGER) ELSE {ts_fallback} END
+                 FROM temp.migration_chunk chunk
                  {base_join}
-                 LEFT JOIN \"{escaped}__crsql_clock\" s
-                   ON p.__crsql_key = s.key AND s.col_name = '{sentinel}'
-                 WHERE s.col_version IS NULL OR s.col_version % 2 != 0",
+                 WHERE chunk.is_alive = 1 AND chunk.in_base = 1",
                 escaped = escaped,
                 v2_clock = consts::V2_CLOCK_SUFFIX,
                 cell_key_base = cell_key_base,
                 base_join = base_join,
-                sentinel = sentinel,
                 ts_fallback = ts_fallback,
             ))?;
         }
@@ -562,13 +617,19 @@ unsafe fn migrate_v1_to_v2_chunk(
                     escaped = escaped,
                     last_key = crate::util::get_master_value(db, &progress_key)?.unwrap_or(0),
                 );
-                let actual = crate::util::get_or_count(db, &total_key, &verify_sql)?;
+                // Run count directly — do NOT cache via get_or_count, since the cached
+                // value would be stale on the next call (start_key will have advanced).
+                let verify_stmt = db.prepare_v2(&verify_sql)?;
+                verify_stmt.step()?;
+                let actual = verify_stmt.column_int64(0);
                 if actual == 0 {
                     crate::util::clear_master_key(db, &progress_key)?;
                     crate::util::clear_master_key(db, &total_key)?;
                     db.exec_safe("RELEASE migration_chunk")?;
                     Ok(0)
                 } else {
+                    // Do NOT cache — the next call will count with the new start_key via get_or_count.
+                    // total_key was already cleared above, so get_or_count will run the count query.
                     db.exec_safe("RELEASE migration_chunk")?;
                     Ok(actual)
                 }
