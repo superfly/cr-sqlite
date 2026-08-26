@@ -151,8 +151,16 @@ pub extern "C" fn crsql_config_set(
         METADATA_USE_VERSION => {
             let new_val = args[1].int();
             let old_val = unsafe { (*ext_data).metadataUseVersion };
-            if !validate_use_version_transition(old_val, new_val, unsafe { (*ext_data).metadataWriteVersion }) {
-                ctx.result_error("Invalid metadata-use-version transition");
+            let write_version = unsafe { (*ext_data).metadataWriteVersion };
+            if !validate_use_version_transition(old_val, new_val, write_version) {
+                let msg = if old_val == 1 && new_val == 2 {
+                    "Cannot set metadata-use-version to v2: requires metadata-write-version to be v2&v1 or v2 first, and all V1→V2 migrations must be complete. Run crsql_incremental_maintenance() until it returns 0."
+                } else if old_val == 2 && new_val == 1 {
+                    "Cannot set metadata-use-version to v1: requires metadata-write-version to be v1 or v2&v1 first."
+                } else {
+                    "Invalid metadata-use-version transition"
+                };
+                ctx.result_error(msg);
                 ctx.result_error_code(ResultCode::ERROR);
                 return;
             }
@@ -169,8 +177,21 @@ pub extern "C" fn crsql_config_set(
         SYNC_LOG_VERSION => {
             let new_val = args[1].int();
             let old_val = unsafe { (*ext_data).syncLogVersion };
-            if !validate_sync_log_transition(old_val, new_val, unsafe { (*ext_data).metadataUseVersion }, unsafe { (*ext_data).metadataWriteVersion }) {
-                ctx.result_error("Invalid sync-log-version transition");
+            let use_version = unsafe { (*ext_data).metadataUseVersion };
+            let write_version = unsafe { (*ext_data).metadataWriteVersion };
+            if !validate_sync_log_transition(old_val, new_val, use_version, write_version) {
+                let msg = if old_val == 1 && new_val == 2 {
+                    if use_version != 2 {
+                        "Cannot set sync-log-version to v2: requires metadata-use-version to be v2 first. Run crsql_incremental_maintenance() to complete V1→V2 migration, then set metadata-use-version to 2."
+                    } else {
+                        "Cannot set sync-log-version to v2: requires metadata-write-version to be v2 or v2&v1."
+                    }
+                } else if old_val == 2 && new_val == 1 {
+                    "Cannot set sync-log-version to v1: requires metadata-use-version to be v1 first."
+                } else {
+                    "Invalid sync-log-version transition"
+                };
+                ctx.result_error(msg);
                 ctx.result_error_code(ResultCode::ERROR);
                 return;
             }
