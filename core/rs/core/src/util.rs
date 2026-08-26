@@ -147,6 +147,26 @@ pub unsafe fn get_master_value(db: *mut sqlite3, key: &str) -> Result<Option<i64
     Ok(None)
 }
 
+/// Get a cached count from crsql_master, or run a count query and cache it.
+/// Used by migration/cleanup to avoid expensive `count(*)` on every chunk.
+/// The count SQL should count only remaining rows (e.g. with a WHERE clause).
+pub unsafe fn get_or_count(
+    db: *mut sqlite3,
+    cache_key: &str,
+    count_sql: &str,
+) -> Result<i64, ResultCode> {
+    match get_master_value(db, cache_key)? {
+        Some(v) => Ok(v),
+        None => {
+            let stmt = db.prepare_v2(count_sql)?;
+            stmt.step()?;
+            let total = stmt.column_int64(0);
+            set_master_value(db, cache_key, total)?;
+            Ok(total)
+        }
+    }
+}
+
 /// Set an integer value in crsql_master by exact key (insert or replace).
 pub unsafe fn set_master_value(db: *mut sqlite3, key: &str, value: i64) -> Result<(), ResultCode> {
     let sql = "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, ?)\0";

@@ -168,6 +168,11 @@ unsafe fn process_cleanup_tasks(
 
 /// Chunked table cleanup: DELETE rows in batches from each suffixed table, then
 /// DROP all tables when empty. Returns estimated remaining rows across all tables.
+///
+/// Uses `changes64()` to track deleted rows without running `count(*)` on every call.
+/// The total row count is cached in crsql_master on the first call. When a DELETE
+/// removes 0 rows, the table is empty. If the estimate goes negative (possible if
+/// rows were added concurrently), we re-count to correct it.
 unsafe fn cleanup_tables_chunk(
     db: *mut sqlite3,
     tbl_name: &str,
@@ -178,8 +183,29 @@ unsafe fn cleanup_tables_chunk(
     db.exec_safe("SAVEPOINT cleanup_chunk")?;
 
     let result = (|| {
-        let mut total_remaining: i64 = 0;
         let mut all_empty = true;
+        let mut total_deleted: i64 = 0;
+
+        // Load or initialize cached total row count across all suffixes
+        let total_key = format!("cleanup_total_{}", tbl_name);
+        let cached_total: i64 = match crate::util::get_master_value(db, &total_key)? {
+            Some(v) => v,
+            None => {
+                // First call: count all rows across suffixes
+                let mut total: i64 = 0;
+                for suffix in suffixes {
+                    let count_sql = format!(
+                        "SELECT count(*) FROM \"{escaped}{suffix}\"\0",
+                        escaped = escaped, suffix = suffix,
+                    );
+                    let stmt = db.prepare_v2(&count_sql)?;
+                    stmt.step()?;
+                    total += stmt.column_int64(0);
+                }
+                crate::util::set_master_value(db, &total_key, total)?;
+                total
+            }
+        };
 
         for suffix in suffixes {
             let table_name = format!("\"{escaped}{suffix}\"", escaped = escaped, suffix = suffix);
@@ -188,17 +214,15 @@ unsafe fn cleanup_tables_chunk(
                 table_name = table_name,
                 chunk_size = chunk_size,
             ))?;
-            let count_sql = format!("SELECT count(*) FROM {table_name}\0", table_name = table_name);
-            let count_stmt = db.prepare_v2(&count_sql)?;
-            count_stmt.step()?;
-            let remaining = count_stmt.column_int64(0);
-            total_remaining += remaining;
-            if remaining > 0 {
+            let deleted = db.changes64();
+            total_deleted += deleted;
+            if deleted > 0 {
+                // Deleted something → table might still have rows
                 all_empty = false;
             }
         }
 
-        // When all empty, drop the tables
+        // If no rows were deleted in any table, all are empty → drop them
         if all_empty {
             for suffix in suffixes {
                 db.exec_safe(&format!(
@@ -207,9 +231,42 @@ unsafe fn cleanup_tables_chunk(
                     suffix = suffix,
                 ))?;
             }
+            crate::util::clear_master_key(db, &total_key)?;
+            return Ok(0i64);
         }
 
-        Ok(total_remaining)
+        // Estimate remaining from cached total minus cumulative deleted.
+        // If negative (concurrent inserts or over-estimate), re-count to correct.
+        let remaining = cached_total - total_deleted;
+        if remaining <= 0 {
+            // Re-count to verify
+            let mut actual: i64 = 0;
+            for suffix in suffixes {
+                let count_sql = format!(
+                    "SELECT count(*) FROM \"{escaped}{suffix}\"\0",
+                    escaped = escaped, suffix = suffix,
+                );
+                let stmt = db.prepare_v2(&count_sql)?;
+                stmt.step()?;
+                actual += stmt.column_int64(0);
+            }
+            if actual == 0 {
+                for suffix in suffixes {
+                    db.exec_safe(&format!(
+                        "DROP TABLE IF EXISTS \"{escaped}{suffix}\";",
+                        escaped = escaped,
+                        suffix = suffix,
+                    ))?;
+                }
+                crate::util::clear_master_key(db, &total_key)?;
+                return Ok(0i64);
+            }
+            // Correct the cache and return actual count
+            crate::util::set_master_value(db, &total_key, actual + total_deleted)?;
+            Ok(actual)
+        } else {
+            Ok(remaining)
+        }
     })();
 
     match result {
@@ -242,27 +299,15 @@ unsafe fn migrate_v1_to_v2_chunk(
     let progress = crate::util::get_master_value(db, &progress_key)?;
     let start_key = progress.unwrap_or(0);
 
-    // One-time count of total rows to migrate (stored for estimate)
+    // One-time count of remaining rows to migrate (cached in crsql_master).
+    // Counts only unprocessed rows (key > start_key) so resume from interruption is correct.
     let total_key = format!("migration_v1_to_v2_total_{}", tbl_info.tbl_name);
-    let total: i64 = match crate::util::get_master_value(db, &total_key)? {
-        Some(v) => v,
-        None => {
-            // First call: count total rows
-            let count_sql = format!(
-                "SELECT count(*) FROM \"{escaped}__crsql_pks\"\0",
-                escaped = escaped,
-            );
-            let count_stmt = db.prepare_v2(&count_sql)?;
-            count_stmt.step()?;
-            let total = count_stmt.column_int64(0);
-            crate::util::set_master_value(db, &total_key, total)?;
-            total
-        }
-    };
-
-    // Track cumulative processed count for estimate
-    let done_key = format!("migration_v1_to_v2_done_{}", tbl_info.tbl_name);
-    let mut cumulative_done: i64 = crate::util::get_master_value(db, &done_key)?.unwrap_or(0);
+    let count_sql = format!(
+        "SELECT count(*) FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key}\0",
+        escaped = escaped,
+        start_key = start_key,
+    );
+    let mut remaining_estimate = crate::util::get_or_count(db, &total_key, &count_sql)?;
 
     // Process a chunk of rows
     let (pk_cols_list, _) = crate::v2_stmts::pk_cols_and_values(&tbl_info.pks);
@@ -321,10 +366,7 @@ unsafe fn migrate_v1_to_v2_chunk(
         };
         db.exec_safe(&format!(
             "INSERT OR IGNORE INTO \"{escaped}{v2_pks}\" ({pks_cols})
-             SELECT {pks_select},
-               CASE WHEN s.col_version IS NULL OR s.col_version % 2 != 0 THEN
-                 CASE WHEN s.col_version IS NULL THEN 1 ELSE s.col_version END
-               ELSE 1 END
+             SELECT {pks_select}, COALESCE(s.col_version, 1)
              FROM \"{escaped}__crsql_pks\" p
              JOIN (SELECT __crsql_key FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key} ORDER BY __crsql_key LIMIT {chunk_size}) chunk
                ON p.__crsql_key = chunk.__crsql_key
@@ -341,6 +383,9 @@ unsafe fn migrate_v1_to_v2_chunk(
             start_key = start_key,
             chunk_size = chunk_size,
         ))?;
+        // Capture actual rows inserted into v2_pks (Step 1) for progress tracking.
+        // Subsequent steps (tombstones, clock) may insert different row counts.
+        let pks_inserted = db.changes64();
 
         // Step 2: Batch insert tombstones (dead rows).
         // skip_hash: PK column replaces hashed_pk. No v2_tombstone_pks needed.
@@ -484,31 +529,45 @@ unsafe fn migrate_v1_to_v2_chunk(
         } else {
             // Update progress marker to last key processed
             crate::util::set_master_value(db, &progress_key, last_key)?;
-            // Use chunk_size as processed count for estimate (actual may be less due to orphans/IGNORE)
-            Ok(chunk_size)
+            // Use actual rows inserted into v2_pks (Step 1) as processed count.
+            // This is more accurate than chunk_size which over-counts due to orphans/IGNORE.
+            Ok(pks_inserted)
         }
     })();
 
     match result {
         Ok(processed) => {
-            cumulative_done += processed;
-            crate::debug::debug_log(&format!("migrate_chunk: processed={} cumulative_done={} total={}", processed, cumulative_done, total));
-            if processed == 0 || cumulative_done >= total {
-                // Migration complete for this table (no more rows, or all rows processed)
+            remaining_estimate -= processed;
+            crate::debug::debug_log(&format!("migrate_chunk: processed={} remaining_estimate={}", processed, remaining_estimate));
+            if processed == 0 {
+                // Chunk was empty — migration complete for this table
                 crate::util::clear_master_key(db, &progress_key)?;
-                // Clear total and done markers
                 crate::util::clear_master_key(db, &total_key)?;
-                crate::util::clear_master_key(db, &done_key)?;
                 db.exec_safe("RELEASE migration_chunk")?;
                 Ok(0)
+            } else if remaining_estimate <= 0 {
+                // Estimate exhausted — re-count to verify (may have been over-count due to orphans/IGNORE)
+                let verify_sql = format!(
+                    "SELECT count(*) FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {last_key}\0",
+                    escaped = escaped,
+                    last_key = crate::util::get_master_value(db, &progress_key)?.unwrap_or(0),
+                );
+                let actual = crate::util::get_or_count(db, &total_key, &verify_sql)?;
+                if actual == 0 {
+                    crate::util::clear_master_key(db, &progress_key)?;
+                    crate::util::clear_master_key(db, &total_key)?;
+                    db.exec_safe("RELEASE migration_chunk")?;
+                    Ok(0)
+                } else {
+                    db.exec_safe("RELEASE migration_chunk")?;
+                    Ok(actual)
+                }
             } else {
-                // Update done marker
-                crate::util::set_master_value(db, &done_key, cumulative_done)?;
+                // Update cached estimate
+                crate::util::set_master_value(db, &total_key, remaining_estimate)?;
                 db.exec_safe("RELEASE migration_chunk")?;
-                let remaining = total - cumulative_done;
-                let remaining = if remaining < 0 { 0i64 } else { remaining };
-                crate::debug::debug_log(&format!("migrate_chunk: returning remaining={} (total={} cum_done={})", remaining, total, cumulative_done));
-                Ok(remaining)
+                crate::debug::debug_log(&format!("migrate_chunk: returning remaining={}", remaining_estimate));
+                Ok(remaining_estimate)
             }
         }
         Err(e) => {
