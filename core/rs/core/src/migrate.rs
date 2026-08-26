@@ -126,9 +126,17 @@ unsafe fn incremental_maintenance(
         }
 
         // Migrate a chunk of rows from V1 to V2
-        let remaining = migrate_v1_to_v2_chunk(db, ext_data, tbl_info, chunk_size as i64)?;
-        crate::debug::debug_log(&format!("migration: {} remaining={}", tbl_info.tbl_name, remaining));
-        total_remaining += remaining as c_int;
+        match migrate_v1_to_v2_chunk(db, ext_data, tbl_info, chunk_size as i64) {
+            Ok(remaining) => {
+                crate::debug::debug_log(&format!("migration: {} remaining={}", tbl_info.tbl_name, remaining));
+                total_remaining += remaining as c_int;
+            }
+            Err(e) => {
+                crate::debug::debug_log(&format!("migration: FAILED for {}: {:?}", tbl_info.tbl_name, e));
+                // Don't abort the entire migration — skip this table and continue with others
+                // The error will be retried on the next maintenance call
+            }
+        }
     }
 
     Ok(total_remaining)
@@ -546,7 +554,9 @@ unsafe fn migrate_v1_to_v2_chunk(
                 db.exec_safe("RELEASE migration_chunk")?;
                 Ok(0)
             } else if remaining_estimate <= 0 {
-                // Estimate exhausted — re-count to verify (may have been over-count due to orphans/IGNORE)
+                // Estimate exhausted — re-count to verify (may have been over-count due to orphans/IGNORE).
+                // Clear cached total first so get_or_count actually runs the count query.
+                crate::util::clear_master_key(db, &total_key)?;
                 let verify_sql = format!(
                     "SELECT count(*) FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {last_key}\0",
                     escaped = escaped,
