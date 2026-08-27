@@ -105,9 +105,9 @@ fn test_auto_qualified_int_pk() -> Result<(), ResultCode> {
 }
 
 /// TEXT PRIMARY KEY → not auto-qualified (no INT in type).
-/// Rowid table (TEXT PK can't be rowid alias, but table still has rowid) →
-/// hash + rowid → 3 columns (__crsql_key, hashed_pk, cl).
-/// __crsql_key = rowid, hashed_pk stores the hash of the TEXT PK.
+/// Non-rowid (implicit rowid is unstable under VACUUM) →
+/// hash + non-rowid → 4 columns (__crsql_key, "id", hashed_pk, cl).
+/// __crsql_key is auto-assigned, "id" stores the TEXT PK, hashed_pk stores its hash.
 fn test_text_pk_not_auto_qualified() -> Result<(), ResultCode> {
     let db = crate::opendb()?;
     db.db.exec_safe("CREATE TABLE foo (id TEXT PRIMARY KEY NOT NULL, x TEXT)")?;
@@ -116,10 +116,10 @@ fn test_text_pk_not_auto_qualified() -> Result<(), ResultCode> {
     migrate_to_v2(&db.db)?;
 
     let col_count = v2_pks_col_count(&db.db, "foo");
-    // hash + rowid: __crsql_key, hashed_pk, cl = 3 cols
-    assert!(col_count == 3, "text PK: expected 3 cols, got {}", col_count);
+    // hash + non-rowid: __crsql_key, "id", hashed_pk, cl = 4 cols
+    assert!(col_count == 4, "text PK: expected 4 cols, got {}", col_count);
     assert!(v2_pks_has_hashed_pk(&db.db, "foo"), "text PK: should have hashed_pk");
-    libc_println!("  text PK: 3 cols, has hashed_pk — PASS");
+    libc_println!("  text PK: 4 cols, has hashed_pk — PASS");
     Ok(())
 }
 
@@ -543,10 +543,10 @@ fn test_skip_hash_non_rowid_insert() -> Result<(), ResultCode> {
 ///
 /// #   Schema                          Directive         as_crr arg          Expected  Why
 /// 1   INTEGER PK                      —                 —                   ns        INTEGER PK is rowid alias → non-rowid (overflow safety), skip_hash auto (INT affinity)
-/// 2   INT PK                          —                 —                   rs        INT is not rowid alias, rowid accessible, skip_hash auto
-/// 3   BIGINT PK                       —                 —                   rs        Same as INT
-/// 4   TEXT PK                         —                 —                   rh        TEXT PK, rowid accessible, hash mode
-/// 5   (INTEGER, INTEGER) composite    —                 —                   rh        Composite PK → no skip_hash, rowid accessible
+/// 2   INT PK                          —                 —                   ns        INT is not rowid alias → implicit rowid unstable under VACUUM → non-rowid, skip_hash auto
+/// 3   BIGINT PK                       —                 —                   ns        Same as INT
+/// 4   TEXT PK                         —                 —                   nh        TEXT PK, implicit rowid unstable → non-rowid, hash mode
+/// 5   (INTEGER, INTEGER) composite    —                 —                   nh        Composite PK → no skip_hash, implicit rowid unstable → non-rowid
 /// 6   INTEGER PK WITHOUT ROWID        —                 —                   ns        Non-rowid, skip_hash auto
 /// 7   INT PK WITHOUT ROWID            —                 —                   ns        Non-rowid, skip_hash auto
 /// 8   TEXT PK WITHOUT ROWID           —                 —                   nh        Non-rowid, hash
@@ -555,12 +555,14 @@ fn test_skip_hash_non_rowid_insert() -> Result<(), ResultCode> {
 /// 11  TEXT PK                         skip_hash=1,      without_rowid       ns        Explicit skip_hash + non-rowid (without_rowid arg = use_rowid=0)
 /// 12  INTEGER PK                      —                 use_rowid           rs        Explicit use_rowid overrides non-rowid default, skip_hash auto
 /// 13  INTEGER PK                      skip_hash=0       use_rowid           rh        Explicit use_rowid + explicit hash
-/// 14  (INTEGER, INTEGER) composite    skip_hash=1       —                   rh        skip_hash=1 rejected on composite PK → hash, rowid accessible
+/// 14  (INTEGER, INTEGER) composite    skip_hash=1       —                   nh        skip_hash=1 rejected on composite PK → hash, non-rowid
 /// 15  (TEXT, TEXT) WITHOUT ROWID      skip_hash=1       —                   nh        skip_hash=1 rejected on composite PK → hash, non-rowid
 /// 16  INTEGER PK                      use_rowid=1       —                   rs        use_rowid=1 directive forces rowid-key
 /// 17  INT PK                          use_rowid=0       —                   ns        use_rowid=0 directive forces non-rowid-key
 /// 18  INTEGER PK                      use_rowid=0,      —                   nh        use_rowid=0 + skip_hash=0 → hash + non-rowid
 ///                                    skip_hash=0
+/// 19  INT PK                          —                 use_rowid           ERROR     use_rowid rejected on non-INTEGER PK (implicit rowid unstable)
+/// 20  TEXT PK                         use_rowid=1       —                   ERROR     use_rowid=1 directive rejected on non-INTEGER PK
 fn test_auto_detection_matrix() -> Result<(), ResultCode> {
     libc_println!("=== test_auto_detection_matrix START ===");
 
@@ -569,13 +571,13 @@ fn test_auto_detection_matrix() -> Result<(), ResultCode> {
         ("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, x TEXT)",
          "'t'", "ns", "INTEGER PK rowid"),
         ("CREATE TABLE t (id INT PRIMARY KEY NOT NULL, x TEXT)",
-         "'t'", "rs", "INT PK rowid"),
+         "'t'", "ns", "INT PK rowid"),
         ("CREATE TABLE t (id BIGINT PRIMARY KEY NOT NULL, x TEXT)",
-         "'t'", "rs", "BIGINT PK rowid"),
+         "'t'", "ns", "BIGINT PK rowid"),
         ("CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, x TEXT)",
-         "'t'", "rh", "TEXT PK rowid"),
+         "'t'", "nh", "TEXT PK rowid"),
         ("CREATE TABLE t (a INTEGER NOT NULL, b INTEGER NOT NULL, x TEXT, PRIMARY KEY (a, b))",
-         "'t'", "rh", "composite INTEGER PK rowid"),
+         "'t'", "nh", "composite INTEGER PK rowid"),
         ("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, x TEXT) WITHOUT ROWID",
          "'t'", "ns", "INTEGER PK WITHOUT ROWID"),
         ("CREATE TABLE t (id INT PRIMARY KEY NOT NULL, x TEXT) WITHOUT ROWID",
@@ -593,7 +595,7 @@ fn test_auto_detection_matrix() -> Result<(), ResultCode> {
         ("CREATE TABLE t /* crsql: skip_hash=0 */ (id INTEGER PRIMARY KEY NOT NULL, x TEXT)",
          "'t', 'use_rowid'", "rh", "INTEGER PK + skip_hash=0 + use_rowid"),
         ("CREATE TABLE t /* crsql: skip_hash=1 */ (a INTEGER NOT NULL, b INTEGER NOT NULL, x TEXT, PRIMARY KEY (a, b))",
-         "'t'", "rh", "composite INTEGER PK + skip_hash=1 (rejected)"),
+         "'t'", "nh", "composite INTEGER PK + skip_hash=1 (rejected)"),
         ("CREATE TABLE t /* crsql: skip_hash=1 */ (a TEXT NOT NULL, b TEXT NOT NULL, x TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID",
          "'t'", "nh", "composite TEXT PK WITHOUT ROWID + skip_hash=1 (rejected)"),
         // use_rowid directive (tri-state): =1 forces rowid, =0 forces non-rowid
@@ -603,6 +605,11 @@ fn test_auto_detection_matrix() -> Result<(), ResultCode> {
          "'t'", "ns", "INT PK + use_rowid=0 directive (force non-rowid)"),
         ("CREATE TABLE t /* crsql: use_rowid=0, skip_hash=0 */ (id INTEGER PRIMARY KEY NOT NULL, x TEXT)",
          "'t'", "nh", "INTEGER PK + use_rowid=0 + skip_hash=0"),
+        // use_rowid=1 on non-INTEGER PK → ERROR (implicit rowid unstable under VACUUM)
+        ("CREATE TABLE t (id INT PRIMARY KEY NOT NULL, x TEXT)",
+         "'t', 'use_rowid'", "ERROR", "INT PK + use_rowid (should fail)"),
+        ("CREATE TABLE t /* crsql: use_rowid=1 */ (id TEXT PRIMARY KEY NOT NULL, x TEXT)",
+         "'t'", "ERROR", "TEXT PK + use_rowid=1 directive (should fail)"),
     ];
 
     for (i, (create_sql, as_crr_args, expected, label)) in cases.iter().enumerate() {
@@ -614,7 +621,19 @@ fn test_auto_detection_matrix() -> Result<(), ResultCode> {
             .map_err(|_| { libc_println!("  [{:>2}] {}: CREATE TABLE FAILED", i + 1, label); ResultCode::ERROR })?;
         db.db.exec_safe("SELECT crsql_set_ts('1700000000')")
             .map_err(|_| { libc_println!("  [{:>2}] {}: set_ts FAILED", i + 1, label); ResultCode::ERROR })?;
-        db.db.exec_safe(&format!("SELECT crsql_as_crr({})", as_crr_args))
+        let as_crr_rc = db.db.exec_safe(&format!("SELECT crsql_as_crr({})", as_crr_args));
+
+        if *expected == "ERROR" {
+            assert!(
+                as_crr_rc.is_err(),
+                "[{}] {}: expected as_crr to FAIL, but it succeeded",
+                i + 1, label
+            );
+            libc_println!("  [{:>2}] {}: correctly rejected — PASS", i + 1, label);
+            continue;
+        }
+
+        as_crr_rc
             .map_err(|_| { libc_println!("  [{:>2}] {}: crsql_as_crr({}) FAILED", i + 1, label, as_crr_args); ResultCode::ERROR })?;
         let sig = get_pk_signature(&db.db, "t");
         let mode = sig.split(':').next().unwrap_or("");

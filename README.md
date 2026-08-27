@@ -335,11 +335,13 @@ Controls whether the SQLite `rowid` is used as the internal `__crsql_key` (the p
 
 | Value | Behavior |
 |---|---|
-| `use_rowid=1` | Use `rowid` as `__crsql_key`. Most efficient, but requires rowids to stay within `[0, 2^51)`. |
+| `use_rowid=1` | Use `rowid` as `__crsql_key`. Most efficient, but requires `INTEGER PRIMARY KEY` and rowids within `[0, 2^51)`. |
 | `use_rowid=0` | Use an auto-assigned `__crsql_key`; store the PK value(s) in `v2_pks` directly. |
-| *(absent)* | **Auto-detect**: `use_rowid=0` for `INTEGER PRIMARY KEY` tables, `use_rowid=1` for other rowid tables, `use_rowid=0` for `WITHOUT ROWID` tables. |
+| *(absent)* | **Auto-detect**: always `use_rowid=0` (non-rowid). See explanation below. |
 
-The auto-detect default for `INTEGER PRIMARY KEY` is non-rowid because `INTEGER PRIMARY KEY` is a rowid alias — the PK value IS the rowid. In distributed systems, the common pattern is random 64-bit integer PKs (e.g. snowflake IDs, random IDs), which routinely exceed `2^51` and would overflow the `cell_key = (rowid << 12) | col_id` computation. This only applies to `INTEGER PRIMARY KEY` (the rowid alias) — other integer PK types like `INT` or `BIGINT` are not rowid aliases, so their rowid is a separate hidden value and `use_rowid=1` is safe by default. If you know your `INTEGER PRIMARY KEY` rowids are small (e.g. explicit 50-bit IDs), use `use_rowid=1` for better performance. `use_rowid=1` can only be set on rowid tables (not `WITHOUT ROWID`).
+The auto-detect default is always non-rowid. `use_rowid=1` is only allowed on `INTEGER PRIMARY KEY` tables — `INTEGER PRIMARY KEY` is a rowid alias, so the rowid IS the PK value and is stable. Other rowid tables (e.g. `INT PRIMARY KEY`, `TEXT PRIMARY KEY`) have **implicit rowids** that can be renumbered by `VACUUM`, making them unsafe as persistent keys. Attempting `use_rowid=1` on a table without `INTEGER PRIMARY KEY` will fail with an error.
+
+Even for `INTEGER PRIMARY KEY` tables, the default is non-rowid because in distributed systems the common pattern is random 64-bit integer PKs (e.g. snowflake IDs), which routinely exceed `2^51` and would overflow the `cell_key = (rowid << 12) | col_id` computation. If you know your rowids are small (e.g. explicit 50-bit IDs, sequential auto-increment), use `use_rowid=1` for better performance.
 
 #### `crsql_as_crr` Arguments
 

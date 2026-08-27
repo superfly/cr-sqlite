@@ -51,8 +51,17 @@ pub fn create_crr(
     // will infer from the persisted flag.
     match use_rowid_resolved {
         Some(true) => {
-            // Force rowid-key mode even for INTEGER PK tables (which default to
-            // non-rowid for overflow safety). Only valid for rowid tables.
+            // Force rowid-key mode. Only allowed for INTEGER PRIMARY KEY tables —
+            // implicit rowids (tables without INTEGER PK) are unstable and can be
+            // renumbered by VACUUM, making them unsafe as persistent keys.
+            if !table_info.has_integer_pk {
+                err.set(&format!(
+                    "use_rowid=1 is only allowed on INTEGER PRIMARY KEY tables. \
+                    Table '{table}' does not have an INTEGER PRIMARY KEY — \
+                    its implicit rowid is unstable under VACUUM and cannot be used as a persistent key."
+                ));
+                return Err(ResultCode::ERROR);
+            }
             table_info.key_is_rowid = true;
             unsafe { crate::util::set_master_value(db, &format!("use_rowid_{}", table), 1) }?;
         }
