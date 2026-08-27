@@ -1949,6 +1949,64 @@ fn test_ts_not_set_errors() -> Result<(), ResultCode> {
     Ok(())
 }
 
+fn test_config_persists_across_reopen() -> Result<(), ResultCode> {
+    libc_println!("=== test_config_persists_across_reopen START ===");
+
+    let path = "crsql_config_reopen_test.db\0";
+    let path_str = path.trim_end_matches('\0');
+
+    #[cfg(not(target_os = "windows"))]
+    extern "C" {
+        fn unlink(pathname: *const core::ffi::c_char) -> core::ffi::c_int;
+    }
+    #[cfg(target_os = "windows")]
+    extern "C" {
+        fn _unlink(pathname: *const core::ffi::c_char) -> core::ffi::c_int;
+    }
+
+    // Remove any leftover file from previous runs
+    unsafe {
+        #[cfg(not(target_os = "windows"))]
+        unlink(path.as_ptr() as *const core::ffi::c_char);
+        #[cfg(target_os = "windows")]
+        _unlink(path.as_ptr() as *const core::ffi::c_char);
+    }
+
+    // Create DB, set metadata-write-version to 2, close
+    {
+        let db = crate::opendb_file(path_str)?;
+        db.db.exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, a)")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
+        // Verify it was set
+        let stmt = db.db.prepare_v2("SELECT crsql_config_get('metadata-write-version')")?;
+        stmt.step()?;
+        let val = stmt.column_int(0);
+        assert_eq!(val, 2, "metadata-write-version should be 2 after set");
+    }
+    // Connection closed (dropped)
+
+    // Reopen — config should be loaded from crsql_master
+    {
+        let db = crate::opendb_file(path_str)?;
+        let stmt = db.db.prepare_v2("SELECT crsql_config_get('metadata-write-version')")?;
+        stmt.step()?;
+        let val = stmt.column_int(0);
+        assert_eq!(val, 2, "metadata-write-version should be 2 after reopen, got {}", val);
+        libc_println!("=== test_config_persists_across_reopen PASS ===");
+    }
+
+    // Cleanup
+    unsafe {
+        #[cfg(not(target_os = "windows"))]
+        unlink(path.as_ptr() as *const core::ffi::c_char);
+        #[cfg(target_os = "windows")]
+        _unlink(path.as_ptr() as *const core::ffi::c_char);
+    }
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), ResultCode> {
     test_pack_agg_matches_pack_columns()?;
     test_pack_agg_with_nulls()?;
@@ -1973,5 +2031,6 @@ pub fn run_suite() -> Result<(), ResultCode> {
     test_dual_write_wire_convergence()?;
     test_tombstone_conflict_resolution()?;
     test_ts_not_set_errors()?;
+    test_config_persists_across_reopen()?;
     Ok(())
 }

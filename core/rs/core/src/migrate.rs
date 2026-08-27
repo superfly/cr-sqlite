@@ -132,7 +132,7 @@ unsafe fn incremental_maintenance(
                     let progress_key = format!("migration_v1_to_v2_migration_{}", tbl_info.tbl_name);
                     let progress = crate::util::get_master_value(db, &progress_key)?;
                     if progress.is_some() {
-                        let total_key = format!("migration_v1_to_v2_total_{}", tbl_info.tbl_name);
+                        let total_key = format!("migration_v1_to_v2_remaining_{}", tbl_info.tbl_name);
                         let cached = crate::util::get_master_value(db, &total_key)?;
                         if let Some(v) = cached {
                             total_remaining += v as c_int;
@@ -246,7 +246,7 @@ unsafe fn cleanup_tables_chunk(
         let mut total_deleted: i64 = 0;
 
         // Load or initialize cached total row count across all suffixes
-        let total_key = format!("cleanup_total_{}", tbl_name);
+        let total_key = format!("cleanup_remaining_{}", tbl_name);
         let cached_total: i64 = match crate::util::get_master_value(db, &total_key)? {
             Some(v) => v,
             None => {
@@ -365,7 +365,7 @@ unsafe fn migrate_v1_to_v2_chunk(
     db.exec_safe("SAVEPOINT migration_chunk")?;
 
     // One-time count of remaining rows to migrate (cached in crsql_master).
-    let total_key = format!("migration_v1_to_v2_total_{}", tbl_info.tbl_name);
+    let total_key = format!("migration_v1_to_v2_remaining_{}", tbl_info.tbl_name);
     let count_sql = format!(
         "SELECT count(*) FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key}\0",
         escaped = escaped,

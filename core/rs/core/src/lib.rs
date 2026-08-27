@@ -279,10 +279,8 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         return null_mut();
     }
 
-    // Set default metadata write version to V1
-    unsafe { (*ext_data).metadataWriteVersion = crate::config::METADATA_WRITE_VERSION_DEFAULT; }
-    unsafe { (*ext_data).metadataUseVersion = crate::config::METADATA_USE_VERSION_DEFAULT; }
-    unsafe { (*ext_data).syncLogVersion = crate::config::SYNC_LOG_VERSION_DEFAULT; }
+    // crsql_newExtData (C) already loads config values from crsql_master.
+    // No need to set defaults here — they're loaded correctly by the C init.
 
     let rc = db
         .create_function_v2(
