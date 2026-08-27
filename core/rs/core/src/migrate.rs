@@ -123,24 +123,32 @@ unsafe fn incremental_maintenance(
     let mut budget: i64 = chunk_size as i64;
     for tbl_info in table_infos.iter() {
         if budget <= 0 {
-            // Still need to count remaining for the return value
+            // Still need to count remaining for the return value.
+            // Use cached total key (set by get_or_count in the main path) to avoid
+            // full COUNT(*) scans on every maintenance call.
             if tbl_info.schema_version != SchemaVersion::V2 {
                 let has_v2 = crate::bootstrap_v2::has_v2_tables(db, &tbl_info.tbl_name)?;
                 if has_v2 {
                     let progress_key = format!("migration_v1_to_v2_migration_{}", tbl_info.tbl_name);
                     let progress = crate::util::get_master_value(db, &progress_key)?;
                     if progress.is_some() {
-                        // Table is being migrated — count remaining
-                        let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
-                        let start_key = progress.unwrap_or(0);
-                        let count_sql = format!(
-                            "SELECT count(*) FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key}\0",
-                            escaped = escaped,
-                            start_key = start_key,
-                        );
-                        let stmt = db.prepare_v2(&count_sql)?;
-                        stmt.step()?;
-                        total_remaining += stmt.column_int64(0) as c_int;
+                        let total_key = format!("migration_v1_to_v2_total_{}", tbl_info.tbl_name);
+                        let cached = crate::util::get_master_value(db, &total_key)?;
+                        if let Some(v) = cached {
+                            total_remaining += v as c_int;
+                        } else {
+                            // No cached value — fall back to COUNT(*)
+                            let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
+                            let start_key = progress.unwrap_or(0);
+                            let count_sql = format!(
+                                "SELECT count(*) FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key}\0",
+                                escaped = escaped,
+                                start_key = start_key,
+                            );
+                            let stmt = db.prepare_v2(&count_sql)?;
+                            stmt.step()?;
+                            total_remaining += stmt.column_int64(0) as c_int;
+                        }
                     }
                 }
             }
