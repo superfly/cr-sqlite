@@ -1088,17 +1088,23 @@ pub fn pull_table_info(
     // 1. INTEGER PRIMARY KEY exists (pk > 0 AND type = 'INTEGER') → it IS the rowid alias.
     // 2. No INTEGER PRIMARY KEY, but none of rowid/oid/_rowid_ are shadowed → rowid accessible.
     // 3. All three aliases shadowed AND no INTEGER PRIMARY KEY → auto-increment fallback.
-    let integer_pk = pks.iter().find(|pk| {
-        let type_sql = format!(
-            "SELECT type FROM pragma_table_info('{table}') WHERE name = '{pk_name}'",
-            table = crate::util::escape_ident_as_value(table),
-            pk_name = crate::util::escape_ident_as_value(&pk.name),
-        );
-        db.prepare_v2(&type_sql).and_then(|stmt| {
-            stmt.step()?;
-            Ok(stmt.column_text(0)?.to_string() == "INTEGER")
-        }).unwrap_or(false)
-    });
+    // INTEGER PRIMARY KEY is only a rowid alias for single-column PKs.
+    // Composite PKs (even if all INTEGER) are never rowid aliases.
+    let integer_pk = if pks.len() == 1 {
+        pks.iter().find(|pk| {
+            let type_sql = format!(
+                "SELECT type FROM pragma_table_info('{table}') WHERE name = '{pk_name}'",
+                table = crate::util::escape_ident_as_value(table),
+                pk_name = crate::util::escape_ident_as_value(&pk.name),
+            );
+            db.prepare_v2(&type_sql).and_then(|stmt| {
+                stmt.step()?;
+                Ok(stmt.column_text(0)?.to_string() == "INTEGER")
+            }).unwrap_or(false)
+        })
+    } else {
+        None
+    };
 
     // Determine the rowid alias to use for ad-hoc queries
     let rowid_alias = if let Some(pk) = integer_pk {
@@ -1125,7 +1131,13 @@ pub fn pull_table_info(
     // True for any rowid table (not WITHOUT ROWID) where rowid is accessible.
     // This is independent of whether the PK is INTEGER (has_integer_pk) —
     // a rowid table with a TEXT PK still has a usable rowid.
-    let mut key_is_rowid = if rowid_accessible {
+    // Note: SQLite allows SELECT "rowid" FROM <WITHOUT ROWID table> to prepare
+    // successfully, so we must check pragma_table_list(wr) to detect WITHOUT ROWID.
+    let is_without_rowid = db.count(&format!(
+        "SELECT wr FROM pragma_table_list('{name}')",
+        name = crate::util::escape_ident_as_value(table),
+    )).map(|v| v == 1).unwrap_or(false);
+    let mut key_is_rowid = if rowid_accessible && !is_without_rowid {
         // Verify rowid is actually accessible (table is not WITHOUT ROWID)
         db.prepare_v2(&format!(
             "SELECT \"{alias}\" FROM \"{escaped}\" LIMIT 0",
@@ -1211,16 +1223,25 @@ pub fn pull_table_info(
         String::new()
     };
 
-    // Check crsql_master for explicit without_rowid flag first (persisted by create_crr).
-    // This overrides schema inference — a rowid table can be explicitly set to without_rowid mode.
-    let explicit_without_rowid = unsafe {
-        crate::util::get_master_value(db, &format!("without_rowid_{}", table))
+    // Check crsql_master for persisted use_rowid flag (set by create_crr).
+    // Value: 1 = force rowid-key, 0 = force non-rowid-key, absent = auto-detect.
+    let persisted_use_rowid: Option<bool> = unsafe {
+        crate::util::get_master_value(db, &format!("use_rowid_{}", table))
     }
     .ok()
     .flatten()
-    .is_some();
+    .map(|v| v == 1);
 
-    if explicit_without_rowid {
+    if let Some(force_rowid) = persisted_use_rowid {
+        key_is_rowid = force_rowid;
+    } else if has_integer_pk {
+        // INTEGER PRIMARY KEY: default to non-rowid.
+        // INTEGER PK IS the rowid alias, so __crsql_key = rowid = PK value.
+        // The PK value can be any 64-bit integer (e.g. random IDs), which may exceed
+        // MAX_ROWID_KEY (2^51). Using rowid as __crsql_key would overflow cell_key.
+        // Instead, store the PK directly in v2_pks with an auto-assigned __crsql_key.
+        // This applies regardless of skip_hash — the two are orthogonal.
+        // Override via `use_rowid` arg/directive if small sequential IDs are guaranteed.
         key_is_rowid = false;
     } else if has_v2 {
         // v2_pks exists and no explicit flag — infer from base table schema.

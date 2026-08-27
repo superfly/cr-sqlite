@@ -897,7 +897,7 @@ unsafe extern "C" fn x_crsql_as_crr(
     }
 
     let args = sqlite::args!(argc, argv);
-    let known_flags = ["without_rowid", "skip_hash"];
+    let known_flags = ["use_rowid", "without_rowid", "skip_hash"];
 
     // Parse args: (table) | (schema, table) | (table, flags...) | (schema, table, flags...)
     let (schema_name, table_name, flags) = if argc >= 2 && known_flags.contains(&args[1].text()) {
@@ -914,7 +914,19 @@ unsafe extern "C" fn x_crsql_as_crr(
         ("main\0", args[0].text(), &[][..])
     };
 
-    let without_rowid = flags.iter().any(|f| f.text() == "without_rowid");
+    // use_rowid tri-state from args:
+    //   'use_rowid'      → Some(true)  = force rowid-key
+    //   'without_rowid'  → Some(false) = force non-rowid-key
+    //   absent           → None        = auto-detect
+    let use_rowid: Option<bool> = {
+        if flags.iter().any(|f| f.text() == "use_rowid") {
+            Some(true)
+        } else if flags.iter().any(|f| f.text() == "without_rowid") {
+            Some(false)
+        } else {
+            None
+        }
+    };
     let skip_hash = flags.iter().any(|f| f.text() == "skip_hash");
 
     let db = ctx.db_handle();
@@ -938,7 +950,7 @@ unsafe extern "C" fn x_crsql_as_crr(
         table_name.as_ptr() as *const c_char,
         0,
         0,
-        if without_rowid { 1 } else { 0 },
+        match use_rowid { Some(true) => 1, Some(false) => -1, None => 0 },
         if skip_hash { 1 } else { 0 },
         &mut err_msg as *mut _,
     );
@@ -1533,16 +1545,22 @@ pub extern "C" fn crsql_create_crr(
     table: *const c_char,
     is_commit_alter: c_int,
     no_tx: c_int,
-    without_rowid: c_int,
+    use_rowid: c_int,
     skip_hash: c_int,
     err: *mut *mut c_char,
 ) -> c_int {
     let schema = unsafe { CStr::from_ptr(schema).to_str() };
     let table = unsafe { CStr::from_ptr(table).to_str() };
+    // use_rowid: 1 = force rowid, -1 = force non-rowid, 0 = auto
+    let use_rowid_opt = match use_rowid {
+        1 => Some(true),
+        -1 => Some(false),
+        _ => None,
+    };
 
     match (table, schema) {
         (Ok(table), Ok(schema)) => {
-            create_crr(db, schema, table, is_commit_alter != 0, no_tx != 0, without_rowid != 0, skip_hash != 0, err)
+            create_crr(db, schema, table, is_commit_alter != 0, no_tx != 0, use_rowid_opt, skip_hash != 0, err)
                 .unwrap_or_else(|err| err) as c_int
         }
         _ => ResultCode::NOMEM as c_int,

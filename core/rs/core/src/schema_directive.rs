@@ -21,6 +21,19 @@ pub fn read_skip_hash_directive_opt(
     Ok(directives.get("skip_hash").map(|v| is_truthy(v)))
 }
 
+/// Read the `use_rowid` directive from the table's CREATE TABLE SQL.
+/// Tri-state:
+///   `use_rowid=1` → Some(true)  = force rowid-key mode
+///   `use_rowid=0` → Some(false) = force non-rowid-key mode
+///   absent        → None        = auto-detect
+pub fn read_use_rowid_directive_opt(
+    db: *mut sqlite::sqlite3,
+    table: &str,
+) -> Result<Option<bool>, ResultCode> {
+    let directives = read_directives(db, table)?;
+    Ok(directives.get("use_rowid").map(|v| is_truthy(v)))
+}
+
 /// Read all crsql directives from the table's CREATE TABLE SQL.
 /// Parses `/* crsql: key1=value1, key2=value2, ... */` comments.
 fn read_directives(
