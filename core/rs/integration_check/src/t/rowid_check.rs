@@ -36,9 +36,9 @@ fn v2_pks_col_count(db: &ManagedConnection, table: &str) -> i32 {
 }
 
 /// Test that as_crr on a rowid table with safe rowids succeeds.
-/// After V2 migration, v2_pks should have rowid-key schema.
-/// Single integer PK auto-qualifies for skip_hash → 2 columns (__crsql_key, cl).
-/// Non-skip_hash rowid-key → 3 columns (__crsql_key, hashed_pk, cl).
+/// After V2 migration, v2_pks should have skip_hash non-rowid schema.
+/// Single integer PK → skip_hash + !key_is_rowid → 3 columns (__crsql_key, "id", cl).
+/// (INTEGER PK values can exceed MAX_ROWID_KEY, so key_is_rowid is forced false.)
 fn test_safe_rowids_get_triggers() -> Result<(), ResultCode> {
     let db = crate::opendb()?;
     db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, data TEXT)")?;
@@ -46,11 +46,11 @@ fn test_safe_rowids_get_triggers() -> Result<(), ResultCode> {
     db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
 
-    // Migrate to V2 and verify v2_pks has rowid-key schema.
-    // Single integer PK → skip_hash → 2 columns (__crsql_key, cl).
+    // Migrate to V2 and verify v2_pks has skip_hash non-rowid schema.
+    // Single integer PK → skip_hash + !key_is_rowid → 3 columns (__crsql_key, "id", cl).
     migrate_to_v2(&db.db)?;
     let col_count = v2_pks_col_count(&db.db, "foo");
-    assert!(col_count == 2, "expected 2 columns in v2_pks (skip_hash rowid-key schema), got {}", col_count);
+    assert!(col_count == 3, "expected 3 columns in v2_pks (skip_hash non-rowid schema), got {}", col_count);
     Ok(())
 }
 
@@ -65,7 +65,8 @@ fn test_empty_rowid_table_gets_triggers() -> Result<(), ResultCode> {
     Ok(())
 }
 
-/// Test that as_crr rejects a table with rowids exceeding MAX_ROWID_KEY.
+/// Test that as_crr succeeds for INTEGER PK tables with rowids exceeding MAX_ROWID_KEY.
+/// INTEGER PK tables use skip_hash + !key_is_rowid, so rowid range is not a constraint.
 fn test_rowid_too_large_rejected() -> Result<(), ResultCode> {
     let db = crate::opendb()?;
     db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, data TEXT)")?;
@@ -76,26 +77,21 @@ fn test_rowid_too_large_rejected() -> Result<(), ResultCode> {
     ))?;
 
     db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
-    let rc = db.db.exec_safe("SELECT crsql_as_crr('foo')");
-    assert!(
-        rc.is_err(),
-        "expected as_crr to fail for table with oversized rowid"
-    );
+    // Should succeed — INTEGER PK tables don't use rowid as __crsql_key
+    db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
     Ok(())
 }
 
-/// Test that as_crr rejects a table with negative rowids.
+/// Test that as_crr succeeds for INTEGER PK tables with negative rowids.
+/// INTEGER PK tables use skip_hash + !key_is_rowid, so rowid range is not a constraint.
 fn test_negative_rowid_rejected() -> Result<(), ResultCode> {
     let db = crate::opendb()?;
     db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, data TEXT)")?;
     db.db.exec_safe("INSERT INTO foo VALUES (-1, 'negative')")?;
 
     db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
-    let rc = db.db.exec_safe("SELECT crsql_as_crr('foo')");
-    assert!(
-        rc.is_err(),
-        "expected as_crr to fail for table with negative rowid"
-    );
+    // Should succeed — INTEGER PK tables don't use rowid as __crsql_key
+    db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
     Ok(())
 }
 
@@ -125,7 +121,8 @@ fn test_without_rowid_allows_oversized() -> Result<(), ResultCode> {
     Ok(())
 }
 
-/// Test that the rowid range check blocks inserts of oversized rowids.
+/// Test that INTEGER PK tables allow oversized rowids (no rowid range enforcement).
+/// INTEGER PK tables use skip_hash + !key_is_rowid, so rowid is not used as __crsql_key.
 fn test_trigger_blocks_oversized_insert() -> Result<(), ResultCode> {
     let db = crate::opendb()?;
     db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, data TEXT)")?;
@@ -135,19 +132,15 @@ fn test_trigger_blocks_oversized_insert() -> Result<(), ResultCode> {
     // Insert within range should work
     db.db.exec_safe("INSERT INTO foo VALUES (1, 'ok')")?;
 
-    // Insert above MAX_ROWID_KEY should fail
-    let rc = db.db.exec_safe(&format!(
+    // Insert above MAX_ROWID_KEY should also work (no rowid range check for INTEGER PK)
+    db.db.exec_safe(&format!(
         "INSERT INTO foo VALUES ({}, 'too_big')",
         crsql_bundle::test_exports::consts::MAX_ROWID_KEY as i64
-    ));
-    assert!(
-        rc.is_err(),
-        "expected insert with oversized rowid to be blocked by trigger"
-    );
+    ))?;
     Ok(())
 }
 
-/// Test that the rowid range check blocks updates to oversized rowids.
+/// Test that INTEGER PK tables allow oversized rowid updates (no rowid range enforcement).
 fn test_trigger_blocks_oversized_update() -> Result<(), ResultCode> {
     let db = crate::opendb()?;
     db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, data TEXT)")?;
@@ -155,30 +148,23 @@ fn test_trigger_blocks_oversized_update() -> Result<(), ResultCode> {
     db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
 
-    // Update to oversized rowid should fail
-    let rc = db.db.exec_safe(&format!(
+    // Update to oversized rowid should work (no rowid range check for INTEGER PK)
+    db.db.exec_safe(&format!(
         "UPDATE foo SET id = {} WHERE id = 1",
         crsql_bundle::test_exports::consts::MAX_ROWID_KEY as i64
-    ));
-    assert!(
-        rc.is_err(),
-        "expected update with oversized rowid to be blocked by trigger"
-    );
+    ))?;
     Ok(())
 }
 
-/// Test that the rowid range check blocks negative rowid inserts.
+/// Test that INTEGER PK tables allow negative rowids (no rowid range enforcement).
 fn test_trigger_blocks_negative_insert() -> Result<(), ResultCode> {
     let db = crate::opendb()?;
     db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, data TEXT)")?;
     db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
 
-    let rc = db.db.exec_safe("INSERT INTO foo VALUES (-1, 'negative')");
-    assert!(
-        rc.is_err(),
-        "expected insert with negative rowid to be blocked by trigger"
-    );
+    // Negative rowid should work (no rowid range check for INTEGER PK)
+    db.db.exec_safe("INSERT INTO foo VALUES (-1, 'negative')")?;
     Ok(())
 }
 
@@ -195,19 +181,19 @@ fn test_non_rowid_table_no_check_triggers() -> Result<(), ResultCode> {
     Ok(())
 }
 
-/// Test that downgrade (crsql_as_table) removes rowid range enforcement.
+/// Test that downgrade (crsql_as_table) removes triggers.
+/// INTEGER PK tables don't enforce rowid range, so oversized inserts work before and after downgrade.
 fn test_downgrade_drops_check_triggers() -> Result<(), ResultCode> {
     let db = crate::opendb()?;
     db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, data TEXT)")?;
     db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
 
-    // While CRR, oversized insert should fail
-    let rc = db.db.exec_safe(&format!(
+    // While CRR, oversized insert should work (INTEGER PK doesn't enforce rowid range)
+    db.db.exec_safe(&format!(
         "INSERT INTO foo VALUES ({}, 'too_big')",
         crsql_bundle::test_exports::consts::MAX_ROWID_KEY as i64
-    ));
-    assert!(rc.is_err(), "expected oversized insert to be blocked while CRR");
+    ))?;
 
     // Downgrade
     let rc = db.db.exec_safe("SELECT crsql_as_table('foo')");
@@ -216,16 +202,17 @@ fn test_downgrade_drops_check_triggers() -> Result<(), ResultCode> {
         return Err(ResultCode::ERROR);
     }
 
-    // After downgrade, oversized insert should succeed (no rowid check)
+    // After downgrade, oversized insert should still succeed
     let rc = db.db.exec_safe(&format!(
-        "INSERT INTO foo VALUES ({}, 'too_big')",
-        crsql_bundle::test_exports::consts::MAX_ROWID_KEY as i64
+        "INSERT INTO foo VALUES ({}, 'too_big2')",
+        crsql_bundle::test_exports::consts::MAX_ROWID_KEY as i64 + 1
     ));
     assert!(rc.is_ok(), "expected oversized insert to succeed after downgrade");
     Ok(())
 }
 
-/// Test that ALTER preserves rowid range enforcement (it's in the Rust trigger code, not separate triggers).
+/// Test that ALTER preserves trigger functionality.
+/// INTEGER PK tables don't enforce rowid range, so oversized inserts work before and after ALTER.
 fn test_alter_preserves_check_triggers() -> Result<(), ResultCode> {
     let db = crate::opendb()?;
     db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, data TEXT)")?;
@@ -251,12 +238,11 @@ fn test_alter_preserves_check_triggers() -> Result<(), ResultCode> {
         return Err(ResultCode::ERROR);
     }
 
-    // After alter, rowid range check should still be enforced
-    let rc = db.db.exec_safe(&format!(
+    // After alter, oversized insert should still work (INTEGER PK doesn't enforce rowid range)
+    db.db.exec_safe(&format!(
         "INSERT INTO foo VALUES ({}, 'too_big', 'extra')",
         crsql_bundle::test_exports::consts::MAX_ROWID_KEY as i64
-    ));
-    assert!(rc.is_err(), "expected oversized insert to be blocked after ALTER");
+    ))?;
     Ok(())
 }
 
@@ -343,11 +329,11 @@ fn test_direct_v2_mode_creates_v2_only() -> Result<(), ResultCode> {
         }
     }
 
-    // v2_pks should have rowid-key schema.
-    // Single integer PK → skip_hash → 2 columns (__crsql_key, cl).
+    // v2_pks should have skip_hash non-rowid schema.
+    // Single integer PK → skip_hash + !key_is_rowid → 3 columns (__crsql_key, "id", cl).
     let col_count = v2_pks_col_count(&db.db, "foo");
-    if col_count != 2 {
-        println!("test_direct_v2: v2_pks col_count={}, expected 2", col_count);
+    if col_count != 3 {
+        println!("test_direct_v2: v2_pks col_count={}, expected 3", col_count);
         return Err(ResultCode::CONSTRAINT);
     }
 

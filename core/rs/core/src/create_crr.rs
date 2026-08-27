@@ -21,7 +21,7 @@ pub fn create_crr(
     table: &str,
     is_commit_alter: bool,
     no_tx: bool,
-    without_rowid: bool,
+    use_rowid: Option<bool>,
     skip_hash_flag: bool,
     err: *mut *mut c_char,
 ) -> Result<ResultCode, ResultCode> {
@@ -38,14 +38,30 @@ pub fn create_crr(
     // when upgrading stuff to CRRs
     let mut table_info = pull_table_info(db, table, err)?;
 
-    // Override key_is_rowid if without_rowid was requested.
+    // Resolve use_rowid: as_crr arg takes precedence, then schema directive, then auto.
+    // Some(true)  = force rowid-key mode (caller guarantees rowids < MAX_ROWID_KEY)
+    // Some(false) = force non-rowid-key mode
+    // None        = auto-detect (default for INTEGER PK is non-rowid)
+    let use_rowid_resolved = use_rowid.or_else(|| {
+        crate::schema_directive::read_use_rowid_directive_opt(db, table).unwrap_or(None)
+    });
+
+    // Override key_is_rowid based on the resolved use_rowid preference.
     // This only matters on first registration — subsequent pull_table_info calls
-    // will infer from v2_pks schema.
-    if without_rowid && table_info.key_is_rowid {
-        table_info.key_is_rowid = false;
-        // Persist the without_rowid preference so migration path can read it
-        // when creating v2_tables before v2_pks exists.
-        unsafe { crate::util::set_master_value(db, &format!("without_rowid_{}", table), 1) }?;
+    // will infer from the persisted flag.
+    match use_rowid_resolved {
+        Some(true) => {
+            // Force rowid-key mode even for INTEGER PK tables (which default to
+            // non-rowid for overflow safety). Only valid for rowid tables.
+            table_info.key_is_rowid = true;
+            unsafe { crate::util::set_master_value(db, &format!("use_rowid_{}", table), 1) }?;
+        }
+        Some(false) => {
+            // Force non-rowid-key mode.
+            table_info.key_is_rowid = false;
+            unsafe { crate::util::set_master_value(db, &format!("use_rowid_{}", table), 0) }?;
+        }
+        None => {} // auto-detect — table_info already has the right value
     }
 
     // Override skip_hash if explicitly requested via flag.
@@ -148,7 +164,7 @@ fn validate_rowid_range(
             "Table {table} has rowids outside the safe range [0, {max_key}). \
             Found range [{min_rowid}, {max_rowid}]. \
             cell_key = (rowid << {bits}) | col_id must fit in a signed INT64. \
-            Pass 'without_rowid' to crsql_as_crr to use the table PK columns instead of rowid as the internal key.",
+            Pass 'use_rowid=0' via schema directive or use a non-rowid key strategy.",
             table = table,
             max_key = consts::MAX_ROWID_KEY,
             min_rowid = min_rowid,

@@ -304,6 +304,60 @@ ALTER TABLE table_name ...;
 SELECT crsql_commit_alter('table_name');
 ```
 
+### Schema Directives
+
+cr-sqlite auto-detects the optimal key strategy for each table based on its primary key schema. You can override the auto-detection using **schema directives** — special comments in the `CREATE TABLE` SQL:
+
+```sql
+CREATE TABLE my_table /* crsql: skip_hash=0, use_rowid=1 */ (
+  id INTEGER PRIMARY KEY NOT NULL,
+  data TEXT
+);
+```
+
+Directives are parsed from `/* crsql: key=value, ... */` comments. The comment must appear **after the table name** (SQLite strips comments that appear before it in `sqlite_master`).
+
+#### `skip_hash`
+
+Controls whether the primary key is hashed before storage in the internal `v2_pks` and `v2_tombstones` tables. It is highly recommended to keep keys hashed for large PKs (e.g. UUIDs, long strings) as it limits tombstone growth — unhashed tombstones store the full PK value, which can bloat storage significantly.
+
+| Value | Behavior |
+|---|---|
+| `skip_hash=1` | Store the PK value directly (no hash). Faster lookups, but requires a single-column PK (any type). |
+| `skip_hash=0` | Hash the PK before storage. Works with any PK type. |
+| *(absent)* | **Auto-detect**: `skip_hash=1` if the table has a single-column PK with `INT` affinity, otherwise `skip_hash=0`. Manual `skip_hash=1` works with any single-column PK. |
+
+`skip_hash=1` on a composite PK table is rejected (falls back to hash mode) — skip_hash requires a single-column PK.
+
+#### `use_rowid`
+
+Controls whether the SQLite `rowid` is used as the internal `__crsql_key` (the primary key for clock entries).
+
+| Value | Behavior |
+|---|---|
+| `use_rowid=1` | Use `rowid` as `__crsql_key`. Most efficient, but requires rowids to stay within `[0, 2^51)`. |
+| `use_rowid=0` | Use an auto-assigned `__crsql_key`; store the PK value(s) in `v2_pks` directly. |
+| *(absent)* | **Auto-detect**: `use_rowid=0` for `INTEGER PRIMARY KEY` tables, `use_rowid=1` for other rowid tables, `use_rowid=0` for `WITHOUT ROWID` tables. |
+
+The auto-detect default for `INTEGER PRIMARY KEY` is non-rowid because `INTEGER PRIMARY KEY` is a rowid alias — the PK value IS the rowid. In distributed systems, the common pattern is random 64-bit integer PKs (e.g. snowflake IDs, random IDs), which routinely exceed `2^51` and would overflow the `cell_key = (rowid << 12) | col_id` computation. This only applies to `INTEGER PRIMARY KEY` (the rowid alias) — other integer PK types like `INT` or `BIGINT` are not rowid aliases, so their rowid is a separate hidden value and `use_rowid=1` is safe by default. If you know your `INTEGER PRIMARY KEY` rowids are small (e.g. explicit 50-bit IDs), use `use_rowid=1` for better performance. `use_rowid=1` can only be set on rowid tables (not `WITHOUT ROWID`).
+
+#### `crsql_as_crr` Arguments
+
+The same overrides can be passed as positional arguments to `crsql_as_crr`:
+
+```sql
+-- force rowid-key mode
+SELECT crsql_as_crr('my_table', 'use_rowid');
+
+-- force non-rowid-key mode
+SELECT crsql_as_crr('my_table', 'without_rowid');
+
+-- force skip_hash on
+SELECT crsql_as_crr('my_table', 'skip_hash');
+```
+
+The `without_rowid` argument is equivalent to `use_rowid=0`.
+
 ## How It Is Used in Corrosion
 
 [Corrosion](https://github.com/superfly/corrosion) is a distributed, eventually-consistent SQLite database. It embeds cr-sqlite as a loadable extension (with pre-built binaries bundled for darwin-aarch64, linux-x86_64, and linux-aarch64) and builds a full clustering layer on top:
@@ -378,7 +432,7 @@ cargo run -- ../core/dist/crsqlite
 
 | Function | Description |
 |---|---|
-| `crsql_as_crr('table')` | Upgrade a table to a conflict-free replicated relation |
+| `crsql_as_crr('table')` | Upgrade a table to a conflict-free replicated relation. Optional flags: `'use_rowid'`, `'without_rowid'`, `'skip_hash'`. See [Schema Directives](#schema-directives). |
 | `crsql_as_table('table')` | Alias for `crsql_as_crr` |
 | `crsql_site_id()` | Return this database's 16-byte site ID |
 | `crsql_db_version()` | Return the current db_version |
