@@ -540,37 +540,35 @@ unsafe fn migrate_v1_to_v2_chunk(
         let v2_pks_join = v2_pks_join_clause(tbl_info, &escaped, &pk_cols_chunk_list);
         let cell_key_base = format!("(vp.__crsql_key << {col_id_bits})", col_id_bits = col_id_bits);
         let base_join = v2_pks_join;
-        // Step 4: non-sentinel clock entries (join v2_col_map for col_id)
-        db.exec_safe(&format!(
-            "INSERT OR IGNORE INTO \"{escaped}{v2_clock}\"
-             (cell_key, col_version, site_id, db_version, seq, ts)
-             SELECT {cell_key_base} | m.col_id,
-               c.col_version, c.site_id, c.db_version, c.seq,
-               CASE WHEN CAST(c.ts AS INTEGER) > 0 THEN CAST(c.ts AS INTEGER) ELSE {ts_fallback} END
-             FROM \"{escaped}__crsql_clock\" c
-             JOIN temp.migration_chunk chunk
-               ON c.key = chunk.__crsql_key
-             {base_join}
-             JOIN \"{escaped}{v2_col_map}\" m ON c.col_name = m.col_name
-             WHERE c.col_name != '{sentinel}'",
-            escaped = escaped,
-            v2_clock = consts::V2_CLOCK_SUFFIX,
-            v2_col_map = consts::V2_COL_MAP_SUFFIX,
-            cell_key_base = cell_key_base,
-            base_join = base_join,
-            sentinel = sentinel,
-            ts_fallback = ts_fallback,
-        ))?;
+        // Step 4a: non-sentinel clock entries (only for tables with non-PK columns).
+        // PK-only tables have no non-sentinel clock entries — skip this entirely.
+        if !tbl_info.non_pks.is_empty() {
+            db.exec_safe(&format!(
+                "INSERT OR IGNORE INTO \"{escaped}{v2_clock}\"
+                 (cell_key, col_version, site_id, db_version, seq, ts)
+                 SELECT {cell_key_base} | m.col_id,
+                   c.col_version, c.site_id, c.db_version, c.seq,
+                   CASE WHEN CAST(c.ts AS INTEGER) > 0 THEN CAST(c.ts AS INTEGER) ELSE {ts_fallback} END
+                 FROM \"{escaped}__crsql_clock\" c
+                 JOIN temp.migration_chunk chunk
+                   ON c.key = chunk.__crsql_key
+                 {base_join}
+                 JOIN \"{escaped}{v2_col_map}\" m ON c.col_name = m.col_name
+                 WHERE c.col_name != '{sentinel}' AND chunk.is_alive = 1",
+                escaped = escaped,
+                v2_clock = consts::V2_CLOCK_SUFFIX,
+                v2_col_map = consts::V2_COL_MAP_SUFFIX,
+                cell_key_base = cell_key_base,
+                base_join = base_join,
+                sentinel = sentinel,
+                ts_fallback = ts_fallback,
+            ))?;
+        }
 
         // Step 4b: For PK-only tables, migrate/create sentinel clock entries at col_id=0.
-        // The normal clock migration (step 4) skips sentinels. For PK-only tables, the sentinel
-        // is the only clock entry, so we need to migrate it separately.
-        //
-        // Mirrors Step 1's alive detection: LEFT JOIN on sentinel, filter alive
-        // (col_version IS NULL OR col_version % 2 != 0). For rows with no V1 sentinel
-        // but alive in the base table, create a new sentinel with col_version=1.
+        // The sentinel is the only clock entry for PK-only tables.
+        // v2_pks JOIN (base_join) filters orphans — only alive rows were inserted in Step 1.
         if tbl_info.non_pks.is_empty() {
-            // v2_pks JOIN (base_join) filters orphans — only alive rows were inserted in Step 1.
             db.exec_safe(&format!(
                 "INSERT OR IGNORE INTO \"{escaped}{v2_clock}\"
                  (cell_key, col_version, site_id, db_version, seq, ts)
