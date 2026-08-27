@@ -941,6 +941,7 @@ unsafe extern "C" fn x_crsql_as_crr(
     // V2 clock tables require a non-zero ts. Error early if not set.
     if unsafe { (*ext_data).timestamp } == 0 {
         ctx.result_error("crsql_as_crr: timestamp not set — call crsql_set_ts() first");
+        let _ = db.exec_safe("ROLLBACK");
         return;
     }
 
