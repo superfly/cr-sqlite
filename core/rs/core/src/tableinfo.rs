@@ -1128,25 +1128,22 @@ pub fn pull_table_info(
     let has_integer_pk = integer_pk.is_some();
 
     // key_is_rowid: use the table's rowid as __crsql_key.
-    // True for any rowid table (not WITHOUT ROWID) where rowid is accessible.
-    // This is independent of whether the PK is INTEGER (has_integer_pk) —
-    // a rowid table with a TEXT PK still has a usable rowid.
+    // Only safe for INTEGER PRIMARY KEY tables (rowid alias = PK value, stable).
+    // Implicit rowids on other tables can be renumbered by VACUUM — never use them.
+    // The default is always non-rowid; use_rowid=1 can override for INTEGER PK tables.
     // Note: SQLite allows SELECT "rowid" FROM <WITHOUT ROWID table> to prepare
     // successfully, so we must check pragma_table_list(wr) to detect WITHOUT ROWID.
     let is_without_rowid = db.count(&format!(
         "SELECT wr FROM pragma_table_list('{name}')",
         name = crate::util::escape_ident_as_value(table),
     )).map(|v| v == 1).unwrap_or(false);
-    let mut key_is_rowid = if rowid_accessible && !is_without_rowid {
-        // Verify rowid is actually accessible (table is not WITHOUT ROWID)
-        db.prepare_v2(&format!(
-            "SELECT \"{alias}\" FROM \"{escaped}\" LIMIT 0",
-            alias = crate::util::escape_ident(&rowid_alias),
-            escaped = crate::util::escape_ident(table),
-        )).is_ok()
-    } else {
-        false
-    };
+    // Initial value: false for all tables. Only set to true if:
+    // 1. The table has INTEGER PRIMARY KEY (rowid alias, stable), AND
+    // 2. The table is not WITHOUT ROWID, AND
+    // 3. The caller explicitly requests use_rowid=1 (handled in create_crr).
+    // On first registration (no persisted flag), always defaults to false.
+    // On subsequent calls, the persisted use_rowid flag overrides.
+    let mut key_is_rowid = false;
 
     // Detect V2 metadata tables
     let has_v2 = crate::bootstrap_v2::has_v2_tables(db, table).unwrap_or(false);
@@ -1234,25 +1231,15 @@ pub fn pull_table_info(
 
     if let Some(force_rowid) = persisted_use_rowid {
         key_is_rowid = force_rowid;
-    } else if has_integer_pk {
-        // INTEGER PRIMARY KEY: default to non-rowid.
-        // INTEGER PK IS the rowid alias, so __crsql_key = rowid = PK value.
-        // The PK value can be any 64-bit integer (e.g. random IDs), which may exceed
-        // MAX_ROWID_KEY (2^51). Using rowid as __crsql_key would overflow cell_key.
-        // Instead, store the PK directly in v2_pks with an auto-assigned __crsql_key.
-        // This applies regardless of skip_hash — the two are orthogonal.
-        // Override via `use_rowid` arg/directive if small sequential IDs are guaranteed.
+    } else {
+        // Auto-detect: only use rowid-key mode for INTEGER PRIMARY KEY tables.
+        // INTEGER PK is a rowid alias — the rowid IS the PK value, so it's stable.
+        // Other rowid tables (INT PK, TEXT PK, etc.) have implicit rowids that can
+        // be renumbered by VACUUM, making them unsafe as persistent keys.
+        // INTEGER PK defaults to non-rowid anyway (overflow safety), so auto-detect
+        // always results in non-rowid unless explicitly overridden via use_rowid=1.
         key_is_rowid = false;
-    } else if has_v2 {
-        // v2_pks exists and no explicit flag — infer from base table schema.
-        // Use pragma_table_list which has a `wr` column (1 = WITHOUT ROWID, 0 = rowid table).
-        let without_rowid = db.count(&format!(
-            "SELECT wr FROM pragma_table_list('{name}')",
-            name = crate::util::escape_ident_as_value(table),
-        ));
-        key_is_rowid = without_rowid.map(|v| v == 0).unwrap_or(false);
     }
-    // else: no v2_pks yet and no explicit flag — use key_is_rowid as computed above
     // from rowid_accessible (INTEGER PK or unshadowed rowid aliases).
     let has_v1 = {
         let stmt = db.prepare_v2(&format!(
