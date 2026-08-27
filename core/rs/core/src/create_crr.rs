@@ -98,7 +98,13 @@ pub fn create_crr(
 
     // Create V2 tables if metadata write mode is dual-write (2) or V2-only (3)
     if metadata_write_version >= config::METADATA_VERSION_V2_AND_V1 {
-        crate::bootstrap_v2::create_v2_tables(db, &table_info)?;
+        if let Err(rc) = crate::bootstrap_v2::create_v2_tables(db, &table_info) {
+            err.set(&format!(
+                "create_v2_tables failed for {table} (key_is_rowid={}, skip_hash={}): {:?}",
+                table_info.key_is_rowid, table_info.skip_hash, rc
+            ));
+            return Err(rc);
+        }
     }
 
     // Create V1 clock tables unless mode is V2-only (3)
@@ -107,7 +113,10 @@ pub fn create_crr(
     }
 
     remove_crr_triggers_if_exist(db, table)?;
-    create_triggers(db, &table_info, err)?;
+    if let Err(rc) = create_triggers(db, &table_info, err) {
+        err.set(&format!("create_triggers failed for {table}: {:?}", rc));
+        return Err(rc);
+    }
 
     // For rowid tables (not converted to without_rowid), validate rowid range.
     // Enforcement is done within the existing triggers, not separate ones.
@@ -128,7 +137,7 @@ pub fn create_crr(
         )?;
     }
     if metadata_write_version >= config::METADATA_VERSION_V2_AND_V1 {
-        crate::backfill_v2::backfill_table_v2(
+        if let Err(rc) = crate::backfill_v2::backfill_table_v2(
             db,
             table,
             &table_info.pks,
@@ -137,7 +146,13 @@ pub fn create_crr(
             &table_info.rowid_alias,
             table_info.skip_hash,
             no_tx,
-        )?;
+        ) {
+            err.set(&format!(
+                "backfill_table_v2 failed for {table} (key_is_rowid={}, skip_hash={}): {:?}",
+                table_info.key_is_rowid, table_info.skip_hash, rc
+            ));
+            return Err(rc);
+        }
     }
 
     Ok(ResultCode::OK)
