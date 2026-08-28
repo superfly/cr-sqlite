@@ -2,6 +2,7 @@ use alloc::format;
 use alloc::vec::Vec;
 
 use core::ffi::c_int;
+use num_traits::FromPrimitive;
 use sqlite::{Connection, Context};
 use sqlite_nostd as sqlite;
 use sqlite_nostd::{ManagedStmt, ResultCode, Value};
@@ -87,7 +88,7 @@ pub extern "C" fn crsql_config_set(
                 if new_val == METADATA_VERSION_V2_AND_V1 && old_val == METADATA_VERSION_V1 {
                     // Create V2 tables for all existing CRR tables so dual-write
                     // triggers have somewhere to write immediately.
-                    if let Err(rc) = create_v2_tables_for_existing_crrs(db) {
+                    if let Err(rc) = create_v2_tables_for_existing_crrs(db, ext_data) {
                         ctx.result_error("Failed to create V2 tables during transition");
                         ctx.result_error_code(rc);
                         return;
@@ -391,7 +392,10 @@ fn check_migration_complete_or_error(
 
 /// Create V2 metadata tables for all existing CRR tables that don't have them yet.
 /// Called during the V1→V2AndV1 transition so dual-write triggers have V2 tables ready.
-fn create_v2_tables_for_existing_crrs(db: *mut sqlite_nostd::sqlite3) -> Result<(), ResultCode> {
+fn create_v2_tables_for_existing_crrs(
+    db: *mut sqlite_nostd::sqlite3,
+    ext_data: *mut crsql_ExtData,
+) -> Result<(), ResultCode> {
     let table_names = find_tables_with_suffix(db, "__crsql_clock")?;
 
     for tbl_name in &table_names {
@@ -411,6 +415,23 @@ fn create_v2_tables_for_existing_crrs(db: *mut sqlite_nostd::sqlite3) -> Result<
         crate::bootstrap_v2::create_v2_tables(db, &tbl_info)?;
     }
 
+    // Creating V2 tables bumps PRAGMA schema_version. Clear the per-tx flag so
+    // ensure actually re-pulls instead of returning the pre-transition (V1) cache.
+    unsafe {
+        (*ext_data).updatedTableInfosThisTx = 0;
+    }
+    let mut err: *mut core::ffi::c_char = core::ptr::null_mut();
+    let rc = crate::tableinfo::crsql_ensure_table_infos_are_up_to_date(
+        db,
+        ext_data,
+        &mut err as *mut _,
+    );
+    if rc != ResultCode::OK as c_int {
+        if let Some(code) = ResultCode::from_i32(rc) {
+            return Err(code);
+        }
+        return Err(ResultCode::ERROR);
+    }
     Ok(())
 }
 
