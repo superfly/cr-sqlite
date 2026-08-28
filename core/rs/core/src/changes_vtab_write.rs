@@ -603,8 +603,8 @@ unsafe fn merge_insert(
 
     // V2 clock tables require a non-zero ts. If we get a legacy row with
     // ts=0 then we fall back to the current ts. Error early if current ts is not set.
-    if unsafe { (*(*tab).pExtData).timestamp } == 0 {
-        let err = CString::new("crsql - timestamp not set — call crsql_set_ts() before syncing changes")?;
+    if unsafe { crate::config::ensure_timestamp((*tab).pExtData).is_err() } {
+        let err = CString::new("crsql - timestamp not set — call crsql_set_ts() or set default-ts before syncing changes")?;
         unsafe { *errmsg = err.into_raw() };
         return Err(ResultCode::ERROR);
     }
@@ -1145,8 +1145,8 @@ pub unsafe fn v1_to_v2_hydrate_row(
     hashed_pk: &[u8],
 ) -> Result<(), ResultCode> {
     // V2 clock tables require a non-zero ts. Error early if not set.
-    if unsafe { (*ext_data).timestamp } == 0 {
-        crate::debug::debug_log("v1_to_v2_hydrate_row: timestamp not set — call crsql_set_ts() first");
+    if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
+        crate::debug::debug_log("v1_to_v2_hydrate_row: timestamp not set — call crsql_set_ts() first or set default-ts");
         return Err(ResultCode::ERROR);
     }
     let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
@@ -1607,7 +1607,7 @@ unsafe fn v2_nuke_local_row(
     // Delete from base table (with sync bit to prevent trigger recursion)
     with_sync_bit(ext_data, || {
         if tbl_info.key_is_rowid {
-            let mut stmt = v2.base_delete_rowid();
+            let mut stmt = v2.base_delete_rowid()?;
             stmt.bind_int64(1, key)?;
             stmt.step()?;
         } else {

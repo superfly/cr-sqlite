@@ -51,6 +51,7 @@ struct crsql_ExtData {
   int metadataUseVersion;
   int syncLogVersion;
   unsigned long long timestamp;
+  unsigned long long defaultTimestamp;
   void *ordinalMap;
 };
 

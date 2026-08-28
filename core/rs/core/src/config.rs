@@ -13,6 +13,7 @@ pub const MERGE_EQUAL_VALUES: &str = "merge-equal-values";
 pub const METADATA_WRITE_VERSION: &str = "metadata-write-version";
 pub const METADATA_USE_VERSION: &str = "metadata-use-version";
 pub const SYNC_LOG_VERSION: &str = "sync-log-version";
+pub const DEFAULT_TS: &str = "default-ts";
 
 /// Default metadata write version: 1 = V1 (legacy), 2 = V2&V1 (dual write), 3 = V2 only
 pub const METADATA_WRITE_VERSION_DEFAULT: c_int = 1;
@@ -206,8 +207,18 @@ pub extern "C" fn crsql_config_set(
             unsafe { (*ext_data).syncLogVersion = new_val };
             args[1]
         }
+        DEFAULT_TS => {
+            let v = args[1].int64();
+            if v < 0 {
+                ctx.result_error("default-ts must be >= 0 (0 disables, >0 used when crsql_set_ts was not called)");
+                ctx.result_error_code(ResultCode::ERROR);
+                return;
+            }
+            unsafe { (*ext_data).defaultTimestamp = v as u64 };
+            args[1]
+        }
         _ => {
-            ctx.result_error("Unknown setting name");
+            ctx.result_error(&format!("Unknown setting name: {name}"));
             ctx.result_error_code(ResultCode::ERROR);
             return;
         }
@@ -273,12 +284,30 @@ pub extern "C" fn crsql_config_get(
             let ext_data = ctx.user_data() as *mut crsql_ExtData;
             ctx.result_int(unsafe { (*ext_data).syncLogVersion });
         }
+        DEFAULT_TS => {
+            let ext_data = ctx.user_data() as *mut crsql_ExtData;
+            ctx.result_int64(unsafe { (*ext_data).defaultTimestamp as i64 });
+        }
         _ => {
-            ctx.result_error("Unknown setting name");
+            ctx.result_error(&format!("Unknown setting name: {name}"));
             ctx.result_error_code(ResultCode::ERROR);
             return;
         }
     }
+}
+
+/// If the transaction timestamp is unset (0) and `default-ts` is configured
+/// (>0), copy that default into the transaction timestamp.
+/// Returns the timestamp to use, or `Err(())` if still unset.
+pub unsafe fn ensure_timestamp(ext_data: *mut crsql_ExtData) -> Result<u64, ()> {
+    if (*ext_data).timestamp != 0 {
+        return Ok((*ext_data).timestamp);
+    }
+    if (*ext_data).defaultTimestamp != 0 {
+        (*ext_data).timestamp = (*ext_data).defaultTimestamp;
+        return Ok((*ext_data).timestamp);
+    }
+    Err(())
 }
 
 /// Validate metadata-write-version transitions.

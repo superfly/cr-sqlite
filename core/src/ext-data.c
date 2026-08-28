@@ -94,6 +94,7 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   pExtData->metadataWriteVersion = 1;  // V1
   pExtData->metadataUseVersion = 1;   // V1
   pExtData->syncLogVersion = 1;      // V1
+  pExtData->defaultTimestamp = 0;    // off: require crsql_set_ts()
 
   while (sqlite3_step(pStmt) == SQLITE_ROW) {
     const unsigned char *name = sqlite3_column_text(pStmt, 0);
@@ -119,6 +120,11 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
     } else if (strcmp("sync-log-version", (char *)name) == 0) {
       if (colType == SQLITE_INTEGER) {
         pExtData->syncLogVersion = sqlite3_column_int(pStmt, 1);
+      }
+    } else if (strcmp("default-ts", (char *)name) == 0) {
+      if (colType == SQLITE_INTEGER) {
+        sqlite3_int64 v = sqlite3_column_int64(pStmt, 1);
+        pExtData->defaultTimestamp = v > 0 ? (unsigned long long)v : 0;
       }
     } else {
       // unhandled config setting
