@@ -94,6 +94,7 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   pExtData->metadataWriteVersion = 1;  // V1
   pExtData->metadataUseVersion = 1;   // V1
   pExtData->syncLogVersion = 1;      // V1
+  pExtData->defaultTimestamp = 0;    // off: require crsql_set_ts()
 
   while (sqlite3_step(pStmt) == SQLITE_ROW) {
     const unsigned char *name = sqlite3_column_text(pStmt, 0);

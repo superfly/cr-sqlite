@@ -149,8 +149,8 @@ pub fn v2_after_insert(
     rowid: Option<i64>,
 ) -> Result<ResultCode, String> {
     // V2 clock tables require a non-zero ts. Error early if not set.
-    if unsafe { (*ext_data).timestamp } == 0 {
-        return Err("v2_after_insert: timestamp not set — call crsql_set_ts() first".to_string());
+    if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
+        return Err("v2_after_insert: timestamp not set — call crsql_set_ts() first or set default-ts".to_string());
     }
     let db_version = crate::db_version::next_db_version(db, ext_data)
         .map_err(|_| "failed to get next db_version".to_string())?;
@@ -288,8 +288,8 @@ pub fn v2_after_update(
     changed_col_indices: &[usize],
 ) -> Result<ResultCode, String> {
     // V2 clock tables require a non-zero ts. Error early if not set.
-    if unsafe { (*ext_data).timestamp } == 0 {
-        return Err("v2_after_update: timestamp not set — call crsql_set_ts() first".to_string());
+    if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
+        return Err("v2_after_update: timestamp not set — call crsql_set_ts() first or set default-ts".to_string());
     }
     let db_version = crate::db_version::next_db_version(db, ext_data)
         .map_err(|_| "failed to get next db_version".to_string())?;
@@ -368,8 +368,8 @@ pub fn v2_after_delete(
     pks_old: &[*mut sqlite::value],
 ) -> Result<ResultCode, String> {
     // V2 clock tables require a non-zero ts. Error early if not set.
-    if unsafe { (*ext_data).timestamp } == 0 {
-        return Err("v2_after_delete: timestamp not set — call crsql_set_ts() first".to_string());
+    if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
+        return Err("v2_after_delete: timestamp not set — call crsql_set_ts() first or set default-ts".to_string());
     }
     let db_version = crate::db_version::next_db_version(db, ext_data)
         .map_err(|_| "failed to get next db_version".to_string())?;

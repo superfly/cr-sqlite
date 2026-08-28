@@ -939,8 +939,8 @@ unsafe extern "C" fn x_crsql_as_crr(
     }
 
     // V2 clock tables require a non-zero ts. Error early if not set.
-    if unsafe { (*ext_data).timestamp } == 0 {
-        ctx.result_error("crsql_as_crr: timestamp not set — call crsql_set_ts() first");
+    if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
+        ctx.result_error("crsql_as_crr: timestamp not set — call crsql_set_ts() first or set default-ts");
         let _ = db.exec_safe("ROLLBACK");
         return;
     }
@@ -1016,8 +1016,8 @@ unsafe extern "C" fn x_crsql_begin_alter(
 
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
     // V2 clock tables require a non-zero ts. Error early if not set.
-    if unsafe { (*ext_data).timestamp } == 0 {
-        ctx.result_error("crsql_begin_alter: timestamp not set — call crsql_set_ts() first");
+    if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
+        ctx.result_error("crsql_begin_alter: timestamp not set — call crsql_set_ts() first or set default-ts");
         return;
     }
 
@@ -1063,8 +1063,8 @@ unsafe extern "C" fn x_crsql_commit_alter(
     let db = ctx.db_handle();
 
     // V2 clock tables require a non-zero ts. Error early if not set.
-    if unsafe { (*ext_data).timestamp } == 0 {
-        ctx.result_error("crsql_commit_alter: timestamp not set — call crsql_set_ts() first");
+    if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
+        ctx.result_error("crsql_commit_alter: timestamp not set — call crsql_set_ts() first or set default-ts");
         return;
     }
 
@@ -1308,11 +1308,13 @@ unsafe extern "C" fn x_crsql_get_ts(
     _argv: *mut *mut sqlite::value,
 ) {
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
-    let ts = (*ext_data).timestamp;
-    if ts == 0 {
-        ctx.result_error("crsql_get_ts: timestamp not set. Call crsql_set_ts() before writing to V2 clock tables.");
-        return;
-    }
+    let ts = match crate::config::ensure_timestamp(ext_data) {
+        Ok(ts) => ts,
+        Err(()) => {
+            ctx.result_error("crsql_get_ts: timestamp not set. Call crsql_set_ts() or set default-ts.");
+            return;
+        }
+    };
     ctx.result_int64(ts as sqlite::int64);
 }
 

@@ -81,6 +81,7 @@ pub struct crsql_ExtData {
     pub metadataUseVersion: ::core::ffi::c_int,
     pub syncLogVersion: ::core::ffi::c_int,
     pub timestamp: ::core::ffi::c_ulonglong,
+    pub defaultTimestamp: ::core::ffi::c_ulonglong,
     pub ordinalMap: *mut ::core::ffi::c_void,
 }
 
@@ -338,7 +339,7 @@ fn bindgen_test_layout_crsql_ExtData() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::core::mem::size_of::<crsql_ExtData>(),
-        176usize,
+        184usize,
         concat!("Size of: ", stringify!(crsql_ExtData))
     );
     assert_eq!(
@@ -599,8 +600,18 @@ fn bindgen_test_layout_crsql_ExtData() {
         )
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ordinalMap) as usize - ptr as usize },
+        unsafe { ::core::ptr::addr_of!((*ptr).defaultTimestamp) as usize - ptr as usize },
         168usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_ExtData),
+            "::",
+            stringify!(defaultTimestamp)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).ordinalMap) as usize - ptr as usize },
+        176usize,
         concat!(
             "Offset of field: ",
             stringify!(crsql_ExtData),

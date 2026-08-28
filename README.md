@@ -135,10 +135,23 @@ Starting in 0.18.0, **`crsql_set_ts()` must be called in the same transaction** 
 If the timestamp is not set (or was reset by a prior transaction commit), these operations will fail with an error:
 
 ```
-crsql_as_crr: timestamp not set — call crsql_set_ts() first
+crsql_as_crr: timestamp not set — call crsql_set_ts() first or set default-ts
 ```
 
 The timestamp is **transaction-scoped**: it is set via `crsql_set_ts()` and resets to 0 on transaction commit or rollback. This means `crsql_set_ts()` and the operation that needs it must run in the same transaction. In autocommit mode, `SELECT crsql_set_ts(...)` does not trigger a commit (it's a read-only function call), so a subsequent `SELECT crsql_as_crr(...)` in a separate `exec` call will still see the timestamp — but the `crsql_as_crr` call itself writes to the database, which triggers an auto-commit and resets the timestamp for the next operation.
+
+For development convenience, you can skip calling `crsql_set_ts()` before every command by setting a default:
+
+```sql
+SELECT crsql_config_set('default-ts', 1);
+-- now as_crr / inserts / alter work without crsql_set_ts()
+SELECT crsql_as_crr('foo');
+INSERT INTO foo VALUES (1, 'bar');
+```
+
+> **Warning: `default-ts` is intended for development/testing only.** It uses a single static timestamp for all transactions that don't call `crsql_set_ts()`, which means concurrent or sequential writes will share the same logical time — defeating the purpose of it. In production, always call `crsql_set_ts(...)` per transaction. To prevent misuse a default-ts is only valid for the lifetime of the database connection.
+
+`default-ts` is `0` by default (must still call `crsql_set_ts()`). Any value `> 0` is used for the current transaction when `crsql_set_ts()` was not called. An explicit `crsql_set_ts()` still wins for that transaction. The setting is **per-connection** — it is not persisted and resets to `0` on every new connection.
 
 **Only plain `SELECT` queries from `crsql_changes`** (reading changes without merging) do not require a timestamp to be set.
 
