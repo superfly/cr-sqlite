@@ -2077,6 +2077,146 @@ fn assert_changes_feed(
     Ok(())
 }
 
+/// default-ts allows skipping crsql_set_ts() by using a static fallback.
+/// It is per-connection only and not persisted in crsql_master.
+fn test_default_ts_basic() -> Result<(), ResultCode> {
+    libc_println!("=== test_default_ts_basic START ===");
+    let db = crate::opendb()?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    db.db.exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, a)")?;
+
+    // Set default-ts — as_crr should work without crsql_set_ts()
+    db.db.exec_safe("SELECT crsql_config_set('default-ts', 1700000000)")?;
+    db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+
+    // Insert without crsql_set_ts — should use default
+    db.db.exec_safe("INSERT INTO foo VALUES (1, 'x')")?;
+
+    // Verify the clock table got the default ts
+    let stmt = db.db.prepare_v2(
+        "SELECT ts FROM foo__crsql_v2_clock WHERE cell_key >> 12 = 1 LIMIT 1",
+    )?;
+    assert_eq!(stmt.step()?, ResultCode::ROW);
+    assert_eq!(stmt.column_int64(0), 1700000000, "clock ts should be the default-ts value");
+
+    libc_println!("=== test_default_ts_basic PASS ===");
+    Ok(())
+}
+
+/// An explicit crsql_set_ts() must override default-ts for that transaction.
+fn test_default_ts_explicit_wins() -> Result<(), ResultCode> {
+    libc_println!("=== test_default_ts_explicit_wins START ===");
+    let db = crate::opendb()?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    db.db.exec_safe("SELECT crsql_config_set('default-ts', 1700000000)")?;
+    db.db.exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, a)")?;
+    db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+
+    // Explicit ts should win over default
+    db.db.exec_safe("SELECT crsql_set_ts('1800000000')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (1, 'x')")?;
+
+    let stmt = db.db.prepare_v2(
+        "SELECT ts FROM foo__crsql_v2_clock WHERE cell_key >> 12 = 1 LIMIT 1",
+    )?;
+    assert_eq!(stmt.step()?, ResultCode::ROW);
+    assert_eq!(stmt.column_int64(0), 1800000000, "explicit crsql_set_ts should override default-ts");
+
+    libc_println!("=== test_default_ts_explicit_wins PASS ===");
+    Ok(())
+}
+
+/// default-ts must NOT persist across connections — reopening the DB
+/// should reset it to 0, so operations without crsql_set_ts() error again.
+fn test_default_ts_not_persisted() -> Result<(), ResultCode> {
+    libc_println!("=== test_default_ts_not_persisted START ===");
+
+    let path = "crsql_default_ts_persist_test.db\0";
+    let path_str = path.trim_end_matches('\0');
+
+    #[cfg(not(target_os = "windows"))]
+    extern "C" {
+        fn unlink(pathname: *const core::ffi::c_char) -> core::ffi::c_int;
+    }
+    #[cfg(target_os = "windows")]
+    extern "C" {
+        fn _unlink(pathname: *const core::ffi::c_char) -> core::ffi::c_int;
+    }
+
+    unsafe {
+        #[cfg(not(target_os = "windows"))]
+        unlink(path.as_ptr() as *const core::ffi::c_char);
+        #[cfg(target_os = "windows")]
+        _unlink(path.as_ptr() as *const core::ffi::c_char);
+    }
+
+    // Connection 1: set default-ts and use it
+    {
+        let db = crate::opendb_file(path_str)?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+        db.db.exec_safe("SELECT crsql_config_set('default-ts', 1700000000)")?;
+        db.db.exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, a)")?;
+        db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+        db.db.exec_safe("INSERT INTO foo VALUES (1, 'x')")?;
+
+        // Verify config_get returns the value on this connection
+        let stmt = db.db.prepare_v2("SELECT crsql_config_get('default-ts')")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int64(0), 1700000000, "default-ts should be set on this connection");
+    }
+
+    // Connection 2: reopen — default-ts should be 0
+    {
+        let db = crate::opendb_file(path_str)?;
+
+        // config_get should return 0 (not persisted)
+        let stmt = db.db.prepare_v2("SELECT crsql_config_get('default-ts')")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int64(0), 0, "default-ts should NOT persist across connections");
+
+        // as_crr on a new table without ts should fail (no default)
+        db.db.exec_safe("CREATE TABLE bar (id PRIMARY KEY NOT NULL, a)")?;
+        let rc = db.db.exec_safe("SELECT crsql_as_crr('bar')");
+        assert!(rc.is_err(), "crsql_as_crr should fail when default-ts is not set and crsql_set_ts was not called");
+    }
+
+    unsafe {
+        #[cfg(not(target_os = "windows"))]
+        unlink(path.as_ptr() as *const core::ffi::c_char);
+        #[cfg(target_os = "windows")]
+        _unlink(path.as_ptr() as *const core::ffi::c_char);
+    }
+
+    libc_println!("=== test_default_ts_not_persisted PASS ===");
+    Ok(())
+}
+
+/// default-ts uses the same static value for every transaction that
+/// doesn't call crsql_set_ts(), so sequential writes share the same ts.
+fn test_default_ts_static_across_txns() -> Result<(), ResultCode> {
+    libc_println!("=== test_default_ts_static_across_txns START ===");
+    let db = crate::opendb()?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    db.db.exec_safe("SELECT crsql_config_set('default-ts', 1700000000)")?;
+    db.db.exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, a)")?;
+    db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+
+    // Two separate autocommit inserts — both should get the same ts
+    db.db.exec_safe("INSERT INTO foo VALUES (1, 'x')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (2, 'y')")?;
+
+    let stmt = db.db.prepare_v2(
+        "SELECT DISTINCT ts FROM foo__crsql_v2_clock WHERE cell_key >> 12 IN (1, 2)",
+    )?;
+    assert_eq!(stmt.step()?, ResultCode::ROW);
+    assert_eq!(stmt.column_int64(0), 1700000000, "first distinct ts should be the default");
+    // Only one distinct ts — both transactions used the same static default
+    assert_eq!(stmt.step()?, ResultCode::DONE, "both txns should share the same default-ts");
+
+    libc_println!("=== test_default_ts_static_across_txns PASS ===");
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), ResultCode> {
     test_pack_agg_matches_pack_columns()?;
     test_pack_agg_with_nulls()?;
@@ -2103,5 +2243,9 @@ pub fn run_suite() -> Result<(), ResultCode> {
     test_ts_not_set_errors()?;
     test_config_persists_across_reopen()?;
     test_v2_update_uses_col_map_id_after_drop()?;
+    test_default_ts_basic()?;
+    test_default_ts_explicit_wins()?;
+    test_default_ts_not_persisted()?;
+    test_default_ts_static_across_txns()?;
     Ok(())
 }

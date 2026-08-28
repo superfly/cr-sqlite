@@ -46,6 +46,9 @@ where
         ));
     }
 
+    // Apply default-ts when configured; V2 paths still error if ts stays 0.
+    let _ = unsafe { crate::config::ensure_timestamp(ext_data) };
+
     let mut table_infos =
         unsafe { ManuallyDrop::new(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>)) };
     let table_name = values[0].text();

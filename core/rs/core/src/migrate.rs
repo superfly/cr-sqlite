@@ -68,8 +68,8 @@ unsafe fn incremental_maintenance(
     ext_data: *mut crsql_ExtData,
 ) -> Result<c_int, ResultCode> {
     // V2 clock tables require a non-zero ts. Error early if not set.
-    if unsafe { (*ext_data).timestamp } == 0 {
-        crate::debug::debug_log("incremental_maintenance: timestamp not set — call crsql_set_ts() first");
+    if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
+        crate::debug::debug_log("incremental_maintenance: timestamp not set — call crsql_set_ts() first or set default-ts");
         return Err(ResultCode::ERROR);
     }
 
