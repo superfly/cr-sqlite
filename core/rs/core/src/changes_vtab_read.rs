@@ -201,13 +201,10 @@ fn crsql_changes_query_for_table_v2_v1wire(table_info: &TableInfo) -> Result<Str
 /// Used in packed (v2 sync-log) format to fetch all column values in one query.
 /// Example: CASE (c.cell_key & mask) WHEN 0 THEN mt."col0" WHEN 1 THEN mt."col1" END
 fn build_col_val_case(table_info: &TableInfo) -> Result<String, ResultCode> {
-    let mask = consts::CRSQL_COL_ID_MASK;
-
     let mut when_clauses = vec![];
-    for (col_id, col) in table_info.non_pks.iter().enumerate() {
+    for (_, col) in table_info.non_pks.iter().enumerate() {
         when_clauses.push(format!(
-            "WHEN {col_id} THEN mt.\"{col_name}\"",
-            col_id = col_id,
+            "WHEN '{col_name}' THEN mt.\"{col_name}\"",
             col_name = crate::util::escape_ident(&col.name)
         ));
     }
@@ -217,8 +214,7 @@ fn build_col_val_case(table_info: &TableInfo) -> Result<String, ResultCode> {
         Ok("NULL".to_string())
     } else {
         Ok(format!(
-            "CASE (c.cell_key & {mask}) {whens} END",
-            mask = mask,
+            "CASE cm.col_name {whens} END",
             whens = when_clauses.join(" ")
         ))
     }

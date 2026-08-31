@@ -309,11 +309,45 @@ pub fn v2_after_update(
         RowState::NotFound => return Err("row not found in v2_pks — cannot update untracked row".to_string()),
     };
 
-    // Update clock entries for each changed column
+    // Resolve non_pks indices through v2_col_map. After DROP COLUMN the map
+    // has holes, so the array index is not the packed col_id.
+    let mut col_ids: vec::Vec<i64> = vec![];
+    {
+        let mut lookup = v2_stmts.col_id_lookup();
+        for &col_idx in changed_col_indices {
+            let col_name = tbl_info
+                .non_pks
+                .get(col_idx)
+                .map(|c| c.name.as_str())
+                .ok_or_else(|| "changed column index out of range".to_string())?;
+            lookup
+                .bind_text(1, col_name, Destructor::STATIC)
+                .map_err(|e| format!("bind col_id_lookup: {:?}", e))?;
+            match lookup
+                .step()
+                .map_err(|e| format!("step col_id_lookup: {:?}", e))?
+            {
+                ResultCode::ROW => col_ids.push(lookup.column_int64(0)),
+                _ => {
+                    return Err(format!(
+                        "no col_id in v2_col_map for column {}",
+                        col_name
+                    ))
+                }
+            }
+            lookup
+                .reset()
+                .map_err(|e| format!("reset col_id_lookup: {:?}", e))?;
+            lookup
+                .clear_bindings()
+                .map_err(|e| format!("clear col_id_lookup: {:?}", e))?;
+        }
+    }
+
     let mut stmt = v2_stmts.clock_bump_version();
-    for &col_idx in changed_col_indices {
+    for col_id in col_ids {
         let seq = bump_seq(ext_data);
-        let cell_key = (key << consts::CRSQL_COL_ID_BITS as i64) | col_idx as i64;
+        let cell_key = (key << consts::CRSQL_COL_ID_BITS as i64) | col_id;
         stmt.bind_int64(1, cell_key).map_err(|e| format!("bind: {:?}", e))?;
         stmt.bind_int64(2, db_version).map_err(|e| format!("bind: {:?}", e))?;
         stmt.bind_int(3, seq).map_err(|e| format!("bind: {:?}", e))?;

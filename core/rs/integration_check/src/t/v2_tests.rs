@@ -2007,6 +2007,76 @@ fn test_config_persists_across_reopen() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// After DROP COLUMN, col_map ids no longer match non_pks indices.
+/// UPDATE must pack the col_map id, not the pragma ordinal.
+fn test_v2_update_uses_col_map_id_after_drop() -> Result<(), ResultCode> {
+    libc_println!("=== test_v2_update_uses_col_map_id_after_drop START ===");
+    let db = crate::opendb()?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    db.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, a, b)")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('t')")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("INSERT INTO t VALUES (1, 'x', 'y')")?;
+
+    assert_changes_feed(&db.db, &[("a", "x"), ("b", "y")])?;
+
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_begin_alter('t')")?;
+    db.db.exec_safe("ALTER TABLE t DROP COLUMN a")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_commit_alter('t')")?;
+
+    let stmt = db.db.prepare_v2(
+        "SELECT col_id, col_name FROM t__crsql_v2_col_map ORDER BY col_id",
+    )?;
+    assert_eq!(stmt.step()?, ResultCode::ROW);
+    assert_eq!(stmt.column_int64(0), 1, "b should keep col_id 1 after dropping a");
+    assert_eq!(stmt.column_text(1)?, "b");
+    assert_eq!(stmt.step()?, ResultCode::DONE, "dropped column a should not remain in col_map");
+
+    assert_changes_feed(&db.db, &[("b", "y")])?;
+
+    db.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
+    db.db.exec_safe("UPDATE t SET b = 'z' WHERE id = 1")?;
+
+    // INSERT wrote rowid=1 col_id=1 → 4097. UPDATE must bump that cell, not col_id 0 (4096).
+    let stmt = db.db.prepare_v2(
+        "SELECT cell_key & 255, col_version FROM t__crsql_v2_clock WHERE cell_key >> 12 = 1 ORDER BY 1",
+    )?;
+    assert_eq!(stmt.step()?, ResultCode::ROW);
+    assert_eq!(stmt.column_int64(0), 1, "UPDATE of b must use col_map id 1, not non_pks index 0");
+    assert_eq!(stmt.column_int64(1), 2, "existing clock row for b should be bumped");
+    assert_eq!(stmt.step()?, ResultCode::DONE, "must not write a new clock row at col_id 0");
+
+    assert_changes_feed(&db.db, &[("b", "z")])?;
+
+    libc_println!("=== test_v2_update_uses_col_map_id_after_drop PASS ===");
+    Ok(())
+}
+
+fn assert_changes_feed(
+    db: &ManagedConnection,
+    expected: &[(&str, &str)],
+) -> Result<(), ResultCode> {
+    let stmt = db.prepare_v2(
+        "SELECT [cid], [val] FROM crsql_changes WHERE \"table\" = 't' ORDER BY [cid]",
+    )?;
+    let mut got: Vec<(String, String)> = vec![];
+    while stmt.step()? == ResultCode::ROW {
+        got.push((
+            stmt.column_text(0)?.to_string(),
+            stmt.column_text(1)?.to_string(),
+        ));
+    }
+    let exp: Vec<(String, String)> = expected
+        .iter()
+        .map(|(c, v)| ((*c).to_string(), (*v).to_string()))
+        .collect();
+    assert_eq!(got, exp, "changes feed cid/val mismatch");
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), ResultCode> {
     test_pack_agg_matches_pack_columns()?;
     test_pack_agg_with_nulls()?;
@@ -2032,5 +2102,6 @@ pub fn run_suite() -> Result<(), ResultCode> {
     test_tombstone_conflict_resolution()?;
     test_ts_not_set_errors()?;
     test_config_persists_across_reopen()?;
+    test_v2_update_uses_col_map_id_after_drop()?;
     Ok(())
 }
