@@ -314,10 +314,14 @@ impl V2Stmts {
             "INSERT INTO \"{escaped}\" ({pk_cols}) VALUES ({pk_values})",
         ), sqlite::PREPARE_PERSISTENT)?;
 
-        let base_delete_rowid = db.prepare_v3(&format!(
-            "DELETE FROM \"{escaped}\" WHERE \"{alias}\" = ?",
-            alias = crate::util::escape_ident(&tbl_info.rowid_alias)
-        ), sqlite::PREPARE_PERSISTENT)?;
+        let base_delete_rowid = if tbl_info.key_is_rowid {
+            Some(db.prepare_v3(&format!(
+                "DELETE FROM \"{escaped}\" WHERE \"{alias}\" = ?",
+                alias = crate::util::escape_ident(&tbl_info.rowid_alias)
+            ), sqlite::PREPARE_PERSISTENT)?)
+        } else {
+            None
+        };
 
         let base_delete_nonrowid = if !tbl_info.key_is_rowid {
             let where_conds: Vec<String> = tbl_info.pks.iter()
@@ -571,7 +575,9 @@ impl V2Stmts {
     pub fn col_id_lookup(&mut self) -> StmtGuard { StmtGuard::new(&mut self.col_id_lookup) }
     pub fn col_ids_all(&mut self) -> StmtGuard { StmtGuard::new(&mut self.col_ids_all) }
     pub fn base_insert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.base_insert) }
-    pub fn base_delete_rowid(&mut self) -> StmtGuard { StmtGuard::new(&mut self.base_delete_rowid) }
+    pub fn base_delete_rowid(&mut self) -> Result<StmtGuard, ResultCode> {
+        self.base_delete_rowid.as_mut().map(StmtGuard::new).ok_or(ResultCode::ERROR)
+    }
     pub fn base_lookup_pks_by_key(&mut self) -> StmtGuard { StmtGuard::new(&mut self.base_lookup_pks_by_key) }
     /// Get a per-column base table UPDATE statement.
     /// All statements are pre-prepared at V2Stmts construction time.
