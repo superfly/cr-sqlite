@@ -279,7 +279,7 @@ impl V2Stmts {
             "INSERT INTO \"{escaped}{}\" (cell_key, col_version, site_id, db_version, seq, ts) \
              VALUES (?, 1, 0, ?, ?, ?) \
              ON CONFLICT(cell_key) DO UPDATE SET \
-             col_version = col_version + 1, db_version = excluded.db_version, \
+             col_version = col_version + 1, site_id = excluded.site_id, db_version = excluded.db_version, \
              seq = excluded.seq, ts = excluded.ts",
             consts::V2_CLOCK_SUFFIX
         ), sqlite::PREPARE_PERSISTENT)?;
@@ -403,7 +403,7 @@ impl V2Stmts {
         // Bind order: 1=key, 2=cl, 3=ts_fallback, 4=cell_key
         let v1_sentinel_insert_alive = if has_v1 {
             Some(db.prepare_v3(&format!(
-                "INSERT INTO \"{escaped}__crsql_clock\" (key, col_name, col_version, db_version, seq, site_id, ts) \
+                "INSERT INTO \"{escaped}__crsql_clock\" (key, col_name, col_version, site_id, db_version, seq, ts) \
                  SELECT ?, '-1', ?, site_id, db_version, seq, \
                  CASE WHEN ts > 0 THEN ts ELSE ? END \
                  FROM (SELECT site_id, db_version, seq, ts FROM \"{escaped}{}\" WHERE cell_key = ?) LIMIT 1",
@@ -416,7 +416,7 @@ impl V2Stmts {
         let v1_sentinel_insert_dead = if has_v1 {
             if tbl_info.skip_hash {
                 Some(db.prepare_v3(&format!(
-                    "INSERT INTO \"{escaped}__crsql_clock\" (key, col_name, col_version, db_version, seq, site_id, ts) \
+                    "INSERT INTO \"{escaped}__crsql_clock\" (key, col_name, col_version, site_id, db_version, seq, ts) \
                     SELECT ?, '-1', ?, site_id, db_version, seq, \
                     CASE WHEN ts > 0 THEN ts ELSE ? END \
                     FROM (SELECT site_id, db_version, seq, ts FROM \"{escaped}{}\" WHERE \"{pk_col}\" = ?) LIMIT 1",
