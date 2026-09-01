@@ -25,10 +25,9 @@ one huge transaction per table.
 Writes go through the Corrosion Postgres wire-protocol API so they
 replicate properly to peers. Direct SQLite writes would not replicate.
 
-Uses psycopg3 (the `psycopg` package) with its transaction() context
-manager for robust, well-tested transaction handling.
+Uses pg8000 (pure Python PG driver) to avoid C extension segfaults.
 
-    pip install psycopg[binary]
+    pip install pg8000
 
 The script is interactive and requires confirmation before:
   - Pinging the Corrosion API
@@ -44,10 +43,10 @@ import sys
 import os
 
 try:
-    import psycopg
+    import pg8000
 except ImportError:
-    print("Error: psycopg not installed.")
-    print("Install: pip install 'psycopg[binary]'")
+    print("Error: pg8000 not installed.")
+    print("Install: pip install pg8000")
     sys.exit(1)
 
 try:
@@ -116,20 +115,22 @@ def parse_host_port(addr):
 
 
 def connect_postgres(addr):
-    """Connect to Postgres wire protocol endpoint using psycopg3.
+    """Connect to Postgres wire protocol endpoint using pg8000 (pure Python).
 
-    Returns a connection object.
+    Uses TCP keepalives to detect dead connections and a 60s timeout
+    per socket operation.
     """
     host, port = parse_host_port(addr)
 
-    conn = psycopg.connect(
+    conn = pg8000.connect(
         host=host,
         port=port,
-        dbname="corrosion",
-        user="corrosion",
-        connect_timeout=10,
-        autocommit=True,  # We'll use explicit transaction() for batches
+        database="state",
+        user="postgres",
+        timeout=180,          # 3 min — queries take 12-19s on sqlite directly, PG API adds overhead
+        tcp_keepalive=True,
     )
+    conn.autocommit = True
     return conn
 
 
@@ -146,23 +147,17 @@ def confirm(prompt, default=False):
 
 
 def exec_fetchall(conn, sql, params=None):
-    """Execute and fetch all rows. Uses autocommit connection (read-only queries)."""
-    with conn.cursor() as cur:
-        if params:
-            cur.execute(sql, params)
-        else:
-            cur.execute(sql)
-        return cur.fetchall()
+    """Execute and fetch all rows."""
+    cur = conn.cursor()
+    cur.execute(sql, params or ())
+    return cur.fetchall()
 
 
 def exec_fetchone(conn, sql, params=None):
-    """Execute and fetch one row. Uses autocommit connection (read-only queries)."""
-    with conn.cursor() as cur:
-        if params:
-            cur.execute(sql, params)
-        else:
-            cur.execute(sql)
-        return cur.fetchone()
+    """Execute and fetch one row."""
+    cur = conn.cursor()
+    cur.execute(sql, params or ())
+    return cur.fetchone()
 
 
 def get_crr_tables(conn):
@@ -184,7 +179,10 @@ def get_crr_tables(conn):
 
 def get_pk_info(conn, table):
     """Get PK columns from crsql_master v2_pks_{table} key, or from pragma."""
-    row = exec_fetchone(conn, "SELECT value FROM crsql_master WHERE key=%s", (f"v2_pks_{table}",))
+    # Corrosion's PG API doesn't support parameterized queries, so inline the key.
+    # Table name comes from our own table scan, not user input.
+    key = f"v2_pks_{table}".replace("'", "''")
+    row = exec_fetchone(conn, f"SELECT value FROM crsql_master WHERE key = '{key}'")
     if row:
         value = row[0]
         parts = value.split(":", 1)
@@ -196,7 +194,7 @@ def get_pk_info(conn, table):
         return pk_cols
 
     rows = exec_fetchall(conn, f'PRAGMA table_info("{table}")')
-    pk_cols = [(r[5], r[1]) for r in rows if r[5] > 0]
+    pk_cols = [(int(r[5]), r[1]) for r in rows if int(r[5]) > 0]
     pk_cols.sort()
     return [c[1] for c in pk_cols]
 
@@ -205,14 +203,14 @@ def get_expected_clock_count(conn, table):
     """Get expected clock entries per row: count of non-PK columns."""
     try:
         row = exec_fetchone(conn, f'SELECT count(*) FROM "{table}__crsql_v2_col_map" WHERE col_name != \'\'')
-        count = row[0]
+        count = int(row[0])
         if count > 0:
             return count
     except Exception:
         pass
 
     rows = exec_fetchall(conn, f'PRAGMA table_info("{table}")')
-    non_pk = [r for r in rows if r[5] == 0]
+    non_pk = [r for r in rows if int(r[5]) == 0]
     return len(non_pk)
 
 
@@ -222,134 +220,144 @@ def get_all_columns(conn, table):
     return [r[1] for r in rows]
 
 
-def find_offending_count(conn, table, expected_count, pk_cols):
-    """Count rows that need repair.
+def scan_table(conn, table, expected_count, pk_cols):
+    """Scan a table for clock entry issues using separate efficient queries.
 
-    Starts from the base table, LEFT JOINs to pks + clock:
-      - Untracked: no pks entry (p.__crsql_key IS NULL)
-      - Tracked-wrong: pks entry exists but clock count is wrong or missing
+    V1 clock table has PRIMARY KEY (key, col_name) WITHOUT ROWID — so
+    the `key` column is indexed. V1 pks table has:
+      - __crsql_key INTEGER PRIMARY KEY (indexed)
+      - UNIQUE INDEX on the actual PK columns (indexed)
 
-    Returns (total_count, tracked_wrong_count, untracked_count).
+    Strategy:
+    1. Total row count (simple, fast)
+    2. Clock count distribution from pks+clock (uses clock PK index for GROUP BY key)
+    3. Untracked: skip for very large tables (the NOT EXISTS scan is too slow
+       through corrosion's PG API). Can be computed separately if needed.
+
+    Returns dict with: total_rows, offending, tracked_wrong, untracked,
+    distribution (list of (count, num_rows)), max_clock, pks_count.
     """
-    pk_join = " AND ".join(f'p."{c}" = b."{c}"' for c in pk_cols)
+    # 1. Total row count
+    total_rows = int(exec_fetchone(conn, f'SELECT count(*) FROM "{table}"')[0])
 
-    # Untracked: base rows with no pks entry
-    untracked_sql = f'''
-        SELECT count(*)
-        FROM "{table}" b
-        LEFT JOIN "{table}__crsql_pks" p ON {pk_join}
-        WHERE p.__crsql_key IS NULL
-    '''
-    untracked = int(exec_fetchone(conn, untracked_sql)[0])
-
-    # Tracked-wrong: base rows with pks entry but wrong clock count
-    tracked_sql = f'''
-        SELECT count(*)
-        FROM "{table}" b
-        JOIN "{table}__crsql_pks" p ON {pk_join}
-        LEFT JOIN (
-            SELECT c.key, count(*) AS cnt
-            FROM "{table}__crsql_clock" c
-            WHERE c.col_name != '-1'
-            GROUP BY c.key
-        ) clk ON clk.key = p.__crsql_key
-        WHERE clk.cnt IS NULL OR clk.cnt != {expected_count}
-    '''
-    tracked_wrong = int(exec_fetchone(conn, tracked_sql)[0])
-
-    return (tracked_wrong + untracked, tracked_wrong, untracked)
-
-
-def get_clock_count_distribution(conn, table, pk_cols):
-    """Get distribution of clock entry counts for a table.
-
-    Starts from the base table, LEFT JOINs to pks + clock.
-    count=-1 means untracked (no __crsql_pks entry).
-
-    Returns list of (count, num_rows) sorted by count.
-    """
-    pk_join = " AND ".join(f'p."{c}" = b."{c}"' for c in pk_cols)
-
-    # All base rows, classified by clock count or untracked
-    sql = f'''
-        SELECT
-            CASE
-                WHEN p.__crsql_key IS NULL THEN -1
-                WHEN clk.cnt IS NULL THEN 0
-                ELSE clk.cnt
-            END as cnt,
-            count(*) as num_rows
-        FROM "{table}" b
-        LEFT JOIN "{table}__crsql_pks" p ON {pk_join}
-        LEFT JOIN (
-            SELECT c.key, count(*) AS cnt
-            FROM "{table}__crsql_clock" c
-            WHERE c.col_name != '-1'
-            GROUP BY c.key
-        ) clk ON clk.key = p.__crsql_key
+    # 2. Clock count distribution — base JOIN pks, filtered to alive keys only
+    pk_join = " AND ".join(f'b."{c}" = p."{c}"' for c in pk_cols)
+    dist_sql = f'''
+        SELECT cnt, count(*) as num_rows
+        FROM (
+            SELECT (
+                SELECT count(*) FROM "{table}__crsql_clock" c
+                WHERE c.key = p.__crsql_key AND c.col_name != '-1'
+            ) as cnt
+            FROM "{table}" b
+            JOIN "{table}__crsql_pks" p ON {pk_join}
+            WHERE p.__crsql_key IN (
+                SELECT key FROM "{table}__crsql_clock" WHERE col_name != '-1' GROUP BY key
+            )
+        )
         GROUP BY cnt
         ORDER BY cnt
     '''
-    rows = exec_fetchall(conn, sql)
-    return [(int(r[0]), int(r[1])) for r in rows]
+    dist_rows = exec_fetchall(conn, dist_sql)
+    dist = [(int(r[0]), int(r[1])) for r in dist_rows]
+
+    # 3. Untracked: base rows with no pks entry
+    if len(pk_cols) == 1:
+        c = pk_cols[0]
+        untracked_sql = f'''
+            SELECT count(*)
+            FROM "{table}" b
+            WHERE b."{c}" NOT IN (
+                SELECT "{c}" FROM "{table}__crsql_pks" WHERE "{c}" IS NOT NULL
+            )
+        '''
+    else:
+        pk_where = " AND ".join(f'b."{c}" = p."{c}"' for c in pk_cols)
+        untracked_sql = f'''
+            SELECT count(*)
+            FROM "{table}" b
+            WHERE NOT EXISTS (
+                SELECT 1 FROM "{table}__crsql_pks" p WHERE {pk_where}
+            )
+        '''
+    try:
+        untracked = int(exec_fetchone(conn, untracked_sql)[0])
+    except Exception:
+        untracked = -1
+
+    # Derive zero-clock: tracked rows (base - untracked) minus rows in distribution
+    dist_total = sum(num for _, num in dist)
+    if untracked >= 0:
+        zero_clock = (total_rows - untracked) - dist_total
+        if zero_clock < 0:
+            zero_clock = 0
+    else:
+        zero_clock = 0
+
+    # Build full distribution
+    distribution = list(dist)
+    if zero_clock > 0:
+        distribution.append((0, zero_clock))
+    if untracked > 0:
+        distribution.append((-1, untracked))
+    distribution.sort(key=lambda x: x[0])
+
+    tracked_total = dist_total + zero_clock
+    tracked_wrong = sum(num for cnt, num in dist if cnt != expected_count) + zero_clock
+    max_clock = max((cnt for cnt, _ in distribution), default=0)
+
+    if untracked < 0:
+        offending = tracked_wrong
+    else:
+        offending = tracked_wrong + untracked
+
+    return {
+        "total_rows": total_rows,
+        "offending": offending,
+        "tracked_wrong": tracked_wrong,
+        "untracked": untracked,
+        "distribution": distribution,
+        "max_clock": max_clock,
+        "pks_count": tracked_total,
+    }
 
 
-def repair_table(conn, table, pk_cols, expected_count, batch_size=500):
-    """Repair a table in batches, entirely in SQL.
+def repair_untracked(conn, table, pk_cols, batch_size=500):
+    """Fix untracked rows: base rows with no __crsql_pks entry.
 
-    Each batch:
-      1. Finds 500 offending rows (LIMIT) — copy to temp table
-      2. DELETE from base (triggers fire → tombstone)
-      3. INSERT back from temp (triggers fire → alive with all clock entries)
-      4. Drop temp
+    For each untracked row, inserts a pks entry and a sentinel clock entry
+    (col_name='-1', col_version=1) to mark it as alive. Does NOT touch
+    the base table data — no DELETE/INSERT, no trigger firing.
 
-    No queue table — each batch re-runs the offending query with LIMIT.
-    This avoids a full table scan upfront but re-scans per batch. The
-    LIMIT stops early once 500 are found, so each scan is proportional
-    to how far into the table the offending rows are.
+    This maintains the invariant that every base table row has a pks entry,
+    without flooding the replication log with spurious changes.
 
     Returns (total_repaired, error).
     """
-    all_cols = get_all_columns(conn, table)
-    col_list_escaped = ", ".join(f'"{c}"' for c in all_cols)
     pk_cols_escaped = ", ".join(f'"{c}"' for c in pk_cols)
-    pk_join = " AND ".join(f'p."{c}" = b."{c}"' for c in pk_cols)
-    temp_pk_match = " AND ".join(
-        f'"{table}"."{c}" = "{temp_name}"."{c}"' for c in pk_cols
-    )
+    pk_cols_list = ", ".join(f'b."{c}"' for c in pk_cols)
+    pk_where = " AND ".join(f'b."{c}" = p."{c}"' for c in pk_cols)
 
-    temp_name = f"_backfill_temp_{table}"
-
-    # Clean up any leftover temp table
-    try:
-        with conn.transaction():
-            with conn.cursor() as cur:
-                cur.execute(f'DROP TABLE IF EXISTS "{temp_name}"')
-    except Exception:
-        pass
-
-    # Subquery to find offending rows — reused per batch with LIMIT
-    # Starts from base table, LEFT JOINs to pks + clock:
-    #   - Untracked: no pks entry (p.__crsql_key IS NULL)
-    #   - Tracked-wrong: pks entry exists but clock count wrong or missing
-    offending_subquery = f'''
-        SELECT b.{pk_cols_escaped}
-        FROM "{table}" b
-        LEFT JOIN "{table}__crsql_pks" p ON {pk_join}
-        LEFT JOIN (
-            SELECT c.key, count(*) AS cnt
-            FROM "{table}__crsql_clock" c
-            WHERE c.col_name != '-1'
-            GROUP BY c.key
-        ) clk ON clk.key = p.__crsql_key
-        WHERE p.__crsql_key IS NULL
-           OR clk.cnt IS NULL
-           OR clk.cnt != {expected_count}
-        LIMIT {batch_size}
-    '''
-
-    # Join condition for matching temp table PKs back to base
-    temp_join = " AND ".join(f'b."{c}" = q."{c}"' for c in pk_cols)
+    # Find untracked rows: base rows with no pks entry
+    if len(pk_cols) == 1:
+        c = pk_cols[0]
+        untracked_subquery = f'''
+            SELECT b."{c}"
+            FROM "{table}" b
+            WHERE b."{c}" NOT IN (
+                SELECT "{c}" FROM "{table}__crsql_pks" WHERE "{c}" IS NOT NULL
+            )
+            LIMIT {batch_size}
+        '''
+    else:
+        untracked_subquery = f'''
+            SELECT {pk_cols_list}
+            FROM "{table}" b
+            WHERE NOT EXISTS (
+                SELECT 1 FROM "{table}__crsql_pks" p WHERE {pk_where}
+            )
+            LIMIT {batch_size}
+        '''
 
     total_repaired = 0
     batch_num = 0
@@ -359,61 +367,41 @@ def repair_table(conn, table, pk_cols, expected_count, batch_size=500):
         print(f"\r  batch {batch_num}...", end="", flush=True)
 
         try:
-            with conn.transaction():
-                with conn.cursor() as cur:
-                    # 1. Copy 500 offending rows to temp
-                    cur.execute(f'DROP TABLE IF EXISTS "{temp_name}"')
-                    cur.execute(
-                        f'CREATE TEMP TABLE "{temp_name}" AS '
-                        f'SELECT b.* FROM "{table}" b '
-                        f'JOIN ({offending_subquery}) q ON {temp_join}'
-                    )
+            cur = conn.cursor()
 
-                    # Check if we got any rows
-                    cur.execute(f'SELECT count(*) FROM "{temp_name}"')
-                    batch_count = cur.fetchone()[0]
-                    if batch_count == 0:
-                        cur.execute(f'DROP TABLE "{temp_name}"')
-                        break  # No more offending rows
+            # 1. Insert pks entries for untracked rows
+            # INSERT OR IGNORE to skip any that already exist (race safety)
+            cur.execute(
+                f'INSERT OR IGNORE INTO "{table}__crsql_pks" ({pk_cols_escaped}) '
+                f'SELECT {pk_cols_list} FROM ({untracked_subquery}) q'
+            )
+            batch_count = cur.rowcount
 
-                    # 2. Delete from base (triggers fire → tombstone)
-                    # Safety: only delete rows that match a PK in temp (the 500 we copied)
-                    cur.execute(
-                        f'DELETE FROM "{table}" WHERE EXISTS '
-                        f'(SELECT 1 FROM "{temp_name}" WHERE {temp_pk_match})'
-                    )
-                    deleted_count = cur.rowcount
-                    if deleted_count != batch_count:
-                        raise RuntimeError(
-                            f"DELETE mismatch: expected {batch_count}, got {deleted_count}. "
-                            f"Aborting to prevent data loss."
-                        )
+            if batch_count == 0:
+                conn.commit()
+                break  # No more untracked rows
 
-                    # 3. Reinsert from temp (triggers fire → alive with all clock entries)
-                    cur.execute(
-                        f'INSERT INTO "{table}" ({col_list_escaped}) '
-                        f'SELECT {col_list_escaped} FROM "{temp_name}"'
-                    )
-                    inserted_count = cur.rowcount
-                    if inserted_count != batch_count:
-                        raise RuntimeError(
-                            f"INSERT mismatch: expected {batch_count}, got {inserted_count}. "
-                            f"Aborting to prevent data loss."
-                        )
+            # 2. Insert sentinel clock entries for the new pks entries
+            # col_name='-1' (INSERT_SENTINEL), col_version=1 (alive), db_version=0, seq=0, site_id=0, ts='0'
+            cur.execute(
+                f'INSERT OR IGNORE INTO "{table}__crsql_clock" (key, col_name, col_version, db_version, seq, site_id, ts) '
+                f'SELECT p.__crsql_key, \'-1\', 1, 0, 0, 0, \'0\' '
+                f'FROM "{table}__crsql_pks" p '
+                f'JOIN ({untracked_subquery}) q ON {(" AND ".join(f"p.\"{c}\" = q.\"{c}\"" for c in pk_cols))} '
+                f'WHERE NOT EXISTS ('
+                f'  SELECT 1 FROM "{table}__crsql_clock" c '
+                f'  WHERE c.key = p.__crsql_key AND c.col_name = \'-1\''
+                f')'
+            )
 
-                    # 4. Drop temp
-                    cur.execute(f'DROP TABLE "{temp_name}"')
-
+            conn.commit()
             total_repaired += batch_count
         except Exception as e:
+            conn.rollback()
             print(f" FAIL: {e}")
-            try:
-                with conn.transaction():
-                    with conn.cursor() as cur:
-                        cur.execute(f'DROP TABLE IF EXISTS "{temp_name}"')
-            except Exception:
-                pass
             return (total_repaired, str(e))
+
+    return (total_repaired, None)
 
     print(f" done ({total_repaired} rows in {batch_num - 1} batches)")
     return (total_repaired, None)
@@ -451,7 +439,7 @@ def main():
     except Exception as e:
         print(f"FAILED: {e}")
         sys.exit(1)
-    print("connected (psycopg3)")
+    print("connected (pg8000)")
 
     # Ping
     print("Pinging...", end=" ", flush=True)
@@ -467,25 +455,31 @@ def main():
         sys.exit(1)
 
     # Check crsql_master exists
+    print("Checking crsql_master...", end=" ", flush=True)
     try:
         row = exec_fetchone(conn, "SELECT name FROM sqlite_master WHERE type='table' AND name='crsql_master'")
         if not row:
+            print("NOT FOUND")
             print("Error: crsql_master table not found. Is this a crsql database?")
             sys.exit(1)
+        print("OK")
     except Exception as e:
-        print(f"Error checking crsql_master: {e}")
+        print(f"FAILED: {e}")
         sys.exit(1)
 
+    print("Discovering CRR tables...", end=" ", flush=True)
     tables = get_crr_tables(conn)
+    print(f"found {len(tables)}")
     if not tables:
         print("No CRR tables found")
         sys.exit(0)
 
     print(f"\nFound {len(tables)} CRR tables:")
     for t in tables:
+        print(f"  - {t}... ", end="", flush=True)
         pk_cols = get_pk_info(conn, t)
         pk_str = ", ".join(pk_cols) if pk_cols else "?"
-        print(f"  - {t} (pk: {pk_str})")
+        print(f"(pk: {pk_str})")
     print()
 
     # Step 1: Confirm scan
@@ -496,27 +490,64 @@ def main():
     print("\nScanning...\n")
 
     scan_results = []
-    for table in tables:
+    for i, table in enumerate(tables, 1):
+        print(f"  [{i}/{len(tables)}] {table}...", end="", flush=True)
+
+        # Reconnect if the previous query killed the connection
+        try:
+            exec_fetchone(conn, "SELECT 1")
+        except Exception:
+            print("(reconnecting)... ", end="", flush=True)
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = connect_postgres(pg_addr)
+            print("OK ", end="", flush=True)
+
         pk_cols = get_pk_info(conn, table)
         if not pk_cols:
-            print(f"  {table}: SKIP (could not determine PK columns)")
+            print(" SKIP (could not determine PK columns)")
             continue
 
         expected = get_expected_clock_count(conn, table)
         if expected == 0:
-            expected = 1  # pk-only
+            # PK-only table — no non-PK columns, no clock entries expected
+            row_count = int(exec_fetchone(conn, f'SELECT count(*) FROM "{table}"')[0])
+            print(f" OK (PK-only, {row_count} rows)")
+            continue
 
-        total, tracked_wrong, untracked = find_offending_count(conn, table, expected, pk_cols)
-        distribution = get_clock_count_distribution(conn, table, pk_cols)
+        try:
+            result = scan_table(conn, table, expected, pk_cols)
+        except Exception as e:
+            print(f" ERROR (scan): {e}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = connect_postgres(pg_addr)
+            try:
+                result = scan_table(conn, table, expected, pk_cols)
+            except Exception as e2:
+                print(f" RETRY FAILED: {e2}")
+                continue
+
+        pks_note = ""
+        if result.get("pks_count", 0) != result["total_rows"]:
+            pks_note = f" [pks: {result['pks_count']}, base: {result['total_rows']}]"
+
+        untracked_str = str(result['untracked']) if result['untracked'] >= 0 else "?"
+
+        if result["offending"] > 0:
+            print(f" {result['offending']}/{result['total_rows']} offending (expected {expected} clk/row, max {result['max_clock']}, {result['tracked_wrong']} wrong + {untracked_str} untracked){pks_note}")
+        else:
+            print(f" OK ({result['total_rows']} rows){pks_note}")
 
         scan_results.append({
             "table": table,
             "pk_cols": pk_cols,
             "expected": expected,
-            "offending_count": total,
-            "tracked_wrong": tracked_wrong,
-            "untracked": untracked,
-            "distribution": distribution,
+            **result,
         })
 
     # Print scan summary
@@ -524,10 +555,10 @@ def main():
     needs_repair = []
     for r in scan_results:
         pk_str = ", ".join(r["pk_cols"])
-        if r["offending_count"] == 0:
+        if r["offending"] == 0:
             print(f"  {r['table']} (pk: {pk_str}): OK (all rows have {r['expected']} clock entries)")
         else:
-            print(f"  {r['table']} (pk: {pk_str}): {r['offending_count']} rows need repair")
+            print(f"  {r['table']} (pk: {pk_str}): {r['offending']} rows need repair")
             print(f"    expected {r['expected']} clock entries per row")
             print(f"    distribution:")
             for cnt, num in r["distribution"]:
@@ -544,36 +575,45 @@ def main():
         print("\nAll tables are fine — no repair needed.")
         sys.exit(0)
 
-    print(f"\n{len(needs_repair)} tables need repair, {sum(r['offending_count'] for r in needs_repair)} rows total.")
+    # Filter to only tables with untracked rows
+    needs_untracked_fix = [r for r in needs_repair if r["untracked"] > 0]
+    tracked_wrong_total = sum(r["tracked_wrong"] for r in needs_repair)
+
+    if tracked_wrong_total > 0:
+        print(f"\nNote: {tracked_wrong_total} rows have pks entries but wrong clock entry counts.")
+        print("These are NOT being repaired — they are safe to leave as-is:")
+        print("  - They don't appear in crsql_changes (invisible to replication)")
+        print("  - V2 migration handles them correctly (is_alive=1, cl defaults to 1)")
+        print("  - Future mutations will create proper clock entries")
+        print("  - Repairing them (DELETE+INSERT) would flood replication with spurious changes")
+        print()
+
+    if not needs_untracked_fix:
+        print("\nNo untracked rows found — all base rows have pks entries. Nothing to repair.")
+        sys.exit(0)
+
+    print(f"\n{len(needs_untracked_fix)} tables have untracked rows, {sum(r['untracked'] for r in needs_untracked_fix)} total.")
+    print("These rows exist in the base table but have no __crsql_pks entry.")
+    print("Repair: INSERT pks entry + sentinel clock (col_version=1) — no base table changes.")
     print()
 
     # Step 2: Confirm each table repair individually
     repaired_tables = []
-    for r in needs_repair:
+    for r in needs_untracked_fix:
         table = r["table"]
-        count = r["offending_count"]
-        expected = r["expected"]
-        tracked_wrong = r["tracked_wrong"]
         untracked_count = r["untracked"]
-        num_batches = (count + 499) // 500
+        num_batches = (untracked_count + 499) // 500
 
         print(f"Table: {table} (pk: {', '.join(r['pk_cols'])})")
-        if tracked_wrong > 0:
-            print(f"  {tracked_wrong} tracked rows with wrong clock entry count (expected {expected} per row)")
-        if untracked_count > 0:
-            print(f"  {untracked_count} untracked rows (in base table but no __crsql_pks entry)")
-        est_batches = (count + 499) // 500
-        print(f"  This will DELETE and re-INSERT ~{count} rows in ~{est_batches} batches of 500.")
-        print(f"  Each batch is its own committed transaction (smaller changesets for replication).")
-        print(f"  Triggers will fire, creating proper clock entries for all columns.")
-        print(f"  Writes go through Corrosion PG API for replication.")
+        print(f"  {untracked_count} untracked rows (~{num_batches} batches of 500)")
+        print(f"  Repair: INSERT into __crsql_pks + sentinel clock entry (no base table changes)")
         print()
 
-        if not confirm(f"  Repair {table} (~{count} rows, ~{est_batches} batches)?"):
+        if not confirm(f"  Fix untracked rows in {table} (~{untracked_count} rows)?"):
             print(f"  Skipped {table}.\n")
             continue
 
-        repaired, error = repair_table(conn, table, r["pk_cols"], expected)
+        repaired, error = repair_untracked(conn, table, r["pk_cols"])
         if error:
             print(f"  FAIL: {error}")
         else:
@@ -584,10 +624,10 @@ def main():
         print("No tables were repaired.")
         sys.exit(0)
 
-    # Summary (batches were committed individually)
+    # Summary
     print(f"Repair summary:")
     for table, count in repaired_tables:
-        print(f"  {table}: {count} rows repaired")
+        print(f"  {table}: {count} untracked rows fixed")
     print(f"  Total: {sum(c for _, c in repaired_tables)} rows")
     print()
 
@@ -599,17 +639,17 @@ def main():
         expected = get_expected_clock_count(conn, table)
         if expected == 0:
             expected = 1
-        total, _, _ = find_offending_count(conn, table, expected, pk_cols)
-        if total > 0:
-            print(f"  {table}: STILL HAS {total} offending rows")
+        result = scan_table(conn, table, expected, pk_cols)
+        if result["untracked"] > 0:
+            print(f"  {table}: STILL HAS {result['untracked']} untracked rows")
             all_ok = False
         else:
-            print(f"  {table}: OK")
+            print(f"  {table}: OK (0 untracked)")
 
     if all_ok:
         print("\nAll repairs verified successfully.")
     else:
-        print("\nSome tables still have issues — see above.")
+        print("\nSome tables still have untracked rows — see above.")
 
     conn.close()
 
