@@ -701,7 +701,7 @@ unsafe fn merge_insert(
         )
     } else {
         // Packed merge: compute vectors based on wire format
-        let (col_names, col_vrsns, seqs, unpacked_vals) = if is_v2_wire_packed {
+        let (col_names, col_vrsns, seqs, unpacked_vals, sentinel_col_vrsn, sentinel_seq) = if is_v2_wire_packed {
             let col_names: Vec<&str> = insert_col.split('\0').collect();
             let col_vrsns: Vec<i64> = unpack_varints(insert_col_vrsn_raw.blob())?;
             let seqs: Vec<i64> = unpack_varints(insert_seq_raw.blob())?;
@@ -716,14 +716,17 @@ unsafe fn merge_insert(
                 *errmsg = err.into_raw();
                 return Err(ResultCode::ERROR);
             }
-            (col_names, col_vrsns, seqs, unpacked_vals)
+            // V2 wire doesn't send a separate sentinel — it's implied by the CL.
+            (col_names, col_vrsns, seqs, unpacked_vals, None, None)
         } else {
             // V1 wire format: convert to single-element (or empty) vectors
             let insert_col_vrsn = insert_col_vrsn_raw.int64();
             let insert_seq = insert_seq_raw.int64();
 
             if insert_col == crate::c::INSERT_SENTINEL {
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                // Sentinel-only change (PK-only table insert, or sentinel-only row).
+                // Pass col_version and seq through for the sentinel clock entry at col_id=0.
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(insert_col_vrsn), Some(insert_seq))
             } else {
                 let col_val = sqlite_value_to_column_value(insert_val);
                 (
@@ -731,6 +734,8 @@ unsafe fn merge_insert(
                     vec![insert_col_vrsn],
                     vec![insert_seq],
                     vec![col_val],
+                    None,
+                    None,
                 )
             }
         };
@@ -749,6 +754,8 @@ unsafe fn merge_insert(
             insert_site_id,
             insert_cl,
             insert_ts,
+            sentinel_col_vrsn,
+            sentinel_seq,
         )
     };
 
@@ -1528,6 +1535,10 @@ pub unsafe fn sqlite_value_to_column_value(val: *mut sqlite::value) -> ColumnVal
 /// V2 packed merge: process a full V2 wire packed row in one pass.
 /// Looks up local key/CL once, handles resurrection and skipped-delete cleanup,
 /// then applies each column change.
+///
+/// `sentinel_col_vrsn` / `sentinel_seq`: For V1 wire sentinel-only changes
+/// (PK-only table inserts), the incoming col_version and seq for the sentinel
+/// clock entry at col_id=0. None for V2 wire or non-sentinel V1 wire changes.
 #[allow(clippy::too_many_arguments)]
 unsafe fn v2_packed_merge(
     db: *mut sqlite3,
@@ -1543,6 +1554,8 @@ unsafe fn v2_packed_merge(
     site_id: &[u8],
     incoming_cl: i64,
     ts: i64,
+    sentinel_col_vrsn: Option<i64>,
+    sentinel_seq: Option<i64>,
 ) -> Result<ResultCode, ResultCode> {
     // ts check is done at the top of merge_insert
     let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
@@ -1569,6 +1582,40 @@ unsafe fn v2_packed_merge(
             &unpacked_vals[i], col_vrsns[i], db_vrsn, site_id, seqs[i], ts,
             unpacked_pks, col_id_bits,
         )?;
+    }
+
+    // PK-only tables: create/merge sentinel clock entry at col_id=0.
+    // The zero-fill in v2_ensure_alive_row_at_cl reads from v2_col_map which is
+    // empty for PK-only tables, so no clock entry is created there.
+    // The col_names loop above is also empty (PK-only sends no column changes).
+    // Without this, the row exists in v2_pks but is invisible to crsql_changes.
+    //
+    // Uses a cached upsert with merge_equal baked in:
+    // - On resurrection (incoming_cl > local_cl): clocks were nuked, so this is a fresh INSERT.
+    // - On equal CL: reconcile by site_id when mergeEqualValues is enabled.
+    //   The incoming col_version, site_id, db_version, seq, and ts are always from
+    //   the incoming change (V1 wire sentinel carries all of these).
+    if tbl_info.non_pks.is_empty() && col_names.is_empty() {
+        let cell_key = (local_key << col_id_bits) | 0;
+        let incoming_col_vrsn = sentinel_col_vrsn.unwrap_or(1);
+        let seq = sentinel_seq.unwrap_or(0);
+        let site_ordinal = get_site_ordinal_or_zero(ext_data, site_id)?;
+        let merge_equal = unsafe { (*ext_data).mergeEqualValues };
+
+        let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
+        let v2 = v2_ref.as_mut().unwrap();
+        let mut stmt = v2.sentinel_merge_upsert()?;
+        stmt.bind_int64(1, cell_key)?;
+        stmt.bind_int64(2, incoming_col_vrsn)?;
+        stmt.bind_int64(3, site_ordinal)?;
+        stmt.bind_int64(4, db_vrsn)?;
+        stmt.bind_int64(5, seq)?;
+        stmt.bind_int64(6, ts)?;
+        if merge_equal == 1 {
+            // Bind incoming site_id blob for the WHERE clause comparison
+            stmt.bind_blob(7, site_id, sqlite::Destructor::STATIC)?;
+        }
+        stmt.step()?;
     }
 
     Ok(ResultCode::OK)

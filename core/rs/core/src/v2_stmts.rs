@@ -87,6 +87,9 @@ pub struct V2Stmts {
     clock_zero_fill: ManagedStmt,
     /// Per-column merge upsert with crsql_change_wins. Keyed by column name.
     clock_merge_upserts: alloc::collections::BTreeMap<String, ManagedStmt>,
+    /// Sentinel merge upsert for PK-only tables (col_id=0). merge_equal baked in.
+    /// Only prepared for PK-only tables (non_pks.is_empty()).
+    sentinel_merge_upsert: Option<ManagedStmt>,
 
     // --- v2_col_map ---
     /// SELECT col_id FROM v2_col_map WHERE col_name = ?
@@ -513,6 +516,32 @@ impl V2Stmts {
                 }
                 map
             },
+            sentinel_merge_upsert: if tbl_info.non_pks.is_empty() {
+                let merge_where = if merge_equal == 1 {
+                    format!(
+                        "WHERE excluded.col_version > col_version \
+                        OR (excluded.col_version = col_version \
+                            AND ? > (SELECT site_id FROM crsql_site_id WHERE ordinal = \"{escaped}{suffix}\".site_id))",
+                        escaped = escaped,
+                        suffix = consts::V2_CLOCK_SUFFIX,
+                    )
+                } else {
+                    "WHERE excluded.col_version > col_version".to_string()
+                };
+                Some(db.prepare_v3(&format!(
+                    "INSERT INTO \"{escaped}{suffix}\" (cell_key, col_version, site_id, db_version, seq, ts) \
+                    VALUES (?, ?, ?, ?, ?, ?) \
+                    ON CONFLICT(cell_key) DO UPDATE SET \
+                    col_version = excluded.col_version, site_id = excluded.site_id, \
+                    db_version = excluded.db_version, seq = excluded.seq, ts = excluded.ts \
+                    {merge_where}",
+                    escaped = escaped,
+                    suffix = consts::V2_CLOCK_SUFFIX,
+                    merge_where = merge_where,
+                ), sqlite::PREPARE_PERSISTENT)?)
+            } else {
+                None
+            },
             col_id_lookup,
             col_ids_all,
             base_insert,
@@ -554,6 +583,12 @@ impl V2Stmts {
         col_name: &str,
     ) -> Result<StmtGuard, ResultCode> {
         Ok(StmtGuard::new(self.clock_merge_upserts.get_mut(col_name).ok_or(ResultCode::ERROR)?))
+    }
+
+    /// Get the sentinel merge upsert for PK-only tables. Only available when
+    /// non_pks.is_empty() (prepared at construction time with merge_equal baked in).
+    pub fn sentinel_merge_upsert(&mut self) -> Result<StmtGuard, ResultCode> {
+        self.sentinel_merge_upsert.as_mut().map(StmtGuard::new).ok_or(ResultCode::ERROR)
     }
 
     // --- Getters ---

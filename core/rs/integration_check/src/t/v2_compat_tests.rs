@@ -1,4 +1,5 @@
 extern crate crsql_bundle;
+use alloc::vec::Vec;
 use libc_print::libc_println;
 use sqlite::{Connection, Destructor, ManagedConnection, ResultCode};
 use sqlite_nostd as sqlite;
@@ -838,6 +839,130 @@ fn v2_wire_non_rowid_delete() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// Test: PK-only table forward sync (A→B→C).
+/// Verifies that remote merge creates the col_id=0 sentinel clock entry,
+/// so the row appears in crsql_changes on the receiving node and can be
+/// forwarded to a third node.
+fn v2_pk_only_forward_sync() -> Result<(), ResultCode> {
+    libc_println!("=== v2_pk_only_forward_sync START ===");
+    let db_a = crate::opendb()?;
+    let db_b = crate::opendb()?;
+    let db_c = crate::opendb()?;
+
+    for db in [&db_a.db, &db_b.db, &db_c.db] {
+        db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL)")?;
+        db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.exec_safe("SELECT crsql_as_crr('foo')")?;
+    }
+
+    migrate_to_v2(&db_a.db)?;
+    migrate_to_v2(&db_b.db)?;
+    migrate_to_v2(&db_c.db)?;
+
+    // Insert on A
+    db_a.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db_a.db.exec_safe("INSERT INTO foo (id) VALUES (1)")?;
+
+    // Sync A → B
+    sync_left_to_right(&db_a.db, &db_b.db, 0)?;
+
+    // B should have the row in base table
+    let stmt = db_b.db.prepare_v2("SELECT count(*) FROM foo WHERE id = 1")?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int(0), 1, "db_b should have id=1 in base table");
+
+    // B should have a clock entry at col_id=0 (sentinel) so the row appears in crsql_changes
+    let stmt = db_b.db.prepare_v2("SELECT count(*) FROM foo__crsql_v2_clock")?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int(0), 1, "db_b should have 1 clock entry (sentinel at col_id=0), got {}", stmt.column_int(0));
+
+    // B's crsql_changes should emit the row
+    let stmt = db_b.db.prepare_v2("SELECT count(*) FROM crsql_changes WHERE \"table\" = 'foo'")?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int(0), 1, "db_b crsql_changes should have 1 row for foo");
+
+    // Sync B → C (forward)
+    sync_left_to_right(&db_b.db, &db_c.db, 0)?;
+
+    // C should have the row
+    let stmt = db_c.db.prepare_v2("SELECT count(*) FROM foo WHERE id = 1")?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int(0), 1, "db_c should have id=1 after forward sync");
+
+    libc_println!("=== v2_pk_only_forward_sync PASS ===");
+    Ok(())
+}
+
+/// Test: PK-only table site_id tie-break at equal CL.
+/// Two nodes independently insert the same PK-only row (CL=1).
+/// With merge-equal-values enabled, the node with the higher site_id blob
+/// should win the sentinel clock entry.
+fn v2_pk_only_site_id_tiebreak() -> Result<(), ResultCode> {
+    libc_println!("=== v2_pk_only_site_id_tiebreak START ===");
+    let db_a = crate::opendb()?;
+    let db_b = crate::opendb()?;
+
+    for db in [&db_a.db, &db_b.db] {
+        db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL)")?;
+        db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.exec_safe("SELECT crsql_as_crr('foo')")?;
+        // Enable site_id tie-break on both nodes
+        db.exec_safe("SELECT crsql_config_set('merge-equal-values', 1)")?;
+    }
+
+    migrate_to_v2(&db_a.db)?;
+    migrate_to_v2(&db_b.db)?;
+
+    // Get site_ids for comparison
+    let siteid_a: Vec<u8> = {
+        let stmt = db_a.db.prepare_v2("SELECT crsql_site_id()")?;
+        stmt.step()?;
+        stmt.column_blob(0)?.to_vec()
+    };
+    let siteid_b: Vec<u8> = {
+        let stmt = db_b.db.prepare_v2("SELECT crsql_site_id()")?;
+        stmt.step()?;
+        stmt.column_blob(0)?.to_vec()
+    };
+
+    // Both insert the same PK-only row (CL=1 on each)
+    db_a.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db_a.db.exec_safe("INSERT INTO foo (id) VALUES (1)")?;
+    db_b.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db_b.db.exec_safe("INSERT INTO foo (id) VALUES (1)")?;
+
+    // Sync A → B
+    sync_left_to_right(&db_a.db, &db_b.db, 0)?;
+
+    // B should still have the row
+    let stmt = db_b.db.prepare_v2("SELECT count(*) FROM foo WHERE id = 1")?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int(0), 1, "db_b should have id=1");
+
+    // Check which site_id won the sentinel clock entry on db_b
+    // The sentinel is at col_id=0 (cell_key & mask == 0)
+    let stmt = db_b.db.prepare_v2(
+        "SELECT s.site_id FROM foo__crsql_v2_clock AS c \
+         JOIN crsql_site_id AS s ON c.site_id = s.ordinal \
+         WHERE c.cell_key & 255 = 0"
+    )?;
+    stmt.step()?;
+    let winning_site_id: Vec<u8> = stmt.column_blob(0)?.to_vec();
+
+    // The site_id with the higher blob value should win
+    let a_wins = siteid_a > siteid_b;
+    let expected_winner = if a_wins { &siteid_a[..] } else { &siteid_b[..] };
+    assert_eq!(
+        &winning_site_id[..], expected_winner,
+        "db_b sentinel should have the winning site_id (higher blob value). \
+         a={:?} b={:?} winner={:?}",
+        siteid_a, siteid_b, winning_site_id
+    );
+
+    libc_println!("=== v2_pk_only_site_id_tiebreak PASS ===");
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), ResultCode> {
     v2_basic_insert_sync()?;
     v2_update_sync()?;
@@ -846,6 +971,8 @@ pub fn run_suite() -> Result<(), ResultCode> {
     v2_pk_only_delete_sync()?;
     v2_pk_only_reinsert()?;
     v2_pk_only_bidirectional()?;
+    v2_pk_only_forward_sync()?;
+    v2_pk_only_site_id_tiebreak()?;
     v2_composite_pk_sync()?;
     v2_sync_bit_honored()?;
     v2_bidirectional_sync()?;
