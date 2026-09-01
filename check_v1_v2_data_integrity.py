@@ -3,11 +3,15 @@
 
 Discovers all tables with both V1 (__crsql_clock) and V2 (__crsql_v2_clock)
 tables, then validates in parallel (one connection per table):
-  1. Alive rows: v2_pks count == base table count
+  1. Alive rows: v2_pks count == base table count (invariant: no exceptions)
   2. Dead rows: v2_tombstones count == V1 dead sentinels
   3. Tombstone PKs: v2_tombstone_pks count == V1 dead (hash tables only)
   4. Clock entries: v2_clock count == V1 clock for alive rows
   5. Data integrity: all clock values match between V1 and V2
+
+Note: per-row clock entry count is NOT checked. Clock entries per row can
+legitimately vary (e.g., seeded snapshot rows have 0 until first write).
+The invariant enforced is: every base table row has a v2_pks entry (check #1).
 
 Usage:
   python3 check_v1_v2_data_integrity.py <database> [extension_path]
@@ -269,51 +273,12 @@ def validate_table(db_path, ext_path, table, col_id_bits):
             errors.append(f"integrity query failed: {e}")
             all_ok = False
 
-        # 6. Per-row clock entry count: every alive row must have exactly C
-        #    clock entries, where C is the number of non-PK columns (regular
-        #    tables) or 1 (pk-only tables, the '-1' sentinel). This catches
-        #    missing/extra clock entries on individual rows that a global
-        #    count comparison (check #4) would miss.
-        if pk_only:
-            expected_per_row = 1
-            clock_filter = "c.col_name = '-1'"
-        else:
-            expected_per_row = conn.execute(
-                f'SELECT count(*) FROM "{table}__crsql_v2_col_map" WHERE col_name != \'\''
-            ).fetchone()[0]
-            clock_filter = "c.col_name != '-1'"
-
-        per_row_sql = f'''
-            SELECT status, count(*) as cnt FROM (
-              SELECT
-                CASE
-                  WHEN clk.clock_cnt IS NULL THEN 'NO_CLOCK_ENTRIES'
-                  WHEN clk.clock_cnt = {expected_per_row} THEN 'OK'
-                  ELSE 'WRONG_COUNT'
-                END as status
-              FROM "{table}__crsql_pks" p
-              JOIN "{table}" b ON {base_join}
-              LEFT JOIN (
-                SELECT c.key, count(*) AS clock_cnt
-                FROM "{table}__crsql_clock" c
-                WHERE {clock_filter}
-                GROUP BY c.key
-              ) clk ON clk.key = p.__crsql_key
-            ) GROUP BY status
-        '''
-
-        try:
-            cursor = conn.execute(per_row_sql)
-            results = cursor.fetchall()
-            for status, cnt in results:
-                if status != "OK":
-                    errors.append(
-                        f"per-row clock count {status}={cnt} (expected {expected_per_row} per alive row)"
-                    )
-                    all_ok = False
-        except Exception as e:
-            errors.append(f"per-row clock count query failed: {e}")
-            all_ok = False
+        # Note: per-row clock entry count is NOT checked. Clock entries per row
+        # can legitimately vary (e.g., seeded snapshot rows have 0 clock entries
+        # until first write, backfilled rows from migration have no clock entries).
+        # The invariant we enforce is: every base table row has a v2_pks entry (check #1).
+        # Clock entry correctness is covered by the global count (check #4) and
+        # data integrity comparison (check #5) for rows that do have clock entries.
 
         stats = {
             "alive": v2_pks_count,

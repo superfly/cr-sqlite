@@ -620,7 +620,11 @@ unsafe fn migrate_v1_to_v2_chunk(
             remaining_estimate -= processed;
             crate::debug::debug_log(&format!("migrate_chunk: processed={} remaining_estimate={}", processed, remaining_estimate));
             if processed == 0 {
-                // Chunk was empty — migration complete for this table
+                // Chunk was empty — migration complete for this table.
+                // Backfill v2_pks for untracked rows: base table rows that have no
+                // __crsql_pks entry (and thus no v2_pks entry after migration).
+                // These are inserted with CL=1 (alive, first version).
+                backfill_untracked_v2_pks(db, tbl_info, &escaped)?;
                 crate::util::clear_master_key(db, &progress_key)?;
                 crate::util::clear_master_key(db, &total_key)?;
                 db.exec_safe("RELEASE migration_chunk")?;
@@ -641,6 +645,8 @@ unsafe fn migrate_v1_to_v2_chunk(
                 let actual = verify_stmt.column_int64(0);
                 drop(verify_stmt);
                 if actual == 0 {
+                    // Migration complete — backfill untracked rows
+                    backfill_untracked_v2_pks(db, tbl_info, &escaped)?;
                     crate::util::clear_master_key(db, &progress_key)?;
                     crate::util::clear_master_key(db, &total_key)?;
                     db.exec_safe("RELEASE migration_chunk")?;
@@ -671,4 +677,76 @@ unsafe fn migrate_v1_to_v2_chunk(
             Err(e)
         }
     }
+}
+
+/// Backfill v2_pks entries for untracked rows: base table rows that have no
+/// v2_pks entry (because they had no __crsql_pks entry in V1). Inserts them
+/// with CL=1 (alive, first version). This maintains the invariant that every
+/// base table row has a v2_pks entry.
+///
+/// Uses INSERT OR IGNORE so rows already migrated from V1 are skipped.
+/// For rowid-key tables, __crsql_key = rowid. For non-rowid tables, the
+/// auto-increment __crsql_key is assigned by the INSERT.
+/// For hash mode, hashed_pk is computed from the PK columns.
+unsafe fn backfill_untracked_v2_pks(
+    db: *mut sqlite3,
+    tbl_info: &TableInfo,
+    escaped: &str,
+) -> Result<(), ResultCode> {
+    let (pk_cols_list, _) = crate::v2_stmts::pk_cols_and_values(&tbl_info.pks);
+    let pk_cols_base = crate::util::as_identifier_list(&tbl_info.pks, Some("b."))?;
+
+    let (pks_cols, pks_select) = if tbl_info.skip_hash && tbl_info.key_is_rowid {
+        ("__crsql_key, cl".to_string(), "b.rowid, 1".to_string())
+    } else if tbl_info.skip_hash {
+        (format!("{}, cl", pk_cols_list), format!("{}, 1", pk_cols_base))
+    } else if tbl_info.key_is_rowid {
+        (
+            "__crsql_key, hashed_pk, cl".to_string(),
+            format!("b.rowid, crsql_hash_pk({}), 1", pk_cols_base),
+        )
+    } else {
+        (
+            format!("{}, hashed_pk, cl", pk_cols_list),
+            format!("{}, crsql_hash_pk({}), 1", pk_cols_base, pk_cols_base),
+        )
+    };
+
+    let where_clause = if tbl_info.skip_hash && tbl_info.key_is_rowid {
+        let rowid_alias = crate::util::escape_ident(&tbl_info.rowid_alias);
+        format!("vp.__crsql_key = b.\"{}\"", rowid_alias)
+    } else if tbl_info.skip_hash {
+        format!(
+            "vp.\"{}\" = b.\"{}\"",
+            crate::util::escape_ident(&tbl_info.skip_hash_pk_col),
+            crate::util::escape_ident(&tbl_info.skip_hash_pk_col)
+        )
+    } else {
+        format!("vp.hashed_pk = crsql_hash_pk({})", pk_cols_base)
+    };
+
+    let sql = format!(
+        "INSERT OR IGNORE INTO \"{escaped}{v2_pks}\" ({pks_cols})
+         SELECT {pks_select}
+         FROM \"{escaped}\" b
+         WHERE NOT EXISTS (
+           SELECT 1 FROM \"{escaped}{v2_pks}\" vp
+           WHERE {where_clause}
+         )",
+        escaped = escaped,
+        v2_pks = consts::V2_PKS_SUFFIX,
+        pks_cols = pks_cols,
+        pks_select = pks_select,
+        where_clause = where_clause,
+    );
+
+    db.exec_safe(&sql)?;
+    let inserted = db.changes64();
+    if inserted > 0 {
+        crate::debug::debug_log(&format!(
+            "backfill_untracked_v2_pks: {} inserted {} untracked rows",
+            tbl_info.tbl_name, inserted
+        ));
+    }
+    Ok(())
 }
