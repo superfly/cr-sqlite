@@ -42,54 +42,24 @@ Usage:
 """
 import sys
 import os
-import re
 
-import psycopg
-
-# TOML parsing — try stdlib first (Python 3.11+), fall back to manual parse
 try:
-    import tomllib
-    HAS_TOMLLIB = True
+    import psycopg
 except ImportError:
-    HAS_TOMLLIB = False
+    print("Error: psycopg not installed.")
+    print("Install: pip install 'psycopg[binary]'")
+    sys.exit(1)
 
-
-def parse_toml_manual(path):
-    """Minimal TOML parser for the fields we need: [api], api.pg.addr, db.path."""
-    result = {"api": {}, "db": {}}
-    current_section = None
-    with open(path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            # Section header
-            m = re.match(r'^\[([^\]]+)\]$', line)
-            if m:
-                section = m.group(1)
-                parts = section.split(".")
-                if parts[0] == "api":
-                    current_section = "api"
-                elif parts[0] == "db":
-                    current_section = "db"
-                else:
-                    current_section = None
-                continue
-            # Key = value
-            m = re.match(r'^(\S+)\s*=\s*(.+)$', line)
-            if m and current_section:
-                key = m.group(1)
-                val = m.group(2).strip()
-                if (val.startswith('"') and val.endswith('"')) or \
-                   (val.startswith("'") and val.endswith("'")):
-                    val = val[1:-1]
-                if "." in key and current_section == "api":
-                    parts = key.split(".", 1)
-                    if parts[0] == "pg":
-                        result["api"].setdefault("pg", {})[parts[1]] = val
-                        continue
-                result[current_section][key] = val
-    return result
+try:
+    import tomllib  # Python 3.11+
+except ImportError:
+    try:
+        import tomli as tomllib  # pip install tomli (backport for < 3.11)
+    except ImportError:
+        print("Error: no TOML parser available.")
+        print("Python 3.11+ has tomllib built-in.")
+        print("For older Python: pip install tomli")
+        sys.exit(1)
 
 
 def load_config(config_path):
@@ -98,11 +68,8 @@ def load_config(config_path):
         print(f"Error: config not found: {config_path}")
         sys.exit(1)
 
-    if HAS_TOMLLIB:
-        with open(config_path, "rb") as f:
-            config = tomllib.load(f)
-    else:
-        config = parse_toml_manual(config_path)
+    with open(config_path, "rb") as f:
+        config = tomllib.load(f)
 
     api = config.get("api", {})
     pg = api.get("pg", {})
