@@ -1,26 +1,21 @@
 #!/usr/bin/env python3
-"""Backfill missing V1 clock entries by delete+reinserting offending rows.
+"""Fix untracked rows in Corrosion CRR tables.
 
-For each CRR table, finds rows that need repair:
-  1. Tracked but wrong: rows in __crsql_pks with wrong clock entry count
-     (fewer or more than expected — one per non-PK column, or 1 for pk-only)
-  2. Untracked: rows in the base table with no __crsql_pks entry at all
+Untracked rows are rows that exist in the base table but have no __crsql_pks
+entry — cr-sqlite has no metadata for them. This script finds and repairs them
+by inserting a pks entry and a sentinel clock entry (col_name='-1',
+col_version=1) to mark the row as alive. It does NOT touch the base table data
+(no DELETE/INSERT), so it doesn't flood replication with spurious changes.
 
-For each such table, processes offending rows in batches of 500.
-Each batch is its own committed transaction:
-  1. Copy batch rows to a temp table
-  2. DELETE them (triggers fire → tombstone with even CL)
-  3. INSERT them back (triggers fire → alive with odd CL, all clock entries)
-  4. Drop the temp table
-  5. Commit
+Tracked-but-wrong rows (rows in __crsql_pks with wrong clock entry counts) are
+reported but NOT repaired — they are safe to leave as-is:
+  - They don't appear in crsql_changes (invisible to replication)
+  - V2 migration handles them correctly (is_alive=1, cl defaults to 1)
+  - Future mutations will create proper clock entries
+  - Repairing them (DELETE+INSERT) would flood replication with spurious changes
 
-Both delete and insert in a batch share the same db_version (same transaction),
-so peers fetching changes at that db_version see: delete absorbed by insert.
-Net effect: row is alive with all columns properly clocked at col_version=1.
-The higher CL ensures this write wins over stale state on peers.
-
-Batching keeps changesets small so corrosion doesn't need to process
-one huge transaction per table.
+For each table with untracked rows, processes them in batches of 500.
+Each batch is its own committed transaction.
 
 Writes go through the Corrosion Postgres wire-protocol API so they
 replicate properly to peers. Direct SQLite writes would not replicate.
@@ -35,7 +30,7 @@ The script is interactive and requires confirmation before:
   - Repairing each table (shows batch count)
 
 Usage:
-  python3 backfill_v1_clock_entries.py <config_path>
+  python3 fix_corrosion_untracked_rows.py <config_path>
 
   config_path: path to corrosion config.toml (e.g., /etc/corrosion2/config.toml)
 """

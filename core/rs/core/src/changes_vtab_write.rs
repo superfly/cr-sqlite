@@ -1064,29 +1064,19 @@ unsafe fn v2_ensure_alive_row_at_cl(
         } else if local_cl > 0 {
             v2_nuke_tombstone(db, &escaped, tbl_info, hashed_pk, unpacked_pks, ext_data)?;
         }
-        // Create fresh v2_pks entry with new CL
+        // Create fresh v2_pks entry with new CL.
+        // No zero-fill: only create clock entries for columns actually received
+        // in the incoming change (handled by the col_names loop in v2_packed_merge).
+        // This is safe because:
+        // - The sender's INSERT trigger created clock entries for all columns, so
+        //   the feed sends all column values. The col_names loop will create entries
+        //   for each received column.
+        // - For seeded rows (CL=1 locally, no clock entries), only received columns
+        //   get clock entries. Unreceived columns keep their snapshot values and
+        //   are invisible to crsql_changes until modified locally.
+        // - PK-only tables get a sentinel at col_id=0 from the sentinel_merge_upsert
+        //   in v2_packed_merge.
         let new_key = v2_insert_pk_row(db, ext_data, &escaped, tbl_info, unpacked_pks, hashed_pk, incoming_cl)?;
-        // Create zero-version clock entries for all mapped columns so they appear in sync logs.
-        // Use the incoming change's site_id and db_version since it created this row.
-        // seq=0 for placeholders; the packed column updates will overwrite specific entries.
-        //
-        // col_version=0 here (not 1 like local inserts) because these are placeholders
-        // for columns we haven't received yet. The actual column changes arrive as
-        // separate change rows and overwrite specific entries with col_version=1+.
-        // With V1 wire format, col_version=0 entries appear in the feed but lose to
-        // any local col_version > 0 on merge — safe but potentially wasteful.
-        //
-        // TODO(0.19): In V2-wire-only mode, we can skip zero-fill entirely and only
-        // create clock entries for columns that were actually received in the change.
-        let col_id_bits = consts::CRSQL_COL_ID_BITS as i64;
-        let base = new_key << col_id_bits;
-        let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
-        let v2 = v2_ref.as_mut().unwrap();
-        let mut clock_stmt = v2.clock_zero_fill();
-        clock_stmt.bind_int64(1, base)?;
-        clock_stmt.bind_int64(2, incoming_site_id)?;
-        clock_stmt.bind_int64(3, incoming_db_version)?;
-        clock_stmt.step()?;
         new_key
     } else {
         // incoming_cl == local_cl — row must already exist
@@ -1485,6 +1475,8 @@ unsafe fn v2_merge_insert_tombstone(
 
     // If the row was alive, nuke its local state (clocks, v2_pks, base table row).
     // Also save PK values into v2_tombstone_pks for future lookups (hash mode only).
+    // For seeded snapshots (local_key=None but row exists in base table), we still
+    // need to delete the base table row and save PK values for tombstone_pks.
     if let Some(local_key) = local_key {
         // Look up PK values once — used for both tombstone_pks insert and v2_nuke_local_row.
         let mut local_pks: Vec<ColumnValue> = Vec::new();

@@ -4,6 +4,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec;
+use alloc::vec::Vec;
 
 use sqlite_nostd as sqlite;
 use sqlite_nostd::{sqlite3, Connection, Destructor, ResultCode};
@@ -301,11 +302,11 @@ pub fn v2_after_update(
         .map_err(|e| format!("failed to get v2 stmts: {:?}", e))?;
     let v2_stmts = v2_stmts_ref.as_mut().unwrap();
 
-    // Lookup __crsql_key — row must be alive (in v2_pks). Dead or missing = error.
+    // Lookup __crsql_key — row must be alive (in v2_pks).
     let key = match lookup_row_state(v2_stmts, pks_new, &hashed_pk, !skip_hash)? {
         RowState::Alive(key, _) => key,
         RowState::Dead(_) => return Err("row is dead (in tombstones) — cannot update a deleted row".to_string()),
-        RowState::NotFound => return Err("row not found in v2_pks for update".to_string()),
+        RowState::NotFound => return Err("row not found in v2_pks — cannot update untracked row".to_string()),
     };
 
     // Update clock entries for each changed column
@@ -347,11 +348,12 @@ pub fn v2_after_delete(
         .map_err(|e| format!("failed to get v2 stmts: {:?}", e))?;
     let v2_stmts = v2_stmts_ref.as_mut().unwrap();
 
-    // Lookup __crsql_key and cl — row must be alive (in v2_pks). Dead or missing = no-op.
+    // Lookup __crsql_key and cl — row must be alive (in v2_pks).
+    // Dead = already tombstoned, no-op.
     let (key, cl) = match lookup_row_state(v2_stmts, pks_old, &hashed_pk, !skip_hash)? {
         RowState::Alive(key, cl) => (key, cl),
-        // Row is already dead (in tombstones) or never tracked — nothing to do.
-        RowState::Dead(_) | RowState::NotFound => return Ok(ResultCode::OK),
+        RowState::Dead(_) => return Ok(ResultCode::OK),
+        RowState::NotFound => return Ok(ResultCode::OK),
     };
 
     let new_cl = cl + 1;

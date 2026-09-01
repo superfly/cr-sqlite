@@ -503,3 +503,70 @@ The `crsql_changes` virtual table provides a unified view across all CRR clock t
 - [Time, Clocks, and the Ordering of Events in a Distributed System](https://lamport.azurewebsites.net/pubs/time-clocks.pdf)
 - [Replicated abstract data types: Building blocks for collaborative applications](http://csl.skku.edu/papers/jpdc11.pdf)
 - [CRDTs for Brrr](https://josephg.com/blog/crdts-go-brrr/)
+
+## Seeding a Cluster from a Shared Snapshot
+
+When all nodes in a cr-sqlite cluster are initialized from the same database snapshot (e.g., via `sqlite3 .dump` or file copy), you can safely clear the crsql clock tables before snapshotting to save space. As long as every node starts with the exact same snapshot, the databases will remain in sync. Clock entries are regenerated automatically on the first write to each row — no data is lost.
+
+This is a first-class workflow for bootstrapping a cluster from a common starting point. It is useful when:
+- All nodes start from the same baseline data (e.g., a schema + reference data dump)
+- You want to minimize snapshot size by stripping replication metadata
+- You need to reset a node's replication state without losing base table data
+
+### Cleanup SQL
+
+Before taking the snapshot, run the following cleanup SQL on the seed database. This strips all replication metadata while preserving the base table data.
+
+**V2 mode** (metadata-use-version = 2):
+
+```sql
+-- For each CRR table "foo" in your schema:
+-- Delete clock entries (makes rows invisible to crsql_changes until written to)
+DELETE FROM foo__crsql_v2_clock;
+-- Delete tombstones (each node agrees on what's deleted, so no need to track this)
+DELETE FROM foo__crsql_v2_tombstones;
+DELETE FROM foo__crsql_v2_tombstones_pks; -- Optional in hash mode
+-- Keep foo__crsql_v2_pks intact — it stores row identity and CL (causal length).
+-- Preserving it ensures proper conflict resolution and efficient local writes
+-- (only changed columns get new clock entries, not all columns).
+-- Reset CL to 1 for every row (alive, first version) since clock entries are gone.
+UPDATE foo__crsql_v2_pks SET cl = 1;
+
+-- Reset the db_version floor so new changes start from db_version 1.
+-- pre_compact_dbversion is a floor in crsql_master that prevents db_version
+-- from regressing after clock-table compaction (e.g., ALTER TABLE).
+-- Without this reset, new writes would inherit a stale high db_version
+-- from before the snapshot cleanup, breaking sync from db_version 0.
+DELETE FROM crsql_master WHERE key = 'pre_compact_dbversion';
+```
+
+**V1 mode** (metadata-use-version = 1):
+
+```sql
+-- For each CRR table "foo" in your schema:
+DELETE FROM foo__crsql_clock;
+DELETE FROM foo__crsql_pks;
+
+-- Reset the db_version tracker
+DELETE FROM crsql_master WHERE key = 'pre_compact_dbversion';
+```
+
+**Dual-write mode** (metadata-write-version = 2, metadata-use-version = 1): clear both V1 and V2 tables.
+
+### How It Works
+
+1. **Snapshot**: All nodes start from the same database file (or dump) with clock entries and tombstones cleared. `v2_pks` is preserved with CL reset to 1, so every row is tracked as alive at causal length 1.
+2. **First write**: When a node updates a seeded row, cr-sqlite sees the existing `v2_pks` entry (CL=1) and creates a clock entry only for the changed column(s) — a normal update, not a full insert.
+3. **Propagation**: The changes appear in `crsql_changes` and propagate to other nodes normally.
+4. **Deletes**: Deleting a seeded row bumps CL from 1 to 2 (even = dead), creating a tombstone that propagates to other nodes and deletes the row there too.
+5. **Convergence**: All nodes converge to the same state as changes propagate. Unmodified seeded rows remain invisible to `crsql_changes` until they are written to.
+
+### Backfilling Clock Entries
+
+If you later need full clock entries for all existing rows (e.g., to allow a new node to join without the snapshot), you can backfill them by delete+reinserting each row (which fires triggers that recreate clock entries).
+
+### Important Notes
+
+- Every node in the cluster MUST start from the same snapshot. The initial rows are not replicated — crsql has no clock entries for them, so they don't appear in `crsql_changes`.
+- A node that joins without the snapshot will not receive the existing data. New nodes must either be seeded from the same snapshot or receive a full snapshot from an existing node before participating in replication.
+- After cleanup, ensure `metadata-use-version` is set correctly on each node before opening connections (it is stored in `crsql_master` and loaded automatically).
