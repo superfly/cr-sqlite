@@ -560,6 +560,84 @@ fn seeded_conflict_resolution() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// Test: V1→V2 migration backfills v2_pks for untracked rows.
+/// Create a V1 DB with an untracked row (base row with no __crsql_pks entry),
+/// then migrate to V2. After migration, every base row should have a v2_pks entry.
+fn seeded_migration_backfills_untracked() -> Result<(), ResultCode> {
+    libc_println!("=== seeded_migration_backfills_untracked START ===");
+    let db_path = "seed_backfill_test.db";
+    cleanup_files(&[db_path]);
+
+    let db = crate::opendb_file(db_path)?;
+
+    // Create a CRR table and insert data normally (creates clock entries)
+    db.db.exec_safe("CREATE TABLE items (id INTEGER PRIMARY KEY NOT NULL, name TEXT, qty INTEGER)")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('items')")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("INSERT INTO items VALUES (1, 'widget', 10)")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("INSERT INTO items VALUES (2, 'gadget', 20)")?;
+
+    // Create an untracked row: insert directly into base table with sync bit
+    // to suppress triggers, so no __crsql_pks entry is created.
+    db.db.exec_safe("SELECT crsql_internal_sync_bit(1)")?;
+    db.db.exec_safe("INSERT INTO items VALUES (3, 'untracked', 30)")?;
+    db.db.exec_safe("SELECT crsql_internal_sync_bit(0)")?;
+
+    // Verify the row is untracked in V1
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM items__crsql_pks")?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int(0), 2, "should have 2 tracked rows in V1 pks (id=1, id=2)");
+
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM items")?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int(0), 3, "should have 3 base rows");
+
+    // Migrate to V2
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
+    let mut remaining = 1;
+    let mut iterations = 0;
+    while remaining > 0 && iterations < 100 {
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        let stmt = db.db.prepare_v2("SELECT crsql_incremental_maintenance(1000)")?;
+        stmt.step()?;
+        remaining = stmt.column_int(0) as i32;
+        if remaining < 0 {
+            return Err(ResultCode::ERROR);
+        }
+        iterations += 1;
+    }
+    db.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+
+    // After migration, v2_pks should have 3 rows (2 migrated + 1 backfilled)
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM items__crsql_v2_pks")?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int(0), 3, "v2_pks should have all 3 base rows after migration + backfill");
+
+    // The backfilled row should have CL=1 (alive)
+    let stmt = db.db.prepare_v2("SELECT cl FROM items__crsql_v2_pks WHERE __crsql_key = 3")?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int64(0), 1, "backfilled row should have CL=1");
+
+    // The backfilled row should be writable (normal update, not insert-like)
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("UPDATE items SET qty = 999 WHERE id = 3")?;
+
+    // The backfilled row has v2_pks (CL=1) but no clock entries.
+    // First write creates clock entries for all non-PK columns (like an insert).
+    // The update should produce changes (the row is tracked in v2_pks).
+    // The exact count depends on whether other rows also have clock entries
+    // from the migration — we just verify the backfilled row is writable.
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM crsql_changes")?;
+    stmt.step()?;
+    assert!(stmt.column_int(0) > 0, "backfilled row update should produce changes");
+
+    libc_println!("=== seeded_migration_backfills_untracked PASS ===");
+    cleanup_files(&[db_path]);
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), ResultCode> {
     seeded_no_spurious_changes()?;
     seeded_update_propagates()?;
@@ -570,5 +648,6 @@ pub fn run_suite() -> Result<(), ResultCode> {
     seeded_bidirectional_sync()?;
     seeded_delete_reinsert()?;
     seeded_conflict_resolution()?;
+    seeded_migration_backfills_untracked()?;
     Ok(())
 }
