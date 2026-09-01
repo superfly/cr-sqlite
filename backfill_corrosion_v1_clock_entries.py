@@ -88,17 +88,39 @@ def load_config(config_path):
     return pg_addr, db_path
 
 
-def connect_postgres(addr):
-    """Connect to Postgres wire protocol endpoint using psycopg3.
+def parse_host_port(addr):
+    """Parse a host:port address, handling IPv6 brackets.
 
-    Returns a connection object.
+    '[fc01::1]:5487' → ('fc01::1', 5487)
+    '127.0.0.1:5487' → ('127.0.0.1', 5487)
+    'localhost'      → ('localhost', 5432)
     """
-    if ":" in addr:
+    if addr.startswith("["):
+        # IPv6: [host]:port
+        end = addr.find("]")
+        if end == -1:
+            raise ValueError(f"Malformed IPv6 address: {addr}")
+        host = addr[1:end]
+        rest = addr[end+1:]
+        if rest.startswith(":"):
+            port = int(rest[1:])
+        else:
+            port = 5432
+    elif ":" in addr:
         host, port = addr.rsplit(":", 1)
         port = int(port)
     else:
         host = addr
         port = 5432
+    return host, port
+
+
+def connect_postgres(addr):
+    """Connect to Postgres wire protocol endpoint using psycopg3.
+
+    Returns a connection object.
+    """
+    host, port = parse_host_port(addr)
 
     conn = psycopg.connect(
         host=host,
@@ -428,7 +450,6 @@ def main():
         conn = connect_postgres(pg_addr)
     except Exception as e:
         print(f"FAILED: {e}")
-        print("Install psycopg: pip install 'psycopg[binary]'")
         sys.exit(1)
     print("connected (psycopg3)")
 
