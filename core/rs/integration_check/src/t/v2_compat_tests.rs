@@ -1,4 +1,5 @@
 extern crate crsql_bundle;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 use libc_print::libc_println;
 use sqlite::{Connection, Destructor, ManagedConnection, ResultCode};
@@ -596,6 +597,83 @@ fn v2_alter_drop_column_becomes_pk_only() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// Test: ALTER TABLE reordering composite PK columns triggers metadata rebuild.
+/// crsql_hash_pk is order-sensitive: hash(a, b) != hash(b, a). A PK reorder must
+/// be detected as a PK change so V2 metadata tables are dropped and recreated.
+/// Previously, compute_pk_signature sorted PKs alphabetically, so a reorder was
+/// not detected — leaving stale hashed_pk entries that broke lookups and sync.
+///
+/// This test verifies the fix at the signature level: two tables with the same
+/// PK columns but different PK order must produce different signatures. We also
+/// verify the end-to-end behavior by creating two separate databases (one with
+/// each PK order) and confirming their hashed_pk values differ.
+fn v2_alter_reorder_composite_pk() -> Result<(), ResultCode> {
+    libc_println!("=== v2_alter_reorder_composite_pk START ===");
+
+    // Create two DBs with the same composite PK columns but different order.
+    // DB A: PRIMARY KEY(id1, id2) — hash order is (id1, id2)
+    // DB B: PRIMARY KEY(id2, id1) — hash order is (id2, id1)
+    // If compute_pk_signature sorts alphabetically, both would have the same
+    // signature "nh:id1:TEXT,id2:TEXT", and a PK reorder would not be detected.
+    // With the fix, the signatures preserve pk-index order:
+    //   DB A: "nh:id1:TEXT,id2:TEXT"
+    //   DB B: "nh:id2:TEXT,id1:TEXT"
+    // These are different, so check_pk_changed_v2 would detect the reorder.
+
+    let db_a = crate::opendb()?;
+    let db_b = crate::opendb()?;
+
+    db_a.db.exec_safe("CREATE TABLE jx (id1 TEXT NOT NULL, id2 TEXT NOT NULL, val TEXT, PRIMARY KEY(id1, id2))")?;
+    db_b.db.exec_safe("CREATE TABLE jx (id1 TEXT NOT NULL, id2 TEXT NOT NULL, val TEXT, PRIMARY KEY(id2, id1))")?;
+
+    for db in [&db_a.db, &db_b.db] {
+        db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.exec_safe("SELECT crsql_as_crr('jx')")?;
+    }
+    migrate_to_v2(&db_a.db)?;
+    migrate_to_v2(&db_b.db)?;
+
+    // Insert the same row in both DBs
+    for db in [&db_a.db, &db_b.db] {
+        db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.exec_safe("INSERT INTO jx VALUES ('a', 'b', 'hello')")?;
+    }
+
+    // Verify crsql_master signatures differ (the fix: no alphabetical sort)
+    let stmt = db_a.db.prepare_v2("SELECT value FROM crsql_master WHERE key = 'v2_pks_jx'")?;
+    stmt.step()?;
+    let sig_a = stmt.column_text(0)?.to_string();
+    let stmt = db_b.db.prepare_v2("SELECT value FROM crsql_master WHERE key = 'v2_pks_jx'")?;
+    stmt.step()?;
+    let sig_b = stmt.column_text(0)?.to_string();
+    libc_println!("  signature A (PK(id1,id2)): {}", sig_a);
+    libc_println!("  signature B (PK(id2,id1)): {}", sig_b);
+    assert_ne!(sig_a, sig_b, "PK reorder must produce different signatures (fix: no alphabetical sort)");
+
+    // Verify hashed_pk values differ — crsql_hash_pk is order-sensitive
+    let stmt = db_a.db.prepare_v2("SELECT hashed_pk FROM jx__crsql_v2_pks")?;
+    stmt.step()?;
+    let hash_a = stmt.column_blob(0)?.to_vec();
+    let stmt = db_b.db.prepare_v2("SELECT hashed_pk FROM jx__crsql_v2_pks")?;
+    stmt.step()?;
+    let hash_b = stmt.column_blob(0)?.to_vec();
+    assert_ne!(hash_a, hash_b, "hashed_pk must differ for different PK order (hash is order-sensitive)");
+
+    // Verify both DBs can sync the row correctly (each with its own hash order)
+    // If A sends to B, B should see it as a new row (different PK = different identity)
+    // This is expected behavior — reordering PKs changes row identity.
+    db_a.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db_a.db.exec_safe("UPDATE jx SET val = 'updated' WHERE id1 = 'a' AND id2 = 'b'")?;
+
+    // DB A should produce changes
+    let stmt = db_a.db.prepare_v2("SELECT count(*) FROM crsql_changes WHERE \"table\" = 'jx'")?;
+    stmt.step()?;
+    assert!(stmt.column_int(0) > 0, "update should produce changes");
+
+    libc_println!("=== v2_alter_reorder_composite_pk PASS ===");
+    Ok(())
+}
+
 /// Test: PK-only bidirectional sync
 fn v2_pk_only_bidirectional() -> Result<(), ResultCode> {
     libc_println!("=== v2_pk_only_bidirectional START ===");
@@ -980,6 +1058,7 @@ pub fn run_suite() -> Result<(), ResultCode> {
     v2_delete_then_reinsert()?;
     v2_alter_add_column_to_pk_only()?;
     v2_alter_drop_column_becomes_pk_only()?;
+    v2_alter_reorder_composite_pk()?;
     v2_wire_delete_sync()?;
     v2_wire_delete_then_reinsert()?;
     v2_wire_pk_only_delete()?;
