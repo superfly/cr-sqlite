@@ -1646,7 +1646,7 @@ unsafe fn v2_nuke_local_row(
     // Delete from base table (with sync bit to prevent trigger recursion)
     with_sync_bit(ext_data, || {
         if tbl_info.key_is_rowid {
-            let mut stmt = v2.base_delete_rowid();
+            let mut stmt = v2.base_delete_rowid()?;
             stmt.bind_int64(1, key)?;
             stmt.step()?;
         } else {
