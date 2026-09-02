@@ -101,7 +101,7 @@ pub struct V2Stmts {
     /// INSERT INTO base table (pk_cols) VALUES (?, ...) — for merge new row creation
     base_insert: ManagedStmt,
     /// DELETE FROM base table WHERE rowid_alias = ? (rowid-key tables)
-    base_delete_rowid: ManagedStmt,
+    base_delete_rowid: Option<ManagedStmt>,
     /// DELETE FROM base table WHERE pk_cols = ? (non-rowid tables)
     base_delete_nonrowid: Option<ManagedStmt>,
     /// SELECT rowid_alias FROM base table WHERE pk_cols = ? — hydration rowid lookup
