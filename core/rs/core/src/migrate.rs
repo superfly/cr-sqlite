@@ -713,6 +713,8 @@ unsafe fn backfill_untracked_v2_pks(
     };
 
     let where_clause = if tbl_info.skip_hash && tbl_info.key_is_rowid {
+        // Use rowid_alias instead of b.rowid to handle the edge case where
+        // a column named "rowid" shadows the built-in alias.
         let rowid_alias = crate::util::escape_ident(&tbl_info.rowid_alias);
         format!("vp.__crsql_key = b.\"{}\"", rowid_alias)
     } else if tbl_info.skip_hash {

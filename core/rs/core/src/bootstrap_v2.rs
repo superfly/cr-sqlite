@@ -263,15 +263,16 @@ fn populate_col_map(
 }
 
 /// Compute a canonical PK signature for alter detection.
-/// Format: "r:col1:type,col2:type" (rowid-key) or "n:col1:type,col2:type" (non-rowid),
-/// with PK columns sorted by name so order doesn't matter.
+/// Format: "rs:col1:type,col2:type" (rowid+skip_hash), "nh:col1:type,col2:type" (non-rowid+hash), etc.
+/// PK columns are in pk-index order (NOT sorted alphabetically) because the hash
+/// is order-sensitive: crsql_hash_pk(a, b) != crsql_hash_pk(b, a). A PK reorder
+/// must trigger a full metadata rebuild (drop + recreate v2 tables + backfill).
 pub fn compute_pk_signature(table_info: &TableInfo) -> String {
-    let mut entries: Vec<String> = table_info
+    let entries: Vec<String> = table_info
         .pks
         .iter()
         .map(|p| format!("{}:{}", p.name, p.col_type))
         .collect();
-    entries.sort();
     format!(
         "{}{}:{}",
         if table_info.key_is_rowid { "r" } else { "n" },
