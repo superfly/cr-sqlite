@@ -3,7 +3,7 @@
 Audit of the V2 metadata implementation in `core/rs/core/src/` against
 `v2_metadata_design.md`, on branch `somtochi/v2-bugs` @ `3ee6c141`.
 
-Every finding below has an executable reproduction in `v2_audit/repros/`.
+18 findings, all with an executable reproduction in `v2_audit/repros/`.
 Each script exits **1** when the bug is present and **0** when it is not, so the
 whole set doubles as a regression suite:
 
@@ -43,31 +43,34 @@ multi-node delete/resurrect races, and the packed feed's filter/order pushdown.
 | # | Severity | Finding | Repro |
 |---|---|---|---|
 | 1 | **CRITICAL** | `put_varint` writes continuation bits on the wrong bytes — every value ≥ 128 is corrupted on the V2 wire | `alter_01` |
-| 2 | **CRITICAL** | Dropping the last two non-PK columns in one ALTER window fails and leaves the table with **no triggers** | `alter_02` |
-| 3 | **CRITICAL** | `/*/` anywhere in a `CREATE TABLE` aborts the process (panic in the directive parser) | `schema_01` |
-| 4 | **CRITICAL** | `WHERE seq BETWEEN …` returns zero rows in packed mode — corrosion partial-replay deadlock | `feed_01` |
-| 5 | **HIGH** | `db_version` reused after a statement/savepoint rollback — changes become unreachable | `writes_01` |
-| 6 | **HIGH** | Feed is not ordered by `(db_version, seq)` in packed mode, and claims it is | `feed_02` |
-| 7 | **HIGH** | Hash-only tombstones are silently dropped from the V1-compat and PK-only feeds | `e2e_05` |
-| 8 | **HIGH** | Merge path has no rowid bound check — `cell_key` overflows and rows vanish | `schema_02` |
-| 9 | **HIGH** | `crsql_as_table` leaves all V2 metadata behind; `remove_crr_v2_tables` is dead code | `schema_03` |
-| 10 | **HIGH** | A column name containing `'` breaks `crsql_changes` for the whole database | `feed_03` |
-| 11 | **HIGH** | `crsql_as_crr(tbl,'skip_hash')` is broken — always errors | `schema_04` |
-| 12 | **HIGH** | `ALTER TABLE … RENAME COLUMN` destroys the column's clock history — permanent divergence | `alter_03` |
-| 13 | MEDIUM | Orphaned V2 metadata is silently swallowed by the feed's INNER JOIN | `feed_04` |
-| 14 | MEDIUM | Single-column packed groups carry no `char(0)`, contradicting the documented detection rule | `feed_05` |
-| 15 | MEDIUM | V2-wire reception is gated on `metadata-use-version`, not on the documented condition | `e2e_03` |
-| 16 | MEDIUM | Retired `col_id`s are recycled, contradicting the col_id reuse policy | `alter_04` |
-| 17 | LOW/DOC | Six design-vs-implementation divergences (config types, rowid reuse, CHECK constraints, directive keys) | `design_01` |
+| 2 | **CRITICAL** | A malformed blob from a peer **aborts the process** — uncatchable, and the poisoned change replays on every retry | `merge_01` |
+| 3 | **CRITICAL** | Dropping the last two non-PK columns in one ALTER window fails and leaves the table with **no triggers** | `alter_02` |
+| 4 | **CRITICAL** | `/*/` anywhere in a `CREATE TABLE` aborts the process (panic in the directive parser) | `schema_01` |
+| 5 | **CRITICAL** | `WHERE seq BETWEEN …` returns zero rows in packed mode — corrosion partial-replay deadlock | `feed_01` |
+| 6 | **HIGH** | `db_version` reused after a statement/savepoint rollback — changes become unreachable | `writes_01` |
+| 7 | **HIGH** | Feed is not ordered by `(db_version, seq)` in packed mode, and claims it is | `feed_02` |
+| 8 | **HIGH** | Hash-only tombstones are silently dropped from the V1-compat and PK-only feeds | `e2e_05` |
+| 9 | **HIGH** | Merge path has no rowid bound check — `cell_key` overflows and rows vanish | `schema_02` |
+| 10 | **HIGH** | `crsql_as_table` leaves all V2 metadata behind; `remove_crr_v2_tables` is dead code | `schema_03` |
+| 11 | **HIGH** | A column name containing `'` breaks `crsql_changes` for the whole database | `feed_03` |
+| 12 | **HIGH** | `crsql_as_crr(tbl,'skip_hash')` is broken — always errors | `schema_04` |
+| 13 | **HIGH** | `ALTER TABLE … RENAME COLUMN` destroys the column's clock history — permanent divergence | `alter_03` |
+| 14 | MEDIUM | Orphaned V2 metadata is silently swallowed by the feed's INNER JOIN | `feed_04` |
+| 15 | MEDIUM | Single-column packed groups carry no `char(0)`, contradicting the documented detection rule | `feed_05` |
+| 16 | MEDIUM | V2-wire reception is gated on `metadata-use-version`, not on the documented condition | `e2e_03` |
+| 17 | MEDIUM | Retired `col_id`s are recycled, contradicting the col_id reuse policy | `alter_04` |
+| 18 | LOW/DOC | Six design-vs-implementation divergences (config types, rowid reuse, CHECK constraints, directive keys) | `design_01` |
 
 `e2e_04_metadata_invariants.py` is a structural invariant checker rather than a
-finding of its own; it currently trips on finding 7 and should go green once
+finding of its own; it currently trips on finding 8 and should go green once
 that is fixed. Verified **not** broken (regression tests, currently passing):
 `e2e_01`, `e2e_02`, `e2e_06`, `design_02`.
 
 Current state of the full suite (`v2_audit/run_all.sh`):
 
 ```
+SCRIPT                                               RESULT
+---------------------------------------------------- ------
 alter_01_put_varint_continuation_bits                BUG
 alter_02_pk_only_transition_breaks_table             BUG
 alter_03_rename_column_loses_history                 BUG
@@ -77,7 +80,7 @@ design_02_known_good                                 ok
 e2e_01_convergence_fuzz                              ok
 e2e_02_mixed_mode_cluster                            ok
 e2e_03_v2_wire_reception_gate                        BUG
-e2e_04_metadata_invariants                           BUG   (trips on finding 7)
+e2e_04_metadata_invariants                           BUG   (trips on finding 8)
 e2e_05_tombstone_pks_gap_drops_deletes               BUG
 e2e_06_watermark_sync_protocol                       ok
 feed_01_packed_seq_range_filter                      BUG
@@ -85,13 +88,14 @@ feed_02_packed_feed_ordering                         BUG
 feed_03_quoted_col_name_breaks_feed                  BUG
 feed_04_orphan_metadata_silently_dropped             BUG
 feed_05_single_col_packed_missing_char0              BUG
+merge_01_unpack_panics_abort_process                 BUG
 schema_01_directive_comment_panic                    BUG
 schema_02_merge_rowid_overflow                       BUG
 schema_03_drop_table_leaves_v2_metadata              BUG
 schema_04_as_crr_skip_hash_flag_broken               BUG
 writes_01_db_version_reuse_after_stmt_rollback       BUG
 
-reproduced: 18   correct: 4   harness errors: 0
+reproduced: 19   correct: 4   harness errors: 0
 ```
 
 ---
@@ -152,7 +156,71 @@ inside the `value >= 0x80` arm) should go at the same time.
 
 ---
 
-## 2. CRITICAL — dropping the last two non-PK columns leaves the table trigger-less
+## 2. CRITICAL — a malformed blob from a peer aborts the process
+
+**Where:** `core/rs/core/src/pack_columns.rs:241-244` (`unpack_columns`) and
+`core/rs/core/src/pack_columns.rs:467-476` (`unpack_varints`)
+**Repro:** `v2_audit/repros/merge_01_unpack_panics_abort_process.py`
+
+Two unchecked reads of attacker-controlled fields. The extension is built
+`no_std` with `panic = "abort"`, so neither is catchable — the host process dies
+with SIGTRAP. No SQL error, no rollback, no chance for the application to skip
+the bad change.
+
+**A — `unpack_columns` never bounds-checks the per-value `intlen`:**
+
+```rust
+let column_type_and_maybe_intlen = buf.get_u8();
+let column_type = ColumnType::from_u8(column_type_and_maybe_intlen & 0x07);
+let intlen = (column_type_and_maybe_intlen >> 3 & 0xFF) as usize;
+...
+if buf.remaining() < intlen { return Err(ResultCode::ABORT); }
+let len = buf.get_int(intlen) as usize;
+```
+
+`intlen` comes straight off the wire and ranges 0..=31. Every guard checks that
+enough **bytes remain**, which a padded blob trivially satisfies — but
+`bytes::Buf::get_int(n)` **panics for `n > 8`**. `intlen = 8` is fine;
+`intlen = 9` kills the process. Measured across the sweep 8/9/10/15/31: only 8
+survives.
+
+**B — `unpack_varints` sizes an allocation from the wire:**
+
+```rust
+let (count, header_len) = get_varint(data)?;
+let mut out = Vec::with_capacity(count as usize);
+```
+
+`count` is an attacker-controlled u64 varint with no sanity check against the
+remaining buffer length, even though it can never legitimately exceed
+`data.len()`. A header of `FF FF FF FF FF FF FF FF 7F` requests a ~2^63-element
+`Vec` and the allocation failure aborts.
+
+**Reachability — this is the ordinary sync path, not just the debug vtab:**
+
+| entry point | field | result |
+|---|---|---|
+| `INSERT INTO crsql_changes` (V1 wire) | `pk` → `unpack_columns` | **abort** |
+| `INSERT INTO crsql_changes` (packed V2 wire) | `col_version`, `seq` → `unpack_varints` | **abort** |
+| `SELECT … FROM crsql_unpack_columns WHERE package = ?` | `package` | **abort** |
+
+**Consequence.** Any peer that can push a change — or any corruption of those
+bytes in transit or on disk — takes the receiving node down. It is a crash
+**loop**, not a single outage: the poisoned change is still in the sender's
+feed, so the node dies again on every retry, and no operator-visible error ever
+names the offending row.
+
+**Fix:** reject `intlen > 8` in `unpack_columns` before calling `get_int`; in
+`unpack_varints`, drop the `with_capacity` (or cap it against
+`data.len() - header_len`, since one varint is at least one byte). Then fuzz
+both functions over arbitrary byte strings — neither may ever panic. Given
+`panic = "abort"`, it is worth auditing every remaining slice index, `get_int`,
+and `with_capacity` in `pack_columns.rs` the same way; finding 4 is the same
+class of defect in a different file.
+
+---
+
+## 3. CRITICAL — dropping the last two non-PK columns leaves the table trigger-less
 
 **Where:** `core/rs/core/src/alter_v2.rs:135-147` (`sync_col_map_v2`)
 **Design:** "PK-Only Tables" → *ALTER TABLE: Dropping the Last Non-PK Column*
@@ -197,7 +265,7 @@ on failure.
 
 ---
 
-## 3. CRITICAL — `/*/` in a `CREATE TABLE` aborts the process
+## 4. CRITICAL — `/*/` in a `CREATE TABLE` aborts the process
 
 **Where:** `core/rs/core/src/schema_directive.rs:66-70`
 **Design:** "Schema-Embedded Configuration Directives" → *Reading the Directive*
@@ -228,7 +296,7 @@ against arbitrary strings — it must never panic.
 
 ---
 
-## 4. CRITICAL — `WHERE seq BETWEEN …` returns nothing in packed mode
+## 5. CRITICAL — `WHERE seq BETWEEN …` returns nothing in packed mode
 
 **Where:** `core/rs/core/src/changes_vtab_read.rs:254` (`seq` is a BLOB) +
 `core/rs/core/src/changes_vtab.rs:80-110` / `changes_vtab_read.rs:394-439`
@@ -264,7 +332,7 @@ plus unbounded request traffic.
 
 ---
 
-## 5. HIGH — `db_version` reused after a statement or savepoint rollback
+## 6. HIGH — `db_version` reused after a statement or savepoint rollback
 
 **Where:** `core/rs/core/src/db_version.rs:88-91`, `core/rs/core/src/commit.rs:33-40`
 **Repro:** `v2_audit/repros/writes_01_db_version_reuse_after_stmt_rollback.py`
@@ -307,7 +375,7 @@ value separately from the in-memory pending value.
 
 ---
 
-## 6. HIGH — the feed is not ordered by `(db_version, seq)` but says it is
+## 7. HIGH — the feed is not ordered by `(db_version, seq)` but says it is
 
 **Where:** `core/rs/core/src/changes_vtab.rs:124-183` (`orderByConsumed = 1`) +
 `changes_vtab_read.rs:254` / `:30` / `:291`
@@ -340,7 +408,7 @@ skip changes outright.
 
 ---
 
-## 7. HIGH — hash-only tombstones are silently dropped from the feed
+## 8. HIGH — hash-only tombstones are silently dropped from the feed
 
 **Where:** `core/rs/core/src/changes_vtab_read.rs:91` (INNER `JOIN
 v2_tombstone_pks`), reached from `:190` (V1-compat wire) and `:358` (PK-only)
@@ -380,7 +448,7 @@ path should also respect `sync-log-version`.
 
 ---
 
-## 8. HIGH — the merge path never checks the rowid bound
+## 9. HIGH — the merge path never checks the rowid bound
 
 **Where:** `core/rs/core/src/changes_vtab_write.rs` (no bound check;
 `create_crr.rs::validate_rowid_range` only scans existing rows at `as_crr` time,
@@ -406,7 +474,7 @@ document that the `CHECK` in the design is unimplementable on an existing table.
 
 ---
 
-## 9. HIGH — `crsql_as_table` leaves every V2 table behind
+## 10. HIGH — `crsql_as_table` leaves every V2 table behind
 
 **Where:** `core/rs/core/src/lib.rs:136-138`; `core/rs/core/src/teardown_v2.rs`
 **Design:** "Teardown (V2): `crsql_remove_crr_v2`"
@@ -439,7 +507,7 @@ table's `crsql_master` keys and task-queue rows, and change the error path to
 
 ---
 
-## 10. HIGH — a `'` in a column name breaks `crsql_changes` database-wide
+## 11. HIGH — a `'` in a column name breaks `crsql_changes` database-wide
 
 **Where:** `core/rs/core/src/changes_vtab_read.rs:200-215` (`build_col_val_case`)
 **Repro:** `v2_audit/repros/feed_03_quoted_col_name_breaks_feed.py`
@@ -464,11 +532,11 @@ repro shows both the v2-wire and v1-wire builders failing with `SQL logic error`
 **Fix:** use `escape_ident_as_value` (or a dedicated literal escaper) for the
 `WHEN '…'` position and `escape_ident` for the `mt."…"` position. Better: use
 the design's own recommendation and switch the CASE to compare `cm.col_id`
-integers (see finding 17.5), which removes the string literal entirely.
+integers (see finding 18.5), which removes the string literal entirely.
 
 ---
 
-## 11. HIGH — `crsql_as_crr(tbl, 'skip_hash')` always errors
+## 12. HIGH — `crsql_as_crr(tbl, 'skip_hash')` always errors
 
 **Where:** `core/rs/core/src/create_crr.rs:80-82` vs `tableinfo.rs:1215-1220`
 **Design:** "Skip Hash Optimization" → *Eligibility* (manually enabled via `as_crr` option)
@@ -510,7 +578,7 @@ path.
 
 ---
 
-## 12. HIGH — `RENAME COLUMN` destroys the column's clock history
+## 13. HIGH — `RENAME COLUMN` destroys the column's clock history
 
 **Where:** `core/rs/core/src/alter_v2.rs:104-200` (`sync_col_map_v2` reconciles by name)
 **Design:** not covered — "ALTER TABLE (V2)" lists only Column Added / Removed / PK Changed
@@ -535,7 +603,7 @@ leaving the clock rows untouched.
 
 ---
 
-## 13. MEDIUM — orphaned V2 metadata is silently swallowed by the feed
+## 14. MEDIUM — orphaned V2 metadata is silently swallowed by the feed
 
 **Where:** `core/rs/core/src/changes_vtab_read.rs` (`main_join` is an INNER JOIN
 to the base table)
@@ -559,7 +627,7 @@ evidence this drift happens in production).
 
 ---
 
-## 14. MEDIUM — single-column packed groups carry no `char(0)`
+## 15. MEDIUM — single-column packed groups carry no `char(0)`
 
 **Where:** `core/rs/core/src/changes_vtab_read.rs:249`
 **Design:** "V1/V2 Coexistence" and the "Packed Wire Row" table
@@ -588,7 +656,7 @@ implements.
 
 ---
 
-## 15. MEDIUM — V2-wire reception gated on the wrong config value
+## 16. MEDIUM — V2-wire reception gated on the wrong config value
 
 **Where:** `core/rs/core/src/changes_vtab_write.rs:576-587`
 **Design:** "Versioning" — reception requirements
@@ -615,7 +683,7 @@ because the sender has no way to discover the receiver's state.
 
 ---
 
-## 16. MEDIUM — retired `col_id`s are recycled
+## 17. MEDIUM — retired `col_id`s are recycled
 
 **Where:** `core/rs/core/src/alter_v2.rs:170-186`
 **Design:** "PK-Only Tables" → *col_id Reuse Policy*
@@ -634,7 +702,7 @@ adding `d` gives `d` col_id **1** — `b`'s retired id.
 
 Today the DELETE of `b`'s clock rows runs in the same call, so nothing is
 inherited on the happy path. The hazard is real on any path that leaves clock
-rows behind — finding 2 is exactly such a path: after the failed PK-only alter,
+rows behind — finding 3 is exactly such a path: after the failed PK-only alter,
 `v2_col_map` is empty while `col_id` 0 and 1 clock rows survive, so the next
 `ADD COLUMN` takes col_id 0 and inherits a stale clock row with someone else's
 `db_version`/`seq`.
@@ -645,7 +713,7 @@ design describes.
 
 ---
 
-## 17. LOW / DOC — design-vs-implementation divergences
+## 18. LOW / DOC — design-vs-implementation divergences
 
 **Repro:** `v2_audit/repros/design_01_doc_divergences.py` (documents all six; no
 correctness impact on its own, but each one misleads a reader of the design doc)
@@ -686,7 +754,7 @@ correctness impact on its own, but each one misleads a reader of the design doc)
    `col_name` for efficiency." `build_col_val_case`
    (`changes_vtab_read.rs:200-215`) emits `CASE cm.col_name WHEN 'a' THEN …`.
    This is a per-cell string comparison on the hottest query in the system, and
-   it is the direct cause of finding 10.
+   it is the direct cause of finding 11.
 
 6. **A discarded `Result`.** `local_writes/v2.rs:92` calls
    `stmt.bind_int64(1, rowid…)` without `?` — a bind failure is silently
@@ -722,12 +790,12 @@ them), not a code defect, but it belongs in the rollout docs.
 
 1. **Finding 1** (`put_varint`) — one-line fix, corrupts data today, blocks any
    V2-wire rollout.
-2. **Findings 4 and 6** (seq filter + ordering) — same root cause (predicates
+2. **Findings 5 and 7** (seq filter + ordering) — same root cause (predicates
    spliced onto the packed outer query); fix together.
-3. **Finding 2** (ALTER leaves no triggers) plus the trigger-restore guard,
-   which also mitigates findings 13 and 16.
-4. **Finding 3** (parser panic) — trivial bounds check, but it is a process abort.
-5. **Findings 7, 8, 9, 10, 11, 12** — independent, each self-contained.
-6. **Finding 5** — shared with V1; schedule with the V1 owners.
-7. **Findings 14, 15, 17** — reconcile the design doc and the code; several of
+3. **Finding 3** (ALTER leaves no triggers) plus the trigger-restore guard,
+   which also mitigates findings 14 and 17.
+4. **Finding 4** (parser panic) — trivial bounds check, but it is a process abort.
+5. **Findings 8, 9, 10, 11, 12, 13** — independent, each self-contained.
+6. **Finding 6** — shared with V1; schedule with the V1 owners.
+7. **Findings 15, 16, 18** — reconcile the design doc and the code; several of
    these are the doc being stale rather than the code being wrong.
