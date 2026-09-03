@@ -1030,7 +1030,8 @@ unsafe extern "C" fn x_crsql_begin_alter(
     let rc = remove_crr_triggers_if_exist(db, table_name);
     if rc.is_err() {
         sqlite::result_error_code(ctx, rc.unwrap_err() as c_int);
-        let _ = db.exec_safe("ROLLBACK");
+        let _ = db.exec_safe("ROLLBACK TO alter_crr");
+        let _ = db.exec_safe("RELEASE alter_crr");
         return;
     }
     ctx.result_text_static("OK");
@@ -1117,8 +1118,7 @@ unsafe extern "C" fn x_crsql_commit_alter(
                 &mut err_msg as *mut _,
             );
             if rc2 != ResultCode::OK as c_int {
-                ctx.result_error("crsql_compact_post_alter_v2 failed");
-                return;
+                rc = rc2;
             }
         }
 
@@ -1155,7 +1155,10 @@ unsafe extern "C" fn x_crsql_commit_alter(
             "failed compacting tables post alteration: {}",
             error_str
         ));
-        let _ = db.exec_safe("ROLLBACK");
+        // Roll back to the alter_crr savepoint (not the caller's entire transaction),
+        // which restores the triggers that crsql_begin_alter dropped.
+        let _ = db.exec_safe("ROLLBACK TO alter_crr");
+        let _ = db.exec_safe("RELEASE alter_crr");
         return;
     }
 }

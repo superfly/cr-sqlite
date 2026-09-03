@@ -12,7 +12,8 @@ pub static DELETE_SENTINEL: &str = "-1";
 pub static _DB_VERSION_SCHEMA_VERSION: c_int = 0;
 pub static TABLE_INFO_SCHEMA_VERSION: c_int = 1;
 
-#[derive(FromPrimitive, PartialEq, Debug)]
+#[repr(u8)]
+#[derive(FromPrimitive, PartialEq, Debug, Clone, Copy)]
 pub enum CrsqlChangesColumn {
     Tbl = 0,
     Pk = 1,
