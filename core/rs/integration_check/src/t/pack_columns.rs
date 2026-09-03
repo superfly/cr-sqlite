@@ -1,4 +1,5 @@
 use crsql_bundle::test_exports::pack_columns::unpack_columns;
+use crsql_bundle::test_exports::pack_columns::unpack_varints;
 use crsql_bundle::test_exports::pack_columns::ColumnValue;
 use sqlite::{Connection, ResultCode};
 use sqlite_nostd as sqlite;
@@ -193,7 +194,75 @@ fn test_unpack_columns() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// Test varint encoding via crsql_pack_varint_agg and unpack_varints.
+/// This tests the put_varint/get_varint functions end-to-end through the
+/// SQL aggregate, covering all byte lengths including the 9-byte case.
+///
+/// The unit tests in pack_columns.rs verify the exact byte
+/// encoding; this test verifies the round-trip through the SQL interface.
+fn test_varint_encoding() -> Result<(), ResultCode> {
+    let db = crate::opendb()?;
+
+    // Test values covering all varint byte lengths:
+    // 1 byte: 0-127
+    // 2 bytes: 128-16383
+    // 3 bytes: 16384-2097151
+    // ...
+    // 9 bytes: values >= 2^56
+    let test_values: &[(i64, &str)] = &[
+        (0, "0 (1 byte)"),
+        (127, "127 (1 byte boundary)"),
+        (128, "128 (2 byte boundary)"),
+        (200, "200 (2 byte)"),
+        (16383, "16383 (2 byte max)"),
+        (16384, "16384 (3 byte boundary)"),
+        (1048576, "1048576 (3 byte)"),
+        (i32::MAX as i64, "i32::MAX (5 byte)"),
+        (i64::MAX, "i64::MAX (9 byte)"),
+        (i64::MIN, "i64::MIN (9 byte, negative)"),
+        (-1, "-1 (9 byte, negative via reinterpret)"),
+    ];
+
+    for &(val, desc) in test_values {
+        // Pack a single value via crsql_pack_varint_agg
+        let stmt = db.db.prepare_v2(
+            "SELECT crsql_pack_varint_agg(v) FROM (SELECT ? AS v)"
+        )?;
+        stmt.bind_int64(1, val)?;
+        stmt.step()?;
+        let packed = stmt.column_blob(0)?;
+
+        // Unpack and verify round-trip
+        let unpacked = unpack_varints(packed)?;
+        assert_eq!(unpacked.len(), 1, "should have 1 value for {}", desc);
+        assert_eq!(
+            unpacked[0], val,
+            "varint round-trip failed for {}: expected {}, got {}",
+            desc, val, unpacked[0]
+        );
+    }
+
+    // Test multiple values packed together (simulates packed mode with multiple cols)
+    let stmt = db.db.prepare_v2(
+        "SELECT crsql_pack_varint_agg(v) FROM (SELECT 0 AS v UNION ALL SELECT 127 UNION ALL SELECT 128 UNION ALL SELECT 200 UNION ALL SELECT 16384 UNION ALL SELECT 1048576 UNION ALL SELECT 2000000000)"
+    )?;
+    stmt.step()?;
+    let packed = stmt.column_blob(0)?;
+    let unpacked = unpack_varints(packed)?;
+    assert_eq!(unpacked.len(), 7, "should have 7 values");
+    assert_eq!(unpacked[0], 0);
+    assert_eq!(unpacked[1], 127);
+    assert_eq!(unpacked[2], 128);
+    assert_eq!(unpacked[3], 200);
+    assert_eq!(unpacked[4], 16384);
+    assert_eq!(unpacked[5], 1048576);
+    assert_eq!(unpacked[6], 2000000000);
+
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), ResultCode> {
     test_pack_columns()?;
-    test_unpack_columns()
+    test_unpack_columns()?;
+    test_varint_encoding()
 }
