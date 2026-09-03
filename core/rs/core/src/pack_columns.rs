@@ -173,32 +173,52 @@ pub enum ColumnValue {
 /// Encode a value as a SQLite varint into the buffer.
 /// Values 0-127 encode as a single byte (0x00-0x7F), byte-identical
 /// to the old u8 format. Larger values use multi-byte encoding.
+///
+/// SQLite varint format (MSB-first / big-endian):
+///   1-8 bytes: each byte has 7 data bits (high bit = continuation).
+///             The first byte has the most significant bits.
+///             The last byte has the least significant 7 bits (no continuation).
+///   9 bytes:  p[0..7] have 7 data bits each (all with continuation bit set),
+///             p[8] has 8 data bits (the least significant byte, no continuation).
+/// Total capacity: 7*8 + 8 = 64 bits.
+///
+/// This matches SQLite's sqlite3PutVarint exactly.
 fn put_varint(buf: &mut Vec<u8>, value: u64) {
     if value < 0x80 {
         buf.put_u8(value as u8);
         return;
     }
-    // SQLite varint: up to 9 bytes, high bit = continuation
-    let mut bytes = [0u8; 9];
-    let mut n = 0;
-    let mut v = value;
-    if v == 0 {
-        buf.put_u8(0);
+
+    // 9-byte case (value >= 2^56): p[8] = lowest 8 bits,
+    // p[0..7] = 7-bit groups from the remaining bits, all with continuation.
+    if value & (0xff000000u64 << 32) != 0 {
+        let mut v = value >> 8;
+        let mut bytes = [0u8; 9];
+        bytes[8] = (value & 0xFF) as u8;
+        for i in (0..8).rev() {
+            bytes[i] = ((v & 0x7F) as u8) | 0x80;
+            v >>= 7;
+        }
+        buf.extend_from_slice(&bytes);
         return;
     }
-    while v > 0 && n < 9 {
-        bytes[n] = (v & 0x7F) as u8;
+
+    // 2-8 byte case: extract 7-bit groups LSB-first into a stack buffer,
+    // clear the continuation bit on the LSB, reverse in place, bulk-write.
+    let mut tmp = [0u8; 8];
+    let mut n = 0;
+    let mut v = value;
+    loop {
+        tmp[n] = ((v & 0x7F) as u8) | 0x80;
         v >>= 7;
         n += 1;
+        if v == 0 {
+            break;
+        }
     }
-    // Set continuation bits on all but the last byte
-    for i in 1..n {
-        bytes[i - 1] |= 0x80;
-    }
-    // Bytes are stored MSB first (reverse of how we filled them)
-    for i in (0..n).rev() {
-        buf.put_u8(bytes[i]);
-    }
+    tmp[0] &= 0x7F;
+    tmp[..n].reverse();
+    buf.extend_from_slice(&tmp[..n]);
 }
 
 /// Read a SQLite varint from the buffer. Returns the value and number of bytes consumed.
@@ -510,5 +530,183 @@ fn encode_value(buf: &mut Vec<u8>, value: *mut sqlite::value) {
             buf.put_int(len as i64, num_bytes_for_len as usize);
             buf.put_slice(value.blob());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_varint_single_byte() {
+        for v in 0..0x80 {
+            let mut buf = vec![];
+            put_varint(&mut buf, v);
+            assert_eq!(buf.len(), 1);
+            assert_eq!(buf[0], v as u8);
+            let (decoded, n) = get_varint(&buf).unwrap();
+            assert_eq!(decoded, v);
+            assert_eq!(n, 1);
+        }
+    }
+
+    #[test]
+    fn test_varint_two_bytes() {
+        // 128 = 0x81 0x00, 200 = 0x81 0x48, 16383 = 0xFF 0x7F
+        let cases: &[(u64, &[u8])] = &[
+            (128, &[0x81, 0x00]),
+            (200, &[0x81, 0x48]),
+            (16383, &[0xFF, 0x7F]),
+        ];
+        for &(val, expected) in cases {
+            let mut buf = vec![];
+            put_varint(&mut buf, val);
+            assert_eq!(buf.as_slice(), expected, "encoding mismatch for {}", val);
+            let (decoded, n) = get_varint(&buf).unwrap();
+            assert_eq!(decoded, val);
+            assert_eq!(n, expected.len());
+        }
+    }
+
+    #[test]
+    fn test_varint_three_bytes() {
+        // 16384 = 0x81 0x80 0x00, 1048576 = 0xC0 0x80 0x00
+        let cases: &[(u64, &[u8])] = &[
+            (16384, &[0x81, 0x80, 0x00]),
+            (1048576, &[0xC0, 0x80, 0x00]),
+        ];
+        for &(val, expected) in cases {
+            let mut buf = vec![];
+            put_varint(&mut buf, val);
+            assert_eq!(buf.as_slice(), expected, "encoding mismatch for {}", val);
+            let (decoded, n) = get_varint(&buf).unwrap();
+            assert_eq!(decoded, val);
+            assert_eq!(n, expected.len());
+        }
+    }
+
+    #[test]
+    fn test_varint_round_trip_boundaries() {
+        // Test all power-of-2 boundaries and values just below/above them
+        let mut values = vec![0u64, 1, 127, 128, 129];
+        let mut shift = 7;
+        while shift < 64 {
+            values.push(1u64 << shift);
+            values.push((1u64 << shift) - 1);
+            values.push((1u64 << shift) + 1);
+            shift += 7;
+        }
+        values.push(u64::MAX);
+        values.push(i64::MAX as u64);
+        values.push(i64::MIN as u64); // reinterpret for negative round-trip
+
+        for &val in &values {
+            let mut buf = vec![];
+            put_varint(&mut buf, val);
+            let (decoded, n) = get_varint(&buf).unwrap();
+            assert_eq!(decoded, val, "round-trip failed for {} (0x{:x})", val, val);
+            assert_eq!(n, buf.len());
+        }
+    }
+
+    #[test]
+    fn test_varint_sequential_decode() {
+        // Multiple varints packed back-to-back should decode independently
+        let values = [0u64, 1, 127, 128, 200, 16384, 1048576, 42];
+        let mut buf = vec![];
+        for &v in &values {
+            put_varint(&mut buf, v);
+        }
+        let mut offset = 0;
+        for &expected in &values {
+            let (decoded, n) = get_varint(&buf[offset..]).unwrap();
+            assert_eq!(decoded, expected);
+            offset += n;
+        }
+        assert_eq!(offset, buf.len());
+    }
+
+    #[test]
+    fn test_varint_nine_bytes() {
+        // 9-byte varints: values that require all 9 bytes.
+        // SQLite varint format (MSB-first / big-endian):
+        //   p[0..7] = 7 data bits each (high bit = continuation, always set)
+        //   p[8]    = 8 data bits (least significant byte, no continuation)
+        // Total capacity: 7*8 + 8 = 64 bits.
+        //
+        // Encoder: p[8] = v & 0xFF, then extract 7-bit groups from v>>8
+        // into p[7..0] (MSB-first).
+        let cases: &[(u64, &[u8])] = &[
+            // 2^56 = 0x0100000000000000
+            // p[8] = 0x00, v>>8 = 2^48
+            // 7-bit groups from 2^48: [0, 0, 0, 0, 0, 0, 64, 0] (LSB-first)
+            // Emitted MSB-first: p[0]=0x80, p[1]=0xC0, p[2..7]=0x80, p[8]=0x00
+            (
+                1u64 << 56,
+                &[0x80, 0xC0, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00],
+            ),
+            // u64::MAX = 0xFFFFFFFFFFFFFFFF — all bits set
+            // p[8] = 0xFF, all 7-bit groups = 0x7F → 0xFF with continuation
+            (
+                u64::MAX,
+                &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            ),
+            // i64::MAX = 0x7FFFFFFFFFFFFFFF
+            // p[8] = 0xFF, top group = 0x3F → 0xBF, rest = 0xFF
+            (
+                i64::MAX as u64,
+                &[0xBF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            ),
+        ];
+        for &(val, expected) in cases {
+            let mut buf = vec![];
+            put_varint(&mut buf, val);
+            assert_eq!(buf.len(), 9, "9-byte varint for 0x{:x} should be 9 bytes", val);
+            assert_eq!(
+                buf.as_slice(),
+                expected,
+                "9-byte encoding mismatch for 0x{:x}",
+                val
+            );
+            let (decoded, n) = get_varint(&buf).unwrap();
+            assert_eq!(decoded, val, "9-byte round-trip failed for 0x{:x}", val);
+            assert_eq!(n, 9);
+        }
+    }
+
+    #[test]
+    fn test_varint_continuation_bit_placement() {
+        // Explicitly verify that the continuation bit (0x80) is set on every
+        // byte EXCEPT the last emitted byte. The old bug set it on bytes 0..n-2
+        // (missing the second-to-last byte) instead of 1..n-1.
+        //
+        // For a 2-byte varint: byte[0] has continuation, byte[1] doesn't.
+        // For a 3-byte varint: byte[0] and byte[1] have continuation, byte[2] doesn't.
+        // For a 9-byte varint: bytes[0..7] have continuation, byte[8] may or may not
+        // (it uses all 8 bits for data, so the high bit can be set as a data bit).
+        let mut buf = vec![];
+        put_varint(&mut buf, 200); // 2 bytes
+        assert!(buf[0] & 0x80 != 0, "first byte must have continuation bit");
+        assert!(buf[1] & 0x80 == 0, "last byte must NOT have continuation bit");
+
+        buf.clear();
+        put_varint(&mut buf, 16384); // 3 bytes
+        assert!(buf[0] & 0x80 != 0, "byte 0 must have continuation bit");
+        assert!(buf[1] & 0x80 != 0, "byte 1 must have continuation bit");
+        assert!(buf[2] & 0x80 == 0, "last byte must NOT have continuation bit");
+
+        buf.clear();
+        put_varint(&mut buf, 1u64 << 56); // 9 bytes
+        // Bytes 0-7 must have continuation bit set (they're 7-bit groups)
+        for i in 0..8 {
+            assert!(
+                buf[i] & 0x80 != 0,
+                "byte {} of 9-byte varint must have continuation bit",
+                i
+            );
+        }
+        // Byte 8 uses all 8 bits for data — high bit may or may not be set
+        // For 2^56, byte 8 = 0x00 (no high bit)
+        assert_eq!(buf[8], 0x00, "byte 8 of 2^56 should be 0x00");
     }
 }
