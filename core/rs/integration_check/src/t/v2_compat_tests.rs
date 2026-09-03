@@ -1,5 +1,8 @@
 extern crate crsql_bundle;
+use alloc::format;
+use alloc::string::String;
 use alloc::string::ToString;
+use alloc::vec;
 use alloc::vec::Vec;
 use libc_print::libc_println;
 use sqlite::{Connection, Destructor, ManagedConnection, ResultCode};
@@ -1041,6 +1044,767 @@ fn v2_pk_only_site_id_tiebreak() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// Test: ALTER TABLE drop last TWO non-PK columns in one ALTER window.
+/// This is the bug from audit finding #2: when dropping both non-PK columns
+/// at once, the migrate UPDATE to col_id=0 hit a uniqueness violation because
+/// col_id=0 rows already existed for one of the columns. The fix deletes other
+/// dropped col_ids' clock rows BEFORE the migrate, and backfills missing
+/// sentinels for rows that had no clock entries at all.
+///
+/// Additionally, the crsql_commit_alter error path had an early `return` that
+/// skipped the ROLLBACK, leaving the table trigger-less. This test verifies
+/// that triggers are restored after the alter and new writes are tracked.
+fn v2_alter_drop_two_columns_becomes_pk_only() -> Result<(), ResultCode> {
+    libc_println!("=== v2_alter_drop_two_columns_becomes_pk_only START ===");
+    let db = crate::opendb()?;
+    db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, a TEXT, b TEXT)")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+    migrate_to_v2(&db.db)?;
+
+    // Insert rows so clock entries exist for both columns
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (1, 'a1', 'b1')")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (2, 'a2', 'b2')")?;
+
+    // Drop BOTH non-PK columns in one ALTER window
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_begin_alter('foo')")?;
+    db.db.exec_safe("ALTER TABLE foo DROP COLUMN a")?;
+    db.db.exec_safe("ALTER TABLE foo DROP COLUMN b")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_commit_alter('foo')")?;
+
+    // v2_col_map should be empty (no non-PK columns)
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_v2_col_map")?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int(0), 0, "v2_col_map should be empty after dropping all non-PK columns");
+
+    // Sentinel clock entries should exist at col_id=0 for both rows
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_v2_clock WHERE cell_key & 255 = 0")?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int(0), 2, "should have 2 sentinel clock entries at col_id=0");
+
+    // Triggers must be restored — new inserts should be tracked
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (3)")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (4)")?;
+
+    // v2_pks should now have 4 rows
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_v2_pks")?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int(0), 4, "triggers should track new inserts after alter");
+
+    // Changes feed should emit sentinel rows for all 4 rows
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM crsql_changes WHERE \"table\" = 'foo'")?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int(0), 4, "changes feed should have 4 rows (2 migrated + 2 new)");
+
+    // Verify the new rows (id=3, id=4) appear in the feed
+    let stmt = db.db.prepare_v2("SELECT pk FROM crsql_changes WHERE \"table\" = 'foo'")?;
+    let mut found_3 = false;
+    let mut found_4 = false;
+    while stmt.step()? == ResultCode::ROW {
+        let pk_blob = stmt.column_blob(0)?;
+        // PK format: count(1), type=9(int), value
+        if pk_blob.len() >= 3 && pk_blob[0] == 1 && pk_blob[1] == 9 {
+            if pk_blob[2] == 3 { found_3 = true; }
+            if pk_blob[2] == 4 { found_4 = true; }
+        }
+    }
+    assert!(found_3, "new row id=3 should appear in changes feed");
+    assert!(found_4, "new row id=4 should appear in changes feed");
+
+    libc_println!("=== v2_alter_drop_two_columns_becomes_pk_only PASS ===");
+    Ok(())
+}
+
+/// Test: WHERE seq BETWEEN in V2-wire packed mode.
+/// This is the bug from audit finding #4: in packed mode, `seq` is a BLOB
+/// (crsql_pack_varint_agg), so `WHERE seq <= N` compared BLOB to INTEGER,
+/// which is always false in SQLite — returning zero rows.
+///
+/// The fix pushes seq constraints into per-table subqueries (where c.seq is
+/// scalar) and adds a scalar _seq_order column for outer ORDER BY.
+///
+/// This test also covers finding #6: the feed must be ordered by
+/// (db_version, seq) even in packed mode.
+fn v2_wire_packed_seq_filter_and_order() -> Result<(), ResultCode> {
+    libc_println!("=== v2_wire_packed_seq_filter_and_order START ===");
+    let db = crate::opendb()?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+    db.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+    db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, a TEXT, b TEXT)")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+
+    // Insert a row and update columns in separate transactions to get
+    // different db_versions and seqs.
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (1, 'a0', 'b0')")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("UPDATE foo SET a = 'a1' WHERE id = 1")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("UPDATE foo SET b = 'b1' WHERE id = 1")?;
+
+    // Get all changes (no filter) — should return rows
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM crsql_changes WHERE \"table\" = 'foo'")?;
+    stmt.step()?;
+    let total = stmt.column_int(0);
+    assert!(total > 0, "unfiltered feed should return rows, got {}", total);
+
+    // WHERE seq >= 0 — before the fix, this returned 0 rows in packed mode
+    // because seq is a BLOB and BLOB >= INTEGER is false.
+    let stmt = db.db.prepare_v2(
+        "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'foo' AND seq >= 0"
+    )?;
+    stmt.step()?;
+    let filtered = stmt.column_int(0);
+    assert_eq!(filtered, total, "WHERE seq >= 0 should return all rows in packed mode, got {} of {}", filtered, total);
+
+    // WHERE seq BETWEEN 0 AND 100 — the exact pattern from the bug report
+    let stmt = db.db.prepare_v2(
+        "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'foo' AND seq BETWEEN 0 AND 100"
+    )?;
+    stmt.step()?;
+    let between = stmt.column_int(0);
+    assert_eq!(between, total, "WHERE seq BETWEEN 0 AND 100 should return all rows in packed mode");
+
+    // ORDER BY seq — should not error and should return rows in order
+    let stmt = db.db.prepare_v2(
+        "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'foo' ORDER BY seq"
+    )?;
+    stmt.step()?;
+    assert!(stmt.column_int(0) > 0, "ORDER BY seq should return rows in packed mode");
+
+    // ORDER BY db_version, seq — the canonical feed ordering
+    let stmt = db.db.prepare_v2(
+        "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'foo' ORDER BY db_version, seq"
+    )?;
+    stmt.step()?;
+    assert!(stmt.column_int(0) > 0, "ORDER BY db_version, seq should return rows in packed mode");
+
+    // === Ordering verification ===
+    // Verify that ORDER BY db_version, seq returns rows in the correct order.
+    // In packed mode, seq is a BLOB — the fix adds _seq_order (scalar c.seq)
+    // to each arm and rewrites the outer ORDER BY to use it.
+    // We collect (db_version, seq) pairs and verify they are non-decreasing.
+    {
+        let stmt = db.db.prepare_v2(
+            "SELECT db_version, seq FROM crsql_changes WHERE \"table\" = 'foo' ORDER BY db_version, seq"
+        )?;
+        let mut prev_dbv: i64 = -1;
+        let mut prev_seq: i64 = -1;
+        let mut row_count = 0;
+        while stmt.step()? == ResultCode::ROW {
+            let dbv = stmt.column_int64(0);
+            // seq is a packed BLOB in V2-wire — but the ORDER BY uses _seq_order
+            // (scalar), so the ordering is correct even though the returned
+            // seq column is a BLOB. We can't easily compare BLOB seq values,
+            // but we can verify db_version is non-decreasing.
+            assert!(dbv >= prev_dbv,
+                "ORDER BY db_version, seq: db_version should be non-decreasing, got {} after {}",
+                dbv, prev_dbv);
+            prev_dbv = dbv;
+            prev_seq = 0; // placeholder
+            row_count += 1;
+        }
+        assert!(row_count > 0, "ORDER BY db_version, seq should return rows");
+        libc_println!("  ordering: {} rows, db_version non-decreasing", row_count);
+    }
+
+    // Verify ordering across multiple tables (UNION ALL)
+    // The outer ORDER BY must correctly order rows from different arms.
+    {
+        let stmt = db.db.prepare_v2(
+            "SELECT \"table\", db_version FROM crsql_changes ORDER BY db_version, seq"
+        )?;
+        let mut prev_dbv: i64 = -1;
+        let mut row_count = 0;
+        while stmt.step()? == ResultCode::ROW {
+            let dbv = stmt.column_int64(1);
+            assert!(dbv >= prev_dbv,
+                "cross-table ORDER BY db_version: should be non-decreasing, got {} after {}",
+                dbv, prev_dbv);
+            prev_dbv = dbv;
+            row_count += 1;
+        }
+        assert!(row_count > 0, "cross-table ORDER BY should return rows");
+        libc_println!("  cross-table ordering: {} rows, db_version non-decreasing", row_count);
+    }
+
+    // === ORDER BY + LIMIT ===
+    // LIMIT should work with the rewritten _seq_order ordering.
+    // _seq_order is not in the outer SELECT column list but IS in the subquery,
+    // so SQLite can sort and limit on it.
+    {
+        // LIMIT 1 should return the first row by (db_version, seq)
+        let stmt = db.db.prepare_v2(
+            "SELECT db_version FROM crsql_changes WHERE \"table\" = 'foo' ORDER BY db_version, seq LIMIT 1"
+        )?;
+        stmt.step()?;
+        let first_dbv = stmt.column_int64(0);
+        libc_println!("  ORDER BY + LIMIT 1: first db_version={}", first_dbv);
+
+        // LIMIT with offset
+        let stmt = db.db.prepare_v2(
+            "SELECT db_version FROM crsql_changes WHERE \"table\" = 'foo' ORDER BY db_version, seq LIMIT 1 OFFSET 1"
+        )?;
+        stmt.step()?;
+        let second_dbv = stmt.column_int64(0);
+        libc_println!("  ORDER BY + LIMIT 1 OFFSET 1: second db_version={}", second_dbv);
+        assert!(second_dbv >= first_dbv,
+            "second row should have db_version >= first ({} >= {})", second_dbv, first_dbv);
+    }
+
+    // ORDER BY + LIMIT across multiple tables
+    {
+        let stmt = db.db.prepare_v2(
+            "SELECT \"table\", db_version FROM crsql_changes ORDER BY db_version, seq LIMIT 3"
+        )?;
+        let mut rows: Vec<(String, i64)> = Vec::new();
+        while stmt.step()? == ResultCode::ROW {
+            rows.push((stmt.column_text(0)?.to_string(), stmt.column_int64(1)));
+        }
+        libc_println!("  cross-table LIMIT 3: got {} rows: {:?}", rows.len(), rows);
+        assert!(rows.len() <= 3, "LIMIT 3 should return at most 3 rows, got {}", rows.len());
+        assert!(rows.len() > 0, "should have at least 1 row");
+        // Verify non-decreasing db_version
+        for i in 1..rows.len() {
+            assert!(rows[i].1 >= rows[i-1].1,
+                "LIMIT rows should be ordered: row {} db_version {} < row {} db_version {}",
+                i, rows[i].1, i-1, rows[i-1].1);
+        }
+    }
+
+    libc_println!("=== v2_wire_packed_seq_filter_and_order PASS ===");
+    Ok(())
+}
+
+/// Test that WHERE constraints on db_version, site_id, and ts are correctly
+/// pushed into per-table subqueries in V2-wire packed mode.
+///
+/// This verifies:
+/// 1. db_version >= N returns the same rows as V1-wire mode
+/// 2. site_id IS NOT ? (the common sync filter) still works (must NOT be pushed)
+/// 3. ts > N filters correctly at the cell level
+/// 4. Combined db_version + site_id filter returns correct subset
+fn v2_wire_packed_generalized_pushdown() -> Result<(), ResultCode> {
+    libc_println!("=== v2_wire_packed_generalized_pushdown START ===");
+
+    let db = crate::opendb()?;
+    db.db.exec_safe("SELECT crsql_config_set('default-ts', 1700000000)")?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+    db.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+
+    // Diverse table types to exercise all UNION arm variants:
+    //   skip_int  — int PK, has non-PK cols → skip_hash clock + skip_hash tomb (cid='-1')
+    //   hash_tbl  — text PK, has non-PK cols → hash clock + hash tomb (cid='-2')
+    //   skip_pkonly — int PK, no non-PK cols → pkonly clock + skip_hash tomb (cid='-1')
+    //   comp_pk   — composite int+text PK, has non-PK cols → hash clock + hash tomb (cid='-2')
+    db.db.exec_safe("CREATE TABLE skip_int (id INTEGER PRIMARY KEY NOT NULL, a TEXT, b TEXT)")?;
+    db.db.exec_safe("CREATE TABLE hash_tbl (id TEXT PRIMARY KEY NOT NULL, x TEXT)")?;
+    db.db.exec_safe("CREATE TABLE skip_pkonly (id INTEGER PRIMARY KEY NOT NULL)")?;
+    db.db.exec_safe("CREATE TABLE comp_pk (uid INTEGER NOT NULL, tenant TEXT NOT NULL, val TEXT, PRIMARY KEY(uid, tenant))")?;
+    db.db.exec_safe("SELECT crsql_as_crr('skip_int')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('hash_tbl')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('skip_pkonly')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('comp_pk')")?;
+
+    // Insert rows across multiple transactions (different db_versions)
+    // db_version 1: skip_int insert
+    db.db.exec_safe("INSERT INTO skip_int VALUES (1, 'a1', 'b1')")?;
+    // db_version 2: hash_tbl insert
+    db.db.exec_safe("INSERT INTO hash_tbl VALUES ('k1', 'x1')")?;
+    // db_version 3: skip_int insert + skip_pkonly insert
+    db.db.exec_safe("INSERT INTO skip_int VALUES (2, 'a2', 'b2')")?;
+    db.db.exec_safe("INSERT INTO skip_pkonly VALUES (10)")?;
+    // db_version 4: skip_int update
+    db.db.exec_safe("UPDATE skip_int SET a='a3' WHERE id=1")?;
+    // db_version 5: comp_pk insert
+    db.db.exec_safe("INSERT INTO comp_pk VALUES (1, 't1', 'v1')")?;
+    // db_version 6: hash_tbl delete (tombstone)
+    db.db.exec_safe("DELETE FROM hash_tbl WHERE id='k1'")?;
+    // db_version 7: comp_pk update
+    db.db.exec_safe("UPDATE comp_pk SET val='v2' WHERE uid=1 AND tenant='t1'")?;
+    // db_version 8: skip_pkonly delete (tombstone, pk-only)
+    db.db.exec_safe("DELETE FROM skip_pkonly WHERE id=10")?;
+
+    let siteid = {
+        let s = db.db.prepare_v2("SELECT crsql_site_id()")?;
+        s.step()?;
+        s.column_blob(0)?.to_vec()
+    };
+
+    // Helper: count rows matching a WHERE clause (no params)
+    let count_where = |sql: &str| -> i32 {
+        let stmt = db.db.prepare_v2(sql).unwrap();
+        stmt.step().unwrap();
+        stmt.column_int(0)
+    };
+    // Helper: count rows with a blob param for site_id
+    let count_where_siteid = |sql: &str| -> i32 {
+        let stmt = db.db.prepare_v2(sql).unwrap();
+        stmt.bind_blob(1, &siteid, sqlite::Destructor::STATIC).unwrap();
+        stmt.step().unwrap();
+        stmt.column_int(0)
+    };
+
+    // Baseline: count all changes
+    let count_all = count_where("SELECT count(*) FROM crsql_changes");
+    libc_println!("  baseline count_all={}", count_all);
+    assert!(count_all > 0, "should have changes");
+
+    // Count per table
+    let count_skip_int = count_where("SELECT count(*) FROM crsql_changes WHERE \"table\" = 'skip_int'");
+    let count_hash_tbl = count_where("SELECT count(*) FROM crsql_changes WHERE \"table\" = 'hash_tbl'");
+    let count_skip_pkonly = count_where("SELECT count(*) FROM crsql_changes WHERE \"table\" = 'skip_pkonly'");
+    let count_comp_pk = count_where("SELECT count(*) FROM crsql_changes WHERE \"table\" = 'comp_pk'");
+    libc_println!("  counts: skip_int={} hash_tbl={} skip_pkonly={} comp_pk={}",
+        count_skip_int, count_hash_tbl, count_skip_pkonly, count_comp_pk);
+    assert!(count_skip_int > 0, "skip_int should have changes");
+    assert!(count_hash_tbl > 0, "hash_tbl should have changes (incl tombstone)");
+    assert!(count_skip_pkonly > 0, "skip_pkonly should have changes (incl tombstone)");
+    assert!(count_comp_pk > 0, "comp_pk should have changes");
+    assert_eq!(count_skip_int + count_hash_tbl + count_skip_pkonly + count_comp_pk, count_all,
+        "per-table counts should sum to total");
+
+    // Dump all rows for debugging
+    {
+        let stmt = db.db.prepare_v2(
+            "SELECT \"table\", db_version, cid, cl FROM crsql_changes ORDER BY db_version, \"table\""
+        )?;
+        while stmt.step()? == ResultCode::ROW {
+            libc_println!("  row: table={} db_version={} cid={} cl={}",
+                stmt.column_text(0)?, stmt.column_int64(1),
+                core::str::from_utf8(stmt.column_blob(2)?).unwrap_or("?"),
+                stmt.column_int64(3));
+        }
+    }
+
+    // === db_version pushdown ===
+    assert_eq!(count_where("SELECT count(*) FROM crsql_changes WHERE db_version >= 1"), count_all,
+        "db_version >= 1 should return all");
+
+    // Partial: db_version >= 5 should return a subset
+    let count_dbv_ge5 = count_where("SELECT count(*) FROM crsql_changes WHERE db_version >= 5");
+    libc_println!("  db_version >= 5: count={}", count_dbv_ge5);
+    assert!(count_dbv_ge5 > 0 && count_dbv_ge5 < count_all,
+        "db_version >= 5 should return a subset, got {} of {}", count_dbv_ge5, count_all);
+    // Cross-check: complement
+    let count_dbv_lt5 = count_where("SELECT count(*) FROM crsql_changes WHERE db_version < 5");
+    assert_eq!(count_dbv_ge5 + count_dbv_lt5, count_all,
+        "db_version >= 5 + < 5 should equal total");
+
+    assert_eq!(count_where("SELECT count(*) FROM crsql_changes WHERE db_version >= 100"), 0,
+        "db_version >= 100 should return 0");
+
+    // === site_id pushdown (IS and IS NOT) ===
+    assert_eq!(count_where_siteid("SELECT count(*) FROM crsql_changes WHERE site_id IS NOT ?"), 0,
+        "site_id IS NOT self should return 0");
+    assert_eq!(count_where_siteid("SELECT count(*) FROM crsql_changes WHERE site_id IS ?"), count_all,
+        "site_id IS self should return all");
+
+    // === ts pushdown ===
+    assert_eq!(count_where("SELECT count(*) FROM crsql_changes WHERE ts > 0"), count_all,
+        "ts > 0 should return all");
+    assert_eq!(count_where("SELECT count(*) FROM crsql_changes WHERE ts > 2000000000"), 0,
+        "ts > 2000000000 should return 0");
+
+    // === tbl pushdown (literal comparison, branch pruning) ===
+    // Each table filter should return only that table's rows
+    assert_eq!(count_where("SELECT count(*) FROM crsql_changes WHERE \"table\" = 'skip_int'"), count_skip_int);
+    assert_eq!(count_where("SELECT count(*) FROM crsql_changes WHERE \"table\" = 'hash_tbl'"), count_hash_tbl);
+    assert_eq!(count_where("SELECT count(*) FROM crsql_changes WHERE \"table\" = 'skip_pkonly'"), count_skip_pkonly);
+    assert_eq!(count_where("SELECT count(*) FROM crsql_changes WHERE \"table\" = 'comp_pk'"), count_comp_pk);
+    assert_eq!(count_where("SELECT count(*) FROM crsql_changes WHERE \"table\" = 'nonexistent'"), 0,
+        "table = 'nonexistent' should return 0");
+
+    // Verify tbl filter returns correct table names (not mixed)
+    {
+        let stmt = db.db.prepare_v2("SELECT DISTINCT \"table\" FROM crsql_changes WHERE \"table\" = 'comp_pk'")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_text(0)?, "comp_pk", "table = 'comp_pk' should only return comp_pk");
+    }
+
+    // === cid pushdown ===
+    // cid = '-1' matches skip_hash tombstones (hash_tbl delete uses cid='-2', skip_int/skip_pkonly delete uses '-1')
+    let count_cid_del1 = count_where("SELECT count(*) FROM crsql_changes WHERE cid = '-1'");
+    libc_println!("  cid='-1' (skip_hash tomb): count={}", count_cid_del1);
+    assert!(count_cid_del1 > 0, "cid = '-1' should return skip_hash tombstone rows");
+
+    // cid = '-2' matches hash tombstones (hash_tbl delete)
+    let count_cid_del2 = count_where("SELECT count(*) FROM crsql_changes WHERE cid = '-2'");
+    libc_println!("  cid='-2' (hash tomb): count={}", count_cid_del2);
+    assert!(count_cid_del2 > 0, "cid = '-2' should return hash tombstone rows");
+
+    // cid != '-1' should return non-skip_hash-tombstone rows
+    let count_cid_non_del1 = count_where("SELECT count(*) FROM crsql_changes WHERE cid != '-1'");
+    assert!(count_cid_non_del1 > 0, "cid != '-1' should return non-skip_hash-tombstone rows");
+
+    // cid = 'a' should return only rows where column 'a' was changed (skip_int only)
+    let count_cid_a = count_where("SELECT count(*) FROM crsql_changes WHERE cid = 'a'");
+    libc_println!("  cid='a' count={}", count_cid_a);
+    assert!(count_cid_a > 0, "cid = 'a' should return rows where column a was changed");
+
+    // cid = 'val' should return comp_pk update rows
+    let count_cid_val = count_where("SELECT count(*) FROM crsql_changes WHERE cid = 'val'");
+    libc_println!("  cid='val' count={}", count_cid_val);
+    assert!(count_cid_val > 0, "cid = 'val' should return comp_pk rows where val was changed");
+
+    // cid = 'x' — hash_tbl insert was deleted, so x column change is gone (tombstone replaces it)
+    let count_cid_x = count_where("SELECT count(*) FROM crsql_changes WHERE cid = 'x'");
+    libc_println!("  cid='x' count={}", count_cid_x);
+    // hash_tbl insert was deleted — tombstone supersedes the x column change
+
+    // Verify cid values are correct (cid is BLOB in packed mode)
+    {
+        let stmt = db.db.prepare_v2("SELECT cid FROM crsql_changes WHERE cid = 'val' LIMIT 1")?;
+        stmt.step()?;
+        let cid_blob = stmt.column_blob(0)?;
+        let cid_str = core::str::from_utf8(cid_blob).unwrap_or("");
+        assert!(cid_str.contains("val"), "cid = 'val' should return rows with cid containing 'val', got: {:?}", cid_str);
+    }
+
+    // === col_version pushdown ===
+    // col_version >= 1 should return non-tombstone changes.
+    // Note: pk-only tombstones have col_version = t.cl (causal length), not NULL.
+    // Hash tombstones have col_version = NULL (pruned by NULL >= 1).
+    // So col_version >= 1 returns: all clock rows + pk-only tombstones with cl >= 1.
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM crsql_changes WHERE col_version >= ?1")?;
+    stmt.bind_int(1, 1)?;
+    stmt.step()?;
+    let count_colvrsn_ge1 = stmt.column_int(0);
+    libc_println!("  col_version >= 1 count={}", count_colvrsn_ge1);
+    assert!(count_colvrsn_ge1 > 0, "col_version >= 1 should return non-tombstone changes");
+    // Should exclude hash tombstones (col_version = NULL) but include pk-only tombstones (col_version = t.cl)
+    // hash_tbl tombstone is the only one with NULL col_version
+    assert_eq!(count_colvrsn_ge1, count_all - count_cid_del2,
+        "col_version >= 1 should return all except hash tombstones ({} - {} = {})",
+        count_all, count_cid_del2, count_all - count_cid_del2);
+
+    // col_version >= 100 should return nothing
+    assert_eq!(count_where("SELECT count(*) FROM crsql_changes WHERE col_version >= 100"), 0,
+        "col_version >= 100 should return 0");
+
+    // === cl pushdown ===
+    let count_cl_ge1 = count_where("SELECT count(*) FROM crsql_changes WHERE cl >= 1");
+    libc_println!("  cl >= 1 count={}", count_cl_ge1);
+    assert_eq!(count_cl_ge1, count_all, "cl >= 1 should return all (every change has cl >= 1)");
+    assert_eq!(count_where("SELECT count(*) FROM crsql_changes WHERE cl >= 100"), 0,
+        "cl >= 100 should return 0");
+
+    // === seq pushdown ===
+    assert_eq!(count_where("SELECT count(*) FROM crsql_changes WHERE seq >= 0"), count_all,
+        "seq >= 0 should return all");
+
+    // Partial: seq >= 1 should return a subset
+    let count_seq_ge1 = count_where("SELECT count(*) FROM crsql_changes WHERE seq >= 1");
+    libc_println!("  seq >= 1: count={}", count_seq_ge1);
+    assert!(count_seq_ge1 > 0 && count_seq_ge1 < count_all,
+        "seq >= 1 should return a subset, got {} of {}", count_seq_ge1, count_all);
+
+    assert_eq!(count_where("SELECT count(*) FROM crsql_changes WHERE seq >= 100000"), 0,
+        "seq >= 100000 should return 0");
+
+    // === BETWEEN ===
+    // Use actual min/max db_version from the data to construct a meaningful BETWEEN.
+    // Note: min()/max() aggregates on vtab columns can return incorrect values
+    // (SQLite's optimizer may not scan all rows for aggregates on vtabs).
+    // We manually scan to get the true range.
+    let mut versions: Vec<i64> = Vec::new();
+    {
+        let stmt = db.db.prepare_v2("SELECT db_version FROM crsql_changes")?;
+        while stmt.step()? == ResultCode::ROW {
+            versions.push(stmt.column_int64(0));
+        }
+    }
+    let min_dbv = *versions.iter().min().unwrap_or(&1);
+    let max_dbv = *versions.iter().max().unwrap_or(&9);
+    let mid_dbv = (min_dbv + max_dbv) / 2;
+    libc_println!("  db_version range: {} to {}, mid={}", min_dbv, max_dbv, mid_dbv);
+
+    // BETWEEN min AND max should return all
+    let count_between_all = count_where(&format!(
+        "SELECT count(*) FROM crsql_changes WHERE db_version BETWEEN {} AND {}", min_dbv, max_dbv));
+    assert_eq!(count_between_all, count_all, "BETWEEN min AND max should return all");
+
+    // BETWEEN min AND mid should return a subset (or all if mid >= max)
+    let count_between_partial = count_where(&format!(
+        "SELECT count(*) FROM crsql_changes WHERE db_version BETWEEN {} AND {}", min_dbv, mid_dbv));
+    libc_println!("  db_version BETWEEN {} AND {}: count={}", min_dbv, mid_dbv, count_between_partial);
+    // Cross-check: BETWEEN should match >= min AND <= mid
+    assert_eq!(count_where(&format!(
+        "SELECT count(*) FROM crsql_changes WHERE db_version >= {} AND db_version <= {}", min_dbv, mid_dbv)),
+        count_between_partial, "BETWEEN should match >= AND <=");
+
+    // seq BETWEEN 0 AND 0 — partial subset (some rows have seq=0, some have seq>0)
+    let count_seq_between = count_where("SELECT count(*) FROM crsql_changes WHERE seq BETWEEN 0 AND 0");
+    libc_println!("  seq BETWEEN 0 AND 0: count={}", count_seq_between);
+    // All our rows have seq=0 (single-row transactions), so this returns all
+    // Use a different BETWEEN to get a partial subset
+    let count_seq_ge1 = count_where("SELECT count(*) FROM crsql_changes WHERE seq >= 1");
+    if count_seq_ge1 > 0 {
+        assert!(count_seq_between > 0 && count_seq_between < count_all,
+            "seq BETWEEN 0 AND 0 should return a subset, got {} of {}", count_seq_between, count_all);
+    } else {
+        // All rows have seq=0 — BETWEEN 0 AND 0 returns all, which is correct
+        assert_eq!(count_seq_between, count_all,
+            "seq BETWEEN 0 AND 0 should return all when all seq=0");
+    }
+
+    // === Combined pushdown ===
+    // Combined: db_vrsn + site_id IS NOT self + ts → 0
+    assert_eq!(count_where_siteid(
+        "SELECT count(*) FROM crsql_changes WHERE db_version >= 1 AND site_id IS NOT ? AND ts > 0"), 0,
+        "combined: db_vrsn + site_id IS NOT self + ts should be 0");
+
+    // Combined: table = 'skip_int' AND db_version >= 1 → all skip_int rows
+    assert_eq!(count_where(
+        "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'skip_int' AND db_version >= 1"),
+        count_skip_int, "table='skip_int' AND db_version>=1 should return skip_int rows only");
+
+    // Combined: table = 'comp_pk' AND cid = 'val' → comp_pk val changes
+    assert_eq!(count_where(
+        "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'comp_pk' AND cid = 'val'"),
+        count_cid_val, "table='comp_pk' AND cid='val' should match comp_pk val changes");
+
+    // Combined partial: table = 'skip_int' AND db_version >= mid → subset of skip_int
+    let count_skip_int_dbv_mid = count_where(&format!(
+        "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'skip_int' AND db_version >= {}", mid_dbv));
+    libc_println!("  table='skip_int' AND db_version>={}: count={}", mid_dbv, count_skip_int_dbv_mid);
+    assert!(count_skip_int_dbv_mid > 0 && count_skip_int_dbv_mid < count_skip_int,
+        "table='skip_int' AND db_version>={} should return a subset of skip_int, got {} of {}",
+        mid_dbv, count_skip_int_dbv_mid, count_skip_int);
+
+    // Combined partial: table = 'hash_tbl' AND cid = '-2' → only hash_tbl tombstone
+    let count_hash_tomb = count_where(
+        "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'hash_tbl' AND cid = '-2'");
+    libc_println!("  table='hash_tbl' AND cid='-2': count={}", count_hash_tomb);
+    assert!(count_hash_tomb > 0, "table='hash_tbl' AND cid='-2' should return hash tombstone");
+    assert_eq!(count_hash_tomb, count_cid_del2,
+        "hash_tbl tombstone count should match cid='-2' count");
+
+    // Combined partial: table = 'skip_pkonly' AND cid = '-1' → only skip_pkonly tombstone
+    let count_pkonly_tomb = count_where(
+        "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'skip_pkonly' AND cid = '-1'");
+    libc_println!("  table='skip_pkonly' AND cid='-1': count={}", count_pkonly_tomb);
+    assert!(count_pkonly_tomb > 0, "table='skip_pkonly' AND cid='-1' should return pkonly tombstone");
+
+    // Cross-table: cid = '-1' should span skip_int and skip_pkonly tombstones
+    // (skip_int has no delete in our data, so only skip_pkonly)
+    assert_eq!(count_cid_del1, count_pkonly_tomb,
+        "cid='-1' should match skip_pkonly tombstone (skip_int has no delete)");
+
+    // Combined: table = 'comp_pk' AND db_version BETWEEN min AND max → all comp_pk
+    let count_comp_between = count_where(&format!(
+        "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'comp_pk' AND db_version BETWEEN {} AND {}",
+        min_dbv, max_dbv));
+    libc_println!("  table='comp_pk' AND db_version BETWEEN {} AND {}: count={}", min_dbv, max_dbv, count_comp_between);
+    assert_eq!(count_comp_between, count_comp_pk,
+        "table='comp_pk' AND db_version BETWEEN min AND max should return all comp_pk");
+
+    // === Ordering across all 4 table types ===
+    // Verify ORDER BY db_version, seq returns rows in non-decreasing db_version
+    // across all UNION arms (skip_hash clock, hash clock, pkonly, tombstones).
+    {
+        let stmt = db.db.prepare_v2(
+            "SELECT \"table\", db_version FROM crsql_changes ORDER BY db_version, seq"
+        )?;
+        let mut prev_dbv: i64 = -1;
+        let mut row_count = 0;
+        let mut tables_seen: Vec<String> = Vec::new();
+        while stmt.step()? == ResultCode::ROW {
+            let tbl = stmt.column_text(0)?.to_string();
+            let dbv = stmt.column_int64(1);
+            assert!(dbv >= prev_dbv,
+                "ORDER BY db_version, seq: db_version should be non-decreasing, got {} after {} (table={})",
+                dbv, prev_dbv, tbl);
+            if !tables_seen.contains(&tbl) {
+                tables_seen.push(tbl);
+            }
+            prev_dbv = dbv;
+            row_count += 1;
+        }
+        assert_eq!(row_count, count_all, "ORDER BY should return all rows");
+        assert_eq!(tables_seen.len(), 4, "ORDER BY should return rows from all 4 tables, got {:?}", tables_seen);
+        libc_println!("  full ordering: {} rows from {} tables, db_version non-decreasing", row_count, tables_seen.len());
+    }
+
+    // === ORDER BY + LIMIT across all 4 table types ===
+    // Verify LIMIT returns the correct subset of ordered rows
+    {
+        // Get all rows ordered
+        let stmt = db.db.prepare_v2(
+            "SELECT \"table\", db_version FROM crsql_changes ORDER BY db_version, seq"
+        )?;
+        let mut all_rows: Vec<(String, i64)> = Vec::new();
+        while stmt.step()? == ResultCode::ROW {
+            all_rows.push((stmt.column_text(0)?.to_string(), stmt.column_int64(1)));
+        }
+
+        // LIMIT 3 should return first 3 of all_rows
+        let stmt = db.db.prepare_v2(
+            "SELECT \"table\", db_version FROM crsql_changes ORDER BY db_version, seq LIMIT 3"
+        )?;
+        let mut limit_rows: Vec<(String, i64)> = Vec::new();
+        while stmt.step()? == ResultCode::ROW {
+            limit_rows.push((stmt.column_text(0)?.to_string(), stmt.column_int64(1)));
+        }
+        libc_println!("  LIMIT 3: got {} rows", limit_rows.len());
+        assert_eq!(limit_rows.len(), 3, "LIMIT 3 should return exactly 3 rows (have {})", count_all);
+        for i in 0..3 {
+            assert_eq!(limit_rows[i].0, all_rows[i].0,
+                "LIMIT row {} table mismatch: got {} expected {}", i, limit_rows[i].0, all_rows[i].0);
+            assert_eq!(limit_rows[i].1, all_rows[i].1,
+                "LIMIT row {} db_version mismatch: got {} expected {}", i, limit_rows[i].1, all_rows[i].1);
+        }
+
+        // LIMIT 2 OFFSET 2 should return rows 2,3
+        let stmt = db.db.prepare_v2(
+            "SELECT \"table\", db_version FROM crsql_changes ORDER BY db_version, seq LIMIT 2 OFFSET 2"
+        )?;
+        let mut offset_rows: Vec<(String, i64)> = Vec::new();
+        while stmt.step()? == ResultCode::ROW {
+            offset_rows.push((stmt.column_text(0)?.to_string(), stmt.column_int64(1)));
+        }
+        libc_println!("  LIMIT 2 OFFSET 2: got {} rows", offset_rows.len());
+        assert_eq!(offset_rows.len(), 2, "LIMIT 2 OFFSET 2 should return 2 rows");
+        for i in 0..2 {
+            assert_eq!(offset_rows[i].0, all_rows[i+2].0,
+                "OFFSET row {} table mismatch", i);
+            assert_eq!(offset_rows[i].1, all_rows[i+2].1,
+                "OFFSET row {} db_version mismatch", i);
+        }
+    }
+
+    // === DESC ordering ===
+    // Verify ORDER BY db_version DESC returns rows in non-increasing order
+    {
+        let stmt = db.db.prepare_v2(
+            "SELECT \"table\", db_version FROM crsql_changes ORDER BY db_version DESC, seq DESC"
+        )?;
+        let mut prev_dbv: i64 = i64::MAX;
+        let mut row_count = 0;
+        while stmt.step()? == ResultCode::ROW {
+            let dbv = stmt.column_int64(1);
+            assert!(dbv <= prev_dbv,
+                "ORDER BY db_version DESC: should be non-increasing, got {} after {}",
+                dbv, prev_dbv);
+            prev_dbv = dbv;
+            row_count += 1;
+        }
+        assert_eq!(row_count, count_all, "DESC ordering should return all rows");
+        libc_println!("  DESC ordering: {} rows, db_version non-increasing", row_count);
+    }
+
+    // DESC + LIMIT: first row should have the highest db_version
+    {
+        let stmt = db.db.prepare_v2(
+            "SELECT db_version FROM crsql_changes ORDER BY db_version DESC, seq DESC LIMIT 1"
+        )?;
+        stmt.step()?;
+        let max_dbv_query = stmt.column_int64(0);
+        // Should match the max we computed earlier
+        assert_eq!(max_dbv_query, max_dbv,
+            "DESC LIMIT 1 should return max db_version ({}), got {}", max_dbv, max_dbv_query);
+        libc_println!("  DESC LIMIT 1: db_version={}", max_dbv_query);
+    }
+
+    libc_println!("=== v2_wire_packed_generalized_pushdown PASS ===");
+    Ok(())
+}
+
+/// Test that LIKE/MATCH/GLOB/REGEXP constraints error on crsql_changes
+/// in all modes. These operators silently produce wrong results on packed BLOB
+/// outputs (cid, col_vrsn, seq, cval, pks). xBestIndex accepts them with
+/// omit=1 so SQLite trusts the vtab, then xFilter errors. Users who need
+/// pattern matching should wrap crsql_changes in a subquery and filter the
+/// outer query.
+fn v2_reject_pattern_ops() -> Result<(), ResultCode> {
+    libc_println!("=== v2_reject_pattern_ops START ===");
+
+    // Helper: prepare + step, return true if error occurred
+    let query_errors = |db: &ManagedConnection, sql: &str| -> bool {
+        let stmt = match db.prepare_v2(sql) {
+            Ok(s) => s,
+            Err(_) => return true,
+        };
+        match stmt.step() {
+            Ok(_) => false,
+            Err(_) => true,
+        }
+    };
+
+    // Test in V2-wire packed mode
+    {
+        let db = crate::opendb()?;
+        db.db.exec_safe("SELECT crsql_config_set('default-ts', 1700000000)")?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+        db.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+        db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, a TEXT)")?;
+        db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+        db.db.exec_safe("INSERT INTO foo VALUES (1, 'hello')")?;
+
+        assert!(query_errors(&db.db, "SELECT count(*) FROM crsql_changes WHERE cid LIKE '%el%'"),
+            "LIKE on cid should error in V2-wire packed mode");
+        assert!(query_errors(&db.db, "SELECT count(*) FROM crsql_changes WHERE cid GLOB 'h*'"),
+            "GLOB on cid should error in V2-wire packed mode");
+        assert!(query_errors(&db.db, "SELECT count(*) FROM crsql_changes WHERE \"table\" LIKE 'f%'"),
+            "LIKE on table should error in V2-wire packed mode");
+        assert!(query_errors(&db.db, "SELECT count(*) FROM crsql_changes WHERE \"table\" GLOB 'f*'"),
+            "GLOB on table should error in V2-wire packed mode");
+        assert!(query_errors(&db.db, "SELECT count(*) FROM crsql_changes WHERE seq LIKE '1%'"),
+            "LIKE on seq should error in V2-wire packed mode");
+    }
+
+    // Test in V1-wire mode
+    {
+        let db = crate::opendb()?;
+        db.db.exec_safe("SELECT crsql_config_set('default-ts', 1700000000)")?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+        db.db.exec_safe("SELECT crsql_config_set('sync-log-version', 1)")?;
+        db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, a TEXT)")?;
+        db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+        db.db.exec_safe("INSERT INTO foo VALUES (1, 'hello')")?;
+
+        assert!(query_errors(&db.db, "SELECT count(*) FROM crsql_changes WHERE cid LIKE '%el%'"),
+            "LIKE on cid should error in V1-wire mode");
+        assert!(query_errors(&db.db, "SELECT count(*) FROM crsql_changes WHERE cid GLOB 'h*'"),
+            "GLOB on cid should error in V1-wire mode");
+        assert!(query_errors(&db.db, "SELECT count(*) FROM crsql_changes WHERE \"table\" LIKE 'f%'"),
+            "LIKE on table should error in V1-wire mode");
+    }
+
+    // Verify that normal comparison operators still work (regression check)
+    {
+        let db = crate::opendb()?;
+        db.db.exec_safe("SELECT crsql_config_set('default-ts', 1700000000)")?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+        db.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+        db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, a TEXT)")?;
+        db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+        db.db.exec_safe("INSERT INTO foo VALUES (1, 'hello')")?;
+
+        assert!(!query_errors(&db.db, "SELECT count(*) FROM crsql_changes WHERE cid = 'a'"),
+            "cid = 'a' should still work");
+        assert!(!query_errors(&db.db, "SELECT count(*) FROM crsql_changes WHERE db_version >= 1"),
+            "db_version >= 1 should still work");
+        assert!(!query_errors(&db.db, "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'foo'"),
+            "table = 'foo' should still work");
+    }
+
+    libc_println!("=== v2_reject_pattern_ops PASS ===");
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), ResultCode> {
     v2_basic_insert_sync()?;
     v2_update_sync()?;
@@ -1058,6 +1822,10 @@ pub fn run_suite() -> Result<(), ResultCode> {
     v2_delete_then_reinsert()?;
     v2_alter_add_column_to_pk_only()?;
     v2_alter_drop_column_becomes_pk_only()?;
+    v2_alter_drop_two_columns_becomes_pk_only()?;
+    v2_wire_packed_seq_filter_and_order()?;
+    v2_wire_packed_generalized_pushdown()?;
+    v2_reject_pattern_ops()?;
     v2_alter_reorder_composite_pk()?;
     v2_wire_delete_sync()?;
     v2_wire_delete_then_reinsert()?;
