@@ -64,9 +64,12 @@ pub fn parse_directives(create_sql: &str) -> alloc::collections::BTreeMap<String
     let mut search_pos = 0;
     while let Some(comment_start) = create_sql[search_pos..].find("/*") {
         let abs_start = search_pos + comment_start;
-        if let Some(comment_end_rel) = create_sql[abs_start..].find("*/") {
-            let abs_end = abs_start + comment_end_rel + 2;
-            let comment_body = &create_sql[abs_start + 2..abs_start + comment_end_rel];
+        // Search for the comment terminator starting after the "/*" opener,
+        // so that "/*/" (an empty/unterminated comment) does not match at
+        // offset 1 and produce an invalid slice [abs_start+2 .. abs_start+1].
+        if let Some(comment_end_rel) = create_sql[abs_start + 2..].find("*/") {
+            let abs_end = abs_start + 2 + comment_end_rel + 2;
+            let comment_body = &create_sql[abs_start + 2..abs_start + 2 + comment_end_rel];
 
             // Check for crsql: prefix (case-insensitive)
             let trimmed = comment_body.trim();
@@ -174,6 +177,30 @@ mod tests {
         let sql = "CREATE TABLE foo /* crsql: skip_hash=1 (id INTEGER PRIMARY KEY)";
         let directives = parse_directives(sql);
         assert!(directives.is_empty()); // unterminated → no directives
+    }
+
+    #[test]
+    fn test_parse_directives_slash_star_slash() {
+        // "/*/" must not panic — it is a valid (empty/unterminated) comment start
+        let sql = "CREATE TABLE foo /*/ (id INTEGER PRIMARY KEY)";
+        let directives = parse_directives(sql);
+        assert!(directives.is_empty());
+    }
+
+    #[test]
+    fn test_parse_directives_slash_star_slash_with_directive() {
+        // "/*/" followed by a real comment with a directive
+        let sql = "CREATE TABLE foo /*/ /* crsql: skip_hash=1 */ (id INTEGER PRIMARY KEY)";
+        let directives = parse_directives(sql);
+        assert_eq!(directives.get("skip_hash"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn test_parse_directives_empty_comment() {
+        // "/**/" is an empty comment — should not panic
+        let sql = "CREATE TABLE foo /**/ (id INTEGER PRIMARY KEY)";
+        let directives = parse_directives(sql);
+        assert!(directives.is_empty());
     }
 
     #[test]
