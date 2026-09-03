@@ -121,6 +121,7 @@ unsafe fn sync_col_map_v2(
         }
     }
 
+
     // Batch delete dropped columns from col_map
     if !dropped_col_ids.is_empty() {
         let placeholders = dropped_col_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
@@ -137,9 +138,19 @@ unsafe fn sync_col_map_v2(
 
     // If the table will become PK-only, migrate one dropped column's clock
     // entries to col_id=0 to preserve row modification history.
+    // populate_col_map assigns 0-based col_ids, so the first non-PK column may
+    // already use col_id=0 — in that case migrate_col_id is 0 and we skip the
+    // UPDATE (entries are already at the sentinel position).
     let col_id_mask = consts::CRSQL_COL_ID_MASK as i64;
     if will_be_pk_only && !dropped_col_ids.is_empty() {
-        let migrate_col_id = dropped_col_ids.pop().unwrap();
+        // If col_id=0 is among the dropped, pop it specifically — its entries
+        // are already at the sentinel position, so skip migration and keep them
+        // out of the batch delete below. Otherwise pop the last element to migrate.
+        let migrate_col_id = if let Some(pos) = dropped_col_ids.iter().position(|&c| c == 0) {
+            dropped_col_ids.swap_remove(pos)
+        } else {
+            dropped_col_ids.pop().unwrap()
+        };
         if migrate_col_id != 0 {
             let stmt = db.prepare_v2(&format!(
                 "UPDATE \"{}{}\" SET cell_key = cell_key & ~{} WHERE cell_key & {} = ?\0",
