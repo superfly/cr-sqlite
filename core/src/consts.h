@@ -36,6 +36,6 @@
 // 00 00 00 00
 // Given we can't prefix an int with 0s, read from right to left.
 // Rightmost is always `bb`
-#define CRSQLITE_VERSION 130000
+#define CRSQLITE_VERSION 180000
 
 #endif

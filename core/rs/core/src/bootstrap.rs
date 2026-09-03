@@ -168,11 +168,8 @@ fn maybe_update_db_inner(
     if is_blank_slate {
         recorded_version = consts::CRSQLITE_VERSION;
     } else {
-        let stmt =
-            db.prepare_v2("SELECT value FROM crsql_master WHERE key = 'crsqlite_version'")?;
-        let step_result = stmt.step()?;
-        if step_result == ResultCode::ROW {
-            recorded_version = stmt.column_int(0);
+        if let Some(v) = unsafe { crate::util::get_master_value(db, "crsqlite_version") }? {
+            recorded_version = v as c_int;
         }
     }
     // libc_print::libc_println!("recorded_version: {}", recorded_version);
@@ -184,15 +181,78 @@ fn maybe_update_db_inner(
             return Err(ResultCode::ERROR);
         }
     }
+    // TODO(0.19): Disallow opening 0.17 DBs (recorded_version < CRSQLITE_VERSION_0_18_0).
+    // Only accept fully migrated 0.18 DBs (all CRRs migrated to V2 metadata, no V1 tables).
+    // 0.19 will drop V1 metadata + V1 wire format entirely, so any DB still on V1
+    // metadata must be migrated on 0.18 before upgrading.
+
+    // Validate compile-time format constants against stored values.
+    // If stored: refuse to operate if they differ. If not stored: store them.
+    validate_or_store_compile_constants(db, err_msg)?;
 
     // write the db version if we migrated to a new one or we are a blank slate db
     if recorded_version < consts::CRSQLITE_VERSION || is_blank_slate {
-        let stmt =
-            db.prepare_v2("INSERT OR REPLACE INTO crsql_master VALUES ('crsqlite_version', ?)")?;
-        stmt.bind_int(1, consts::CRSQLITE_VERSION)?;
-        stmt.step()?;
+        // Recreate all CRR triggers when upgrading versions.
+        // Trigger SQL may have changed (e.g., rowid arg added in 0.18).
+        // CREATE TRIGGER IF NOT EXISTS won't update existing triggers, so we
+        // must drop and recreate them.
+        if !is_blank_slate && recorded_version < consts::CRSQLITE_VERSION {
+            recreate_all_triggers(db, err_msg)?;
+        }
+
+        unsafe { crate::util::set_master_value(db, "crsqlite_version", consts::CRSQLITE_VERSION as i64) }?;
     }
 
+    Ok(ResultCode::OK)
+}
+
+/// Drop and recreate all CRR triggers on version upgrade.
+/// Trigger SQL may change between versions (e.g., rowid arg added in 0.18),
+/// and CREATE TRIGGER IF NOT EXISTS won't update existing triggers.
+fn recreate_all_triggers(
+    db: *mut sqlite3,
+    err_msg: *mut *mut c_char,
+) -> Result<ResultCode, ResultCode> {
+    let table_infos = crate::tableinfo::pull_all_table_infos(db, core::ptr::null_mut(), err_msg)?;
+    for tbl_info in &table_infos {
+        crate::teardown::remove_crr_triggers_if_exist(db, &tbl_info.tbl_name)?;
+        crate::triggers::create_triggers(db, tbl_info, err_msg)?;
+    }
+    Ok(ResultCode::OK)
+}
+
+/// Compile-time constants that affect on-disk data format.
+/// Stored in crsql_master on first load and validated on subsequent loads.
+const COMPILE_CONST_KEYS: &[(&str, i32)] = &[
+    ("crsql_col_id_bits", consts::CRSQL_COL_ID_BITS as i32),
+    ("crsql_pk_hash_size", consts::PK_HASH_SIZE as i32),
+    ("crsql_site_id_len", consts::SITE_ID_LEN),
+];
+
+fn validate_or_store_compile_constants(
+    db: *mut sqlite3,
+    err_msg: *mut *mut c_char,
+) -> Result<ResultCode, ResultCode> {
+    for (key, compile_val) in COMPILE_CONST_KEYS {
+        match unsafe { crate::util::get_master_value(db, key) }? {
+            Some(stored_val) if stored_val != *compile_val as i64 => {
+                let cstring = CString::new(format!(
+                    "cr-sqlite compile-time constant mismatch: '{}' was compiled as {} but the database expects {}. \
+                    The on-disk data format is incompatible with this build of the extension.",
+                    key, compile_val, stored_val
+                ))?;
+                unsafe {
+                    (*err_msg) = cstring.into_raw();
+                }
+                return Err(ResultCode::ERROR);
+            }
+            Some(_) => {} // matches
+            None => {
+                // Key not stored yet (blank slate or upgrading from 0.17): store the compile-time value
+                unsafe { crate::util::set_master_value(db, key, *compile_val as i64) }?;
+            }
+        }
+    }
     Ok(ResultCode::OK)
 }
 

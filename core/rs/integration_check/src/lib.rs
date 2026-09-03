@@ -15,8 +15,6 @@ use sqlite_nostd as sqlite;
  */
 #[no_mangle]
 pub extern "C" fn crsql_integration_check() {
-    println!("Running automigrate");
-    t::automigrate::run_suite().expect("automigrate suite");
     println!("Running backfill");
     t::backfill::run_suite().expect("backfill suite");
     println!("Running fract");
@@ -35,6 +33,16 @@ pub extern "C" fn crsql_integration_check() {
     t::test_cl_set_vtab::run_suite().expect("test cl set vtab suite");
     println!("Running db_version");
     t::test_db_version::run_suite().expect("test db version suite");
+    println!("Running v2_tests");
+    t::v2_tests::run_suite().expect("v2 tests suite");
+    println!("Running v2_compat_tests");
+    t::v2_compat_tests::run_suite().expect("v2 compat tests suite");
+    println!("Running seeded_snapshot");
+    t::seeded_snapshot::run_suite().expect("seeded snapshot suite");
+    println!("Running rowid_check");
+    t::rowid_check::run_suite().expect("rowid check suite");
+    println!("Running skip_hash_tests");
+    t::skip_hash_tests::run_suite().expect("skip_hash tests suite");
 }
 
 pub fn opendb() -> Result<CRConnection, ResultCode> {

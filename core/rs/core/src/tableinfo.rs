@@ -2,6 +2,7 @@ use crate::alloc::string::ToString;
 use crate::c::crsql_ExtData;
 use crate::c::crsql_fetchPragmaSchemaVersion;
 use crate::c::TABLE_INFO_SCHEMA_VERSION;
+use crate::consts;
 use crate::pack_columns::bind_package_to_stmt;
 use crate::pack_columns::ColumnValue;
 use crate::stmt_cache::reset_cached_stmt;
@@ -14,6 +15,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::Ref;
 use core::cell::RefCell;
+use core::cell::RefMut;
 use core::ffi::c_char;
 use core::ffi::c_int;
 use core::ffi::c_void;
@@ -30,10 +32,60 @@ use sqlite_nostd::StrRef;
 
 // TODO: make this configurable with a crsql_config_set.
 const MAX_CL_CACHE_SIZE: usize = 1500;
+
+/// Which metadata schema version is active for a table.
+/// Set at TableInfo creation time based on config flags and which tables physically exist.
+#[derive(PartialEq, Debug, Copy, Clone)]
+pub enum SchemaVersion {
+    V1,
+    V2,
+    V2AndV1,
+}
+
 pub struct TableInfo {
     pub tbl_name: String,
     pub pks: Vec<ColumnInfo>,
     pub non_pks: Vec<ColumnInfo>,
+    pub schema_version: SchemaVersion,
+    /// True when __crsql_key in v2_pks is the SQLite rowid of the base table.
+    /// This means v2_pks uses the compact schema (__crsql_key, [hashed_pk], cl)
+    /// where __crsql_key = rowid, and PK values are fetched from the base table via
+    /// SELECT pk_cols WHERE rowid = ? when needed.
+    ///
+    /// Can be explicitly disabled for rowid tables (via `without_rowid` option to
+    /// crsql_as_crr), but cannot be enabled for WITHOUT ROWID tables (no rowid to use).
+    ///
+    /// When false (WITHOUT ROWID tables or explicitly disabled), __crsql_key is an
+    /// auto-incremented integer and PK columns are stored directly in v2_pks.
+    ///
+    /// Relationship with has_integer_pk:
+    ///   key_is_rowid = true  → __crsql_key = rowid
+    ///   has_integer_pk = true → PK value = rowid
+    ///   Both true            → __crsql_key = PK value (can use PK directly, no JOIN)
+    ///   key_is_rowid only    → need JOIN to map PK → rowid → __crsql_key
+    pub key_is_rowid: bool,
+    /// True when the table has an INTEGER PRIMARY KEY column.
+    /// In SQLite, `INTEGER PRIMARY KEY` is a rowid alias — the PK value IS the rowid.
+    /// When combined with key_is_rowid, this means __crsql_key = PK value, so
+    /// unpacked_pks[0] can be used directly as __crsql_key without any JOIN.
+    /// See key_is_rowid doc for the full relationship matrix.
+    pub has_integer_pk: bool,
+    /// The column name to use as the rowid alias for JOINs/ad-hoc queries.
+    /// For INTEGER PRIMARY KEY tables: the PK column name (e.g. "id").
+    /// For plain rowid tables: "rowid" (or first unshadowed built-in alias).
+    /// Only valid when key_is_rowid is true.
+    pub rowid_alias: String,
+    /// True when hashing is skipped for this table's PK.
+    /// Tombstones store the PK value directly (no hashed_pk BLOB column).
+    /// v2_tombstone_pks table is not created. Lookups use the PK value
+    /// directly instead of a hash. Independent of key_is_rowid.
+    /// Auto-qualified for single integer-affinity PKs; can be manually enabled
+    /// for other single-column PKs via schema directive or as_crr option.
+    /// Requires single-column PK — composite PKs fall back to hash mode.
+    pub skip_hash: bool,
+    /// Pre-computed escaped single PK column name for skip_hash mode.
+    /// Only valid when skip_hash is true (which requires pks.len() == 1).
+    pub skip_hash_pk_col: String,
 
     // Lookaside --
     // insert returning?
@@ -70,6 +122,9 @@ pub struct TableInfo {
     mark_locally_created_stmt: RefCell<Option<ManagedStmt>>,
     maybe_mark_locally_reinserted_stmt: RefCell<Option<ManagedStmt>>,
     cl_cache: BTreeMap<i64, i64>,
+    /// Cached V2 prepared statements. None if table is not V2-enabled,
+    /// or if statements haven't been prepared yet.
+    v2_stmts: RefCell<Option<crate::v2_stmts::V2Stmts>>,
 }
 
 impl TableInfo {
@@ -705,6 +760,26 @@ impl TableInfo {
         col_info.get_row_patch_data_stmt(self, db)
     }
 
+    /// Get or lazily prepare V2 cached statements.
+    /// If merge_equal has changed since last prepare, re-prepares.
+    /// The caller must hold the borrow for the duration of statement use.
+    pub fn get_v2_stmts(
+        &self,
+        db: *mut sqlite3,
+        ext_data: *mut crate::c::crsql_ExtData,
+    ) -> Result<RefMut<Option<crate::v2_stmts::V2Stmts>>, ResultCode> {
+        let merge_equal = unsafe { (*ext_data).mergeEqualValues };
+        let needs_prepare = match self.v2_stmts.try_borrow()?.as_ref() {
+            None => true,
+            Some(s) => s.merge_equal() != merge_equal,
+        };
+        if needs_prepare {
+            let stmts = crate::v2_stmts::V2Stmts::prepare(db, self, merge_equal)?;
+            *self.v2_stmts.try_borrow_mut()? = Some(stmts);
+        }
+        Ok(self.v2_stmts.try_borrow_mut()?)
+    }
+
     pub fn clear_stmts(&self) -> Result<ResultCode, ResultCode> {
         // finalize all stmts
         let mut stmt = self.set_winner_clock_stmt.try_borrow_mut()?;
@@ -744,6 +819,10 @@ impl TableInfo {
         let mut stmt = self.select_key_stmt.try_borrow_mut()?;
         stmt.take();
 
+        // V2 cached statements
+        let mut v2 = self.v2_stmts.try_borrow_mut()?;
+        v2.take();
+
         // primary key columns shouldn't have statements? right?
         for col in &self.non_pks {
             col.clear_stmts()?;
@@ -763,6 +842,7 @@ impl Drop for TableInfo {
 pub struct ColumnInfo {
     pub cid: i32,
     pub name: String,
+    pub col_type: String,
     // > 0 if it is a primary key columns
     // the value refers to the position in the `PRIMARY KEY (cols...)` statement
     pub pk: i32,
@@ -875,16 +955,16 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
     ext_data: *mut crsql_ExtData,
     err: *mut *mut c_char,
 ) -> c_int {
-    let already_updated = unsafe { (*ext_data).updatedTableInfosThisTx == 1 };
-    if already_updated {
-        return ResultCode::OK as c_int;
-    }
-
     let schema_changed =
         unsafe { crsql_fetchPragmaSchemaVersion(db, ext_data, TABLE_INFO_SCHEMA_VERSION) };
 
     if schema_changed < 0 {
         return ResultCode::ERROR as c_int;
+    }
+
+    let already_updated = unsafe { (*ext_data).updatedTableInfosThisTx == 1 };
+    if already_updated && schema_changed == 0 {
+        return ResultCode::OK as c_int;
     }
 
     let mut table_infos: Box<Vec<TableInfo>> =
@@ -914,36 +994,27 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
     return ResultCode::OK as c_int;
 }
 
-fn pull_all_table_infos(
+pub fn pull_all_table_infos(
     db: *mut sqlite::sqlite3,
-    ext_data: *mut crsql_ExtData,
+    _ext_data: *mut crsql_ExtData,
     err: *mut *mut c_char,
 ) -> Result<Vec<TableInfo>, ResultCode> {
-    let mut clock_table_names = vec![];
-    let stmt = unsafe { (*ext_data).pSelectClockTablesStmt };
-    loop {
-        match stmt.step() {
-            Ok(ResultCode::ROW) => {
-                clock_table_names.push(stmt.column_text(0).to_string());
-            }
-            Ok(ResultCode::DONE) => {
-                stmt.reset()?;
-                break;
-            }
-            Ok(rc) | Err(rc) => {
-                stmt.reset()?;
-                return Err(rc);
-            }
-        }
-    }
+    // Discover CRR tables via their clock tables. V1 tables use the
+    // __crsql_clock suffix; V2 tables use __crsql_v2_clock (consts::V2_CLOCK_SUFFIX).
+    // find_tables_with_suffix returns base table names with the suffix already stripped.
+    // Note: LIKE '%__crsql_clock' does not match '__crsql_v2_clock' tables, so the
+    // two queries are disjoint.
+    let mut clock_table_names = crate::config::find_tables_with_suffix(db, "__crsql_clock")?;
+    clock_table_names.extend(crate::config::find_tables_with_suffix(db, consts::V2_CLOCK_SUFFIX)?);
 
+    let mut seen = alloc::collections::BTreeSet::new();
     let mut ret = vec![];
-    for name in clock_table_names {
-        ret.push(pull_table_info(
-            db,
-            &name[0..(name.len() - "__crsql_clock".len())],
-            err,
-        )?)
+    for base_name in clock_table_names {
+        if seen.contains(base_name.as_str()) {
+            continue;
+        }
+        seen.insert(base_name.clone());
+        ret.push(pull_table_info(db, &base_name, err)?);
     }
 
     Ok(ret)
@@ -973,7 +1044,7 @@ pub fn pull_table_info(
     };
 
     let sql = format!(
-        "SELECT \"cid\", \"name\", \"pk\"
+        "SELECT \"cid\", \"name\", \"type\", \"pk\"
          FROM pragma_table_info('{table}') ORDER BY cid ASC"
     );
     let column_infos = match db.prepare_v2(&sql) {
@@ -983,8 +1054,9 @@ pub fn pull_table_info(
             while stmt.step()? == ResultCode::ROW {
                 cols.push(ColumnInfo {
                     name: stmt.column_text(1)?.to_string(),
+                    col_type: stmt.column_text(2)?.to_string(),
                     cid: stmt.column_int(0),
-                    pk: stmt.column_int(2),
+                    pk: stmt.column_int(3),
                     curr_value_stmt: RefCell::new(None),
                     merge_insert_stmt: RefCell::new(None),
                     row_patch_data_stmt: RefCell::new(None),
@@ -1003,13 +1075,198 @@ pub fn pull_table_info(
         }
     };
 
+    // Check alias shadowing before partition consumes column_infos
+    let has_rowid_col = column_infos.iter().any(|c| c.name == "rowid");
+    let has_oid_col = column_infos.iter().any(|c| c.name == "oid");
+    let has_rowid_under_col = column_infos.iter().any(|c| c.name == "_rowid_");
+    let all_aliases_shadowed = has_rowid_col && has_oid_col && has_rowid_under_col;
+
     let (mut pks, non_pks): (Vec<_>, Vec<_>) = column_infos.into_iter().partition(|x| x.pk > 0);
     pks.sort_by_key(|x| x.pk);
+
+    // Detect rowid key optimization per design doc §3:
+    // 1. INTEGER PRIMARY KEY exists (pk > 0 AND type = 'INTEGER') → it IS the rowid alias.
+    // 2. No INTEGER PRIMARY KEY, but none of rowid/oid/_rowid_ are shadowed → rowid accessible.
+    // 3. All three aliases shadowed AND no INTEGER PRIMARY KEY → auto-increment fallback.
+    // INTEGER PRIMARY KEY is only a rowid alias for single-column PKs.
+    // Composite PKs (even if all INTEGER) are never rowid aliases.
+    let integer_pk = if pks.len() == 1 {
+        pks.iter().find(|pk| {
+            let type_sql = format!(
+                "SELECT type FROM pragma_table_info('{table}') WHERE name = '{pk_name}'",
+                table = crate::util::escape_ident_as_value(table),
+                pk_name = crate::util::escape_ident_as_value(&pk.name),
+            );
+            db.prepare_v2(&type_sql).and_then(|stmt| {
+                stmt.step()?;
+                Ok(stmt.column_text(0)?.to_string() == "INTEGER")
+            }).unwrap_or(false)
+        })
+    } else {
+        None
+    };
+
+    // Determine the rowid alias to use for ad-hoc queries
+    let rowid_alias = if let Some(pk) = integer_pk {
+        // Case 1: INTEGER PRIMARY KEY — the PK column IS the rowid alias
+        pk.name.clone()
+    } else if !all_aliases_shadowed {
+        // Case 2: pick first unshadowed built-in alias
+        if !has_rowid_col {
+            "rowid".to_string()
+        } else if !has_oid_col {
+            "oid".to_string()
+        } else {
+            "_rowid_".to_string()
+        }
+    } else {
+        // Case 3: fallback — no alias
+        String::new()
+    };
+
+    let rowid_accessible = integer_pk.is_some() || !all_aliases_shadowed;
+    let has_integer_pk = integer_pk.is_some();
+
+    // key_is_rowid: use the table's rowid as __crsql_key.
+    // Only safe for INTEGER PRIMARY KEY tables (rowid alias = PK value, stable).
+    // Implicit rowids on other tables can be renumbered by VACUUM — never use them.
+    // The default is always non-rowid; use_rowid=1 can override for INTEGER PK tables.
+    // Note: SQLite allows SELECT "rowid" FROM <WITHOUT ROWID table> to prepare
+    // successfully, so we must check pragma_table_list(wr) to detect WITHOUT ROWID.
+    let is_without_rowid = db.count(&format!(
+        "SELECT wr FROM pragma_table_list('{name}')",
+        name = crate::util::escape_ident_as_value(table),
+    )).map(|v| v == 1).unwrap_or(false);
+    // Initial value: false for all tables. Only set to true if:
+    // 1. The table has INTEGER PRIMARY KEY (rowid alias, stable), AND
+    // 2. The table is not WITHOUT ROWID, AND
+    // 3. The caller explicitly requests use_rowid=1 (handled in create_crr).
+    // On first registration (no persisted flag), always defaults to false.
+    // On subsequent calls, the persisted use_rowid flag overrides.
+    let mut key_is_rowid = false;
+
+    // Detect V2 metadata tables
+    let has_v2 = crate::bootstrap_v2::has_v2_tables(db, table).unwrap_or(false);
+
+    // Detect skip_hash: auto-qualified for single integer-affinity PK,
+    // or manually enabled via schema directive / crsql_master flag.
+    // skip_hash requires a single-column PK — composite PKs are not supported.
+    // Auto-qualification: pks.len() == 1 AND PK type contains "INT".
+    let auto_skip_hash = pks.len() == 1 && {
+        let pk_type = &pks[0].col_type;
+        pk_type.to_uppercase().contains("INT")
+    };
+
+    // Check for schema directive or persisted flag
+    // Returns Some(true) = explicitly enabled, Some(false) = explicitly disabled, None = not set
+    let manual_skip_hash: Option<bool> = if has_v2 {
+        // v2_pks exists — infer from its schema (presence/absence of hashed_pk column)
+        let v2_pks_name = format!("{}{}", crate::util::escape_ident_as_value(table), consts::V2_PKS_SUFFIX);
+        let has_hashed_pk_stmt = db.prepare_v2(&format!(
+            "SELECT count(*) FROM pragma_table_info('{name}') WHERE name = 'hashed_pk'",
+            name = v2_pks_name,
+        ));
+        if let Ok(stmt) = has_hashed_pk_stmt {
+            if stmt.step().unwrap_or(ResultCode::DONE) == ResultCode::ROW {
+                Some(stmt.column_int(0) == 0) // no hashed_pk column → skip_hash mode
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        // v2_pks doesn't exist yet — check crsql_master for skip_hash flag
+        // persisted by create_crr, or check schema directive in sqlite_master
+        let persisted: Option<bool> = unsafe { crate::util::get_master_value(db, &format!("skip_hash_{}", table)) }
+            .ok()
+            .flatten()
+            .map(|v| v == 1);
+        if let Some(p) = persisted {
+            Some(p)
+        } else {
+            // Check schema directive in sqlite_master (tri-state)
+            crate::schema_directive::read_skip_hash_directive_opt(db, table).unwrap_or(None)
+        }
+    };
+
+    // skip_hash resolution:
+    // - If v2_pks exists: manual_skip_hash is the source of truth (persisted schema).
+    // - If v2_pks doesn't exist yet:
+    //   - Explicit directive (Some) overrides auto-qualification.
+    //   - No directive (None): auto-qualification applies.
+    // Enforcement: skip_hash requires a single-column PK. If a composite PK table
+    // has skip_hash explicitly enabled via directive, ignore it (fall back to hash mode).
+    let skip_hash = if has_v2 {
+        manual_skip_hash.unwrap_or(false)
+    } else {
+        match manual_skip_hash {
+            Some(explicit) => {
+                if explicit && pks.len() != 1 {
+                    // Reject skip_hash=1 on composite PK tables — not supported.
+                    false
+                } else {
+                    explicit
+                }
+            }
+            None => auto_skip_hash,
+        }
+    };
+
+    // Pre-compute escaped PK column name for skip_hash mode (requires single PK)
+    let skip_hash_pk_col = if skip_hash && !pks.is_empty() {
+        crate::util::escape_ident(&pks[0].name)
+    } else {
+        String::new()
+    };
+
+    // Check crsql_master for persisted use_rowid flag (set by create_crr).
+    // Value: 1 = force rowid-key, 0 = force non-rowid-key, absent = auto-detect.
+    let persisted_use_rowid: Option<bool> = unsafe {
+        crate::util::get_master_value(db, &format!("use_rowid_{}", table))
+    }
+    .ok()
+    .flatten()
+    .map(|v| v == 1);
+
+    if let Some(force_rowid) = persisted_use_rowid {
+        key_is_rowid = force_rowid;
+    } else {
+        // Auto-detect: only use rowid-key mode for INTEGER PRIMARY KEY tables.
+        // INTEGER PK is a rowid alias — the rowid IS the PK value, so it's stable.
+        // Other rowid tables (INT PK, TEXT PK, etc.) have implicit rowids that can
+        // be renumbered by VACUUM, making them unsafe as persistent keys.
+        // INTEGER PK defaults to non-rowid anyway (overflow safety), so auto-detect
+        // always results in non-rowid unless explicitly overridden via use_rowid=1.
+        key_is_rowid = false;
+    }
+    // from rowid_accessible (INTEGER PK or unshadowed rowid aliases).
+    let has_v1 = {
+        let stmt = db.prepare_v2(&format!(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND tbl_name = '{escaped}{suffix}'",
+            escaped = crate::util::escape_ident_as_value(table),
+            suffix = "__crsql_clock"
+        ))?;
+        stmt.step()? == ResultCode::ROW
+    };
+    let schema_version = if has_v2 && has_v1 {
+        SchemaVersion::V2AndV1
+    } else if has_v2 {
+        SchemaVersion::V2
+    } else {
+        SchemaVersion::V1
+    };
 
     Ok(TableInfo {
         tbl_name: table.to_string(),
         pks,
         non_pks,
+        schema_version,
+        key_is_rowid,
+        has_integer_pk,
+        rowid_alias,
+        skip_hash,
+        skip_hash_pk_col,
         set_winner_clock_stmt: RefCell::new(None),
         local_cl_stmt: RefCell::new(None),
         col_version_stmt: RefCell::new(None),
@@ -1033,6 +1290,7 @@ pub fn pull_table_info(
         insert_clock_stmt: RefCell::new(None),
         update_clock_stmt: RefCell::new(None),
         cl_cache: BTreeMap::new(),
+        v2_stmts: RefCell::new(None),
     })
 }
 

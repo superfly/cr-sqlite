@@ -18,6 +18,7 @@ use crate::tableinfo::{crsql_ensure_table_infos_are_up_to_date, ColumnInfo, Tabl
 pub mod after_delete;
 pub mod after_insert;
 pub mod after_update;
+pub mod v2;
 
 fn trigger_fn_preamble<F>(
     ctx: *mut sqlite::context,
@@ -44,6 +45,9 @@ where
             rc
         ));
     }
+
+    // Apply default-ts when configured; V2 paths still error if ts stays 0.
+    let _ = unsafe { crate::config::ensure_timestamp(ext_data) };
 
     let mut table_infos =
         unsafe { ManuallyDrop::new(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>)) };
@@ -111,7 +115,7 @@ fn mark_new_pk_row_created(
     result
 }
 
-fn bump_seq(ext_data: *mut crsql_ExtData) -> c_int {
+pub fn bump_seq(ext_data: *mut crsql_ExtData) -> c_int {
     unsafe {
         (*ext_data).seq += 1;
         (*ext_data).seq - 1

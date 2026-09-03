@@ -12,7 +12,8 @@ pub static DELETE_SENTINEL: &str = "-1";
 pub static _DB_VERSION_SCHEMA_VERSION: c_int = 0;
 pub static TABLE_INFO_SCHEMA_VERSION: c_int = 1;
 
-#[derive(FromPrimitive, PartialEq, Debug)]
+#[repr(u8)]
+#[derive(FromPrimitive, PartialEq, Debug, Clone, Copy)]
 pub enum CrsqlChangesColumn {
     Tbl = 0,
     Pk = 1,
@@ -38,13 +39,18 @@ pub enum ClockUnionColumn {
     Seq = 7,
     Cl = 8,
     Ts = 9,
+    Cval = 10,
 }
 
+// TODO(0.19): Remove ChangeRowType entirely once V1 wire format is dropped.
+// In V2-only mode, all rows are packed and the row type discrimination
+// (Update vs PackedUpdate, lazy cval fetch, etc.) is no longer needed.
 #[derive(FromPrimitive, PartialEq, Debug)]
 pub enum ChangeRowType {
     Update = 0,
     Delete = 1,
     PkOnly = 2,
+    PackedUpdate = 3,
 }
 
 #[repr(C)]
@@ -72,7 +78,11 @@ pub struct crsql_ExtData {
     pub pSelectSiteIdOrdinalStmt: *mut sqlite::stmt,
     pub pSelectClockTablesStmt: *mut sqlite::stmt,
     pub mergeEqualValues: ::core::ffi::c_int,
+    pub metadataWriteVersion: ::core::ffi::c_int,
+    pub metadataUseVersion: ::core::ffi::c_int,
+    pub syncLogVersion: ::core::ffi::c_int,
     pub timestamp: ::core::ffi::c_ulonglong,
+    pub defaultTimestamp: ::core::ffi::c_ulonglong,
     pub ordinalMap: *mut ::core::ffi::c_void,
 }
 
@@ -97,6 +107,15 @@ pub struct crsql_Changes_cursor {
     pub rowType: ::core::ffi::c_int,
     pub changesRowid: sqlite::int64,
     pub tblInfoIdx: ::core::ffi::c_int,
+    /// Cached prepared statement for reuse across xFilter calls.
+    /// On DONE, pChangesStmt is reset and moved here; pChangesStmt is set to null
+    /// so changes_eof sees EOF. On next xFilter, if cache key matches, we move it back.
+    pub cached_pChangesStmt: *mut sqlite::stmt,
+    /// Cache key for pChangesStmt reuse across xFilter calls.
+    pub cached_idx_str: *const c_char,
+    pub cached_meta_use_version: c_int,
+    pub cached_sync_log_version: c_int,
+    pub cached_schema_version: c_int,
 }
 
 extern "C" {
@@ -174,7 +193,7 @@ fn bindgen_test_layout_crsql_Changes_cursor() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::core::mem::size_of::<crsql_Changes_cursor>(),
-        64usize,
+        96usize,
         concat!("Size of: ", stringify!(crsql_Changes_cursor))
     );
     assert_eq!(
@@ -262,6 +281,56 @@ fn bindgen_test_layout_crsql_Changes_cursor() {
             stringify!(tblInfoIdx)
         )
     );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).cached_pChangesStmt) as usize - ptr as usize },
+        64usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_Changes_cursor),
+            "::",
+            stringify!(cached_pChangesStmt)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).cached_idx_str) as usize - ptr as usize },
+        72usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_Changes_cursor),
+            "::",
+            stringify!(cached_idx_str)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).cached_meta_use_version) as usize - ptr as usize },
+        80usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_Changes_cursor),
+            "::",
+            stringify!(cached_meta_use_version)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).cached_sync_log_version) as usize - ptr as usize },
+        84usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_Changes_cursor),
+            "::",
+            stringify!(cached_sync_log_version)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).cached_schema_version) as usize - ptr as usize },
+        88usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_Changes_cursor),
+            "::",
+            stringify!(cached_schema_version)
+        )
+    );
 }
 
 #[test]
@@ -271,7 +340,7 @@ fn bindgen_test_layout_crsql_ExtData() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::core::mem::size_of::<crsql_ExtData>(),
-        168usize,
+        184usize,
         concat!("Size of: ", stringify!(crsql_ExtData))
     );
     assert_eq!(
@@ -492,8 +561,38 @@ fn bindgen_test_layout_crsql_ExtData() {
         )
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).timestamp) as usize - ptr as usize },
+        unsafe { ::core::ptr::addr_of!((*ptr).metadataWriteVersion) as usize - ptr as usize },
+        148usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_ExtData),
+            "::",
+            stringify!(metadataWriteVersion)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).metadataUseVersion) as usize - ptr as usize },
         152usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_ExtData),
+            "::",
+            stringify!(metadataUseVersion)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).syncLogVersion) as usize - ptr as usize },
+        156usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_ExtData),
+            "::",
+            stringify!(syncLogVersion)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).timestamp) as usize - ptr as usize },
+        160usize,
         concat!(
             "Offset of field: ",
             stringify!(crsql_ExtData),
@@ -502,8 +601,18 @@ fn bindgen_test_layout_crsql_ExtData() {
         )
     );
     assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).defaultTimestamp) as usize - ptr as usize },
+        168usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_ExtData),
+            "::",
+            stringify!(defaultTimestamp)
+        )
+    );
+    assert_eq!(
         unsafe { ::core::ptr::addr_of!((*ptr).ordinalMap) as usize - ptr as usize },
-        160usize,
+        176usize,
         concat!(
             "Offset of field: ",
             stringify!(crsql_ExtData),

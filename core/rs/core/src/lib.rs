@@ -4,12 +4,20 @@
 // TODO: these pub mods are exposed for the integration testing
 // we should re-export in a `test` mod such that they do not become public apis
 mod alter;
-mod automigrate;
+mod alter_v2;
 mod backfill;
+#[cfg(feature = "test")]
+pub mod backfill_v2;
+#[cfg(not(feature = "test"))]
+mod backfill_v2;
 #[cfg(feature = "test")]
 pub mod bootstrap;
 #[cfg(not(feature = "test"))]
 mod bootstrap;
+#[cfg(feature = "test")]
+pub mod bootstrap_v2;
+#[cfg(not(feature = "test"))]
+mod bootstrap_v2;
 #[cfg(feature = "test")]
 pub mod c;
 #[cfg(not(feature = "test"))]
@@ -19,8 +27,8 @@ mod changes_vtab_read;
 mod changes_vtab_write;
 mod commit;
 mod compare_values;
-mod config;
-mod consts;
+pub mod config;
+pub mod consts;
 mod create_cl_set_vtab;
 mod create_crr;
 #[cfg(feature = "test")]
@@ -29,12 +37,21 @@ pub mod db_version;
 mod db_version;
 mod debug;
 mod ext_data;
+#[cfg(feature = "test")]
+pub mod hash_pk;
+#[cfg(not(feature = "test"))]
+mod hash_pk;
 mod is_crr;
 mod local_writes;
+mod migrate;
 #[cfg(feature = "test")]
 pub mod pack_columns;
 #[cfg(not(feature = "test"))]
 mod pack_columns;
+#[cfg(feature = "test")]
+pub mod schema_directive;
+#[cfg(not(feature = "test"))]
+mod schema_directive;
 mod sha;
 mod stmt_cache;
 #[cfg(feature = "test")]
@@ -43,10 +60,18 @@ pub mod tableinfo;
 mod tableinfo;
 mod teardown;
 #[cfg(feature = "test")]
+pub mod teardown_v2;
+#[cfg(not(feature = "test"))]
+mod teardown_v2;
+#[cfg(feature = "test")]
 pub mod test_exports;
 mod triggers;
 mod unpack_columns_vtab;
 mod util;
+#[cfg(feature = "test")]
+pub mod v2_stmts;
+#[cfg(not(feature = "test"))]
+mod v2_stmts;
 
 use alloc::format;
 use alloc::string::ToString;
@@ -56,7 +81,7 @@ use core::mem;
 use core::ptr::null_mut;
 extern crate alloc;
 use alter::crsql_compact_post_alter;
-use automigrate::*;
+use alter_v2::crsql_compact_post_alter_v2;
 use backfill::*;
 use c::{crsql_freeExtData, crsql_initSiteIdExt, crsql_newExtData};
 use config::{crsql_config_get, crsql_config_set};
@@ -67,15 +92,14 @@ use db_version::{
     insert_db_version,
 };
 use is_crr::*;
+use migrate::crsql_incremental_maintenance;
 use local_writes::after_delete::x_crsql_after_delete;
 use local_writes::after_insert::x_crsql_after_insert;
 use local_writes::after_update::x_crsql_after_update;
 use sqlite::{Destructor, ResultCode};
 use sqlite_nostd as sqlite;
 use sqlite_nostd::{Connection, Context, Value};
-#[cfg(feature = "test")]
-use tableinfo::TableInfo;
-use tableinfo::{crsql_ensure_table_infos_are_up_to_date, is_table_compatible, pull_table_info};
+use tableinfo::{TableInfo, crsql_ensure_table_infos_are_up_to_date, is_table_compatible, pull_table_info};
 use teardown::*;
 use triggers::create_triggers;
 
@@ -123,6 +147,36 @@ pub extern "C" fn sqlite3_crsqlcore_init(
 ) -> *mut c_void {
     sqlite::EXTENSION_INIT2(api);
 
+    let sqlite_version = sqlite::libversion_number();
+    if sqlite_version < consts::MIN_SQLITE_VERSION {
+        let msg = format!(
+            "cr-sqlite requires SQLite 3.44.0 or later (ORDER BY in aggregates). Found version {}.",
+            sqlite::libversion()
+        );
+        let cstring = alloc::ffi::CString::new(msg).unwrap_or(alloc::ffi::CString::new("cr-sqlite requires SQLite 3.44.0 or later").unwrap());
+        unsafe {
+            if !err_msg.is_null() {
+                *err_msg = cstring.into_raw();
+            }
+        }
+        return null_mut();
+    }
+
+    // Enable recursive triggers. This is required for correct behavior with
+    // INSERT OR REPLACE: SQLite's REPLACE conflict resolution deletes the
+    // conflicting row, and the AFTER DELETE trigger must fire to clean up
+    // V2 metadata before the AFTER INSERT trigger runs. Without recursive
+    // triggers, only the INSERT trigger fires, leaving stale metadata.
+    if db.exec_safe("PRAGMA recursive_triggers = ON;").is_err() {
+        let cstring = alloc::ffi::CString::new("cr-sqlite: failed to enable recursive_triggers").unwrap();
+        unsafe {
+            if !err_msg.is_null() {
+                *err_msg = cstring.into_raw();
+            }
+        }
+        return null_mut();
+    }
+
     let rc = db
         .create_function_v2(
             "crsql_set_debug",
@@ -130,22 +184,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
             sqlite::UTF8 | sqlite::DIRECTONLY,
             None,
             Some(debug::x_crsql_set_debug),
-            None,
-            None,
-            None,
-        )
-        .unwrap_or(sqlite::ResultCode::ERROR);
-    if rc != ResultCode::OK {
-        return null_mut();
-    }
-
-    let rc = db
-        .create_function_v2(
-            "crsql_automigrate",
-            -1,
-            sqlite::UTF8,
-            None,
-            Some(crsql_automigrate),
             None,
             None,
             None,
@@ -240,6 +278,9 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     if ext_data.is_null() {
         return null_mut();
     }
+
+    // crsql_newExtData (C) already loads config values from crsql_master.
+    // No need to set defaults here — they're loaded correctly by the C init.
 
     let rc = db
         .create_function_v2(
@@ -425,7 +466,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
             "crsql_as_crr",
             -1,
             sqlite::UTF8 | sqlite::DETERMINISTIC,
-            None,
+            Some(ext_data as *mut c_void),
             Some(x_crsql_as_crr),
             None,
             None,
@@ -444,6 +485,23 @@ pub extern "C" fn sqlite3_crsqlcore_init(
             sqlite::UTF8 | sqlite::DETERMINISTIC,
             Some(ext_data as *mut c_void),
             Some(x_crsql_set_ts),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
+    let rc = db
+        .create_function_v2(
+            "crsql_change_wins",
+            4,
+            sqlite::UTF8 | sqlite::DETERMINISTIC,
+            None,
+            Some(x_crsql_change_wins),
             None,
             None,
             None,
@@ -538,7 +596,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
             "crsql_begin_alter",
             -1,
             sqlite::UTF8 | sqlite::DIRECTONLY,
-            None,
+            Some(ext_data as *mut c_void),
             Some(x_crsql_begin_alter),
             None,
             None,
@@ -686,6 +744,76 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         return null_mut();
     }
 
+    // V2 functions: crsql_hash_pk (scalar) and crsql_pack_agg (aggregate)
+    let rc = db
+        .create_function_v2(
+            "crsql_hash_pk",
+            -1,
+            sqlite::UTF8 | sqlite::DETERMINISTIC,
+            None,
+            Some(hash_pk::crsql_hash_pk),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
+    let rc = db
+        .create_function_v2(
+            "crsql_pack_agg",
+            1,
+            sqlite::UTF8 | sqlite::DETERMINISTIC,
+            None,
+            None,
+            Some(pack_columns::crsql_pack_agg_step),
+            Some(pack_columns::crsql_pack_agg_final),
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
+    let rc = db
+        .create_function_v2(
+            "crsql_pack_varint_agg",
+            1,
+            sqlite::UTF8 | sqlite::DETERMINISTIC,
+            None,
+            None,
+            Some(pack_columns::crsql_pack_varint_agg_step),
+            Some(pack_columns::crsql_pack_varint_agg_final),
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
+    // V2: crsql_incremental_maintenance(chunk_size) -> remaining work units
+    let rc = db
+        .create_function_v2(
+            "crsql_incremental_maintenance",
+            1,
+            sqlite::UTF8 | sqlite::DIRECTONLY,
+            Some(ext_data as *mut c_void),
+            Some(x_crsql_incremental_maintenance),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
     return ext_data as *mut c_void;
 }
 
@@ -744,6 +872,16 @@ unsafe extern "C" fn x_crsql_finalize(
  * Takes a table name and turns it into a CRR.
  *
  * This allows users to create and modify tables as normal.
+ *
+ * Optional flags (after table name):
+ *   'without_rowid' - treat a rowid table as WITHOUT ROWID for V2 metadata (uses hashed_pk instead of rowid as key)
+ *   'skip_hash' - use raw PK value as lookup key instead of hashing (requires single integer PK)
+ *
+ * skip_hash mode is also auto-detected: for tables with a single integer PK,
+ * the raw PK value is used directly as the lookup key instead of hashing it.
+ * This avoids the hashed_pk column and blob storage overhead.
+ * Auto-qualified when pks.len() == 1 AND PK type contains "INT".
+ * Use the 'skip_hash' flag or `/* crsql: skip_hash=0 */` schema comment to override.
  */
 unsafe extern "C" fn x_crsql_as_crr(
     ctx: *mut sqlite::context,
@@ -759,17 +897,51 @@ unsafe extern "C" fn x_crsql_as_crr(
     }
 
     let args = sqlite::args!(argc, argv);
-    let (schema_name, table_name) = if argc == 2 {
-        (args[0].text(), args[1].text())
+    let known_flags = ["use_rowid", "without_rowid", "skip_hash"];
+
+    // Parse args: (table) | (schema, table) | (table, flags...) | (schema, table, flags...)
+    let (schema_name, table_name, flags) = if argc >= 2 && known_flags.contains(&args[1].text()) {
+        // (table, flags...)
+        ("main\0", args[0].text(), &args[1..])
+    } else if argc >= 3 && known_flags.contains(&args[2].text()) {
+        // (schema, table, flags...)
+        (args[0].text(), args[1].text(), &args[2..])
+    } else if argc == 2 {
+        // (schema, table)
+        (args[0].text(), args[1].text(), &[][..])
     } else {
-        ("main\0", args[0].text())
+        // (table)
+        ("main\0", args[0].text(), &[][..])
     };
 
+    // use_rowid tri-state from args:
+    //   'use_rowid'      → Some(true)  = force rowid-key
+    //   'without_rowid'  → Some(false) = force non-rowid-key
+    //   absent           → None        = auto-detect
+    let use_rowid: Option<bool> = {
+        if flags.iter().any(|f| f.text() == "use_rowid") {
+            Some(true)
+        } else if flags.iter().any(|f| f.text() == "without_rowid") {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    let skip_hash = flags.iter().any(|f| f.text() == "skip_hash");
+
     let db = ctx.db_handle();
+    let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
     let mut err_msg = null_mut();
     let rc = db.exec_safe("SAVEPOINT as_crr");
     if rc.is_err() {
         ctx.result_error("failed to start as_crr savepoint");
+        return;
+    }
+
+    // V2 clock tables require a non-zero ts. Error early if not set.
+    if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
+        ctx.result_error("crsql_as_crr: timestamp not set — call crsql_set_ts() first or set default-ts");
+        let _ = db.exec_safe("ROLLBACK");
         return;
     }
 
@@ -779,6 +951,8 @@ unsafe extern "C" fn x_crsql_as_crr(
         table_name.as_ptr() as *const c_char,
         0,
         0,
+        match use_rowid { Some(true) => 1, Some(false) => -1, None => 0 },
+        if skip_hash { 1 } else { 0 },
         &mut err_msg as *mut _,
     );
     if rc != ResultCode::OK as c_int {
@@ -806,6 +980,19 @@ unsafe extern "C" fn x_crsql_rows_impacted(
     sqlite::result_int(ctx, rows_impacted);
 }
 
+unsafe extern "C" fn x_crsql_incremental_maintenance(
+    ctx: *mut sqlite::context,
+    argc: i32,
+    argv: *mut *mut sqlite::value,
+) {
+    let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+    let args = sqlite::args!(argc, argv);
+    let chunk_size = if args.len() > 0 { args[0].int() } else { 1000 };
+    let db = ctx.db_handle();
+    let result = crsql_incremental_maintenance(db, chunk_size, ext_data);
+    ctx.result_int(result);
+}
+
 unsafe extern "C" fn x_crsql_begin_alter(
     ctx: *mut sqlite::context,
     argc: i32,
@@ -827,6 +1014,13 @@ unsafe extern "C" fn x_crsql_begin_alter(
         ("main\0", args[0].text())
     };
 
+    let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+    // V2 clock tables require a non-zero ts. Error early if not set.
+    if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
+        ctx.result_error("crsql_begin_alter: timestamp not set — call crsql_set_ts() first or set default-ts");
+        return;
+    }
+
     let db = ctx.db_handle();
     let rc = db.exec_safe("SAVEPOINT alter_crr");
     if rc.is_err() {
@@ -836,7 +1030,8 @@ unsafe extern "C" fn x_crsql_begin_alter(
     let rc = remove_crr_triggers_if_exist(db, table_name);
     if rc.is_err() {
         sqlite::result_error_code(ctx, rc.unwrap_err() as c_int);
-        let _ = db.exec_safe("ROLLBACK");
+        let _ = db.exec_safe("ROLLBACK TO alter_crr");
+        let _ = db.exec_safe("RELEASE alter_crr");
         return;
     }
     ctx.result_text_static("OK");
@@ -868,6 +1063,12 @@ unsafe extern "C" fn x_crsql_commit_alter(
     let mut err_msg = null_mut();
     let db = ctx.db_handle();
 
+    // V2 clock tables require a non-zero ts. Error early if not set.
+    if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
+        ctx.result_error("crsql_commit_alter: timestamp not set — call crsql_set_ts() first or set default-ts");
+        return;
+    }
+
     let rc = if non_destructive {
         match pull_table_info(db, table_name, &mut err_msg as *mut _) {
             Ok(table_info) => {
@@ -886,12 +1087,40 @@ unsafe extern "C" fn x_crsql_commit_alter(
             Err(rc) => rc as c_int,
         }
     } else {
-        let rc = crsql_compact_post_alter(
-            db,
-            table_name.as_ptr() as *const c_char,
-            ext_data,
-            &mut err_msg as *mut _,
-        );
+        // Check schema version from table infos to decide which compaction to run
+        let table_infos =
+            mem::ManuallyDrop::new(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>));
+        let tbl_info = table_infos.iter().find(|t| t.tbl_name == table_name);
+        let has_v1 = tbl_info.map_or(false, |t| {
+            t.schema_version == tableinfo::SchemaVersion::V1 || t.schema_version == tableinfo::SchemaVersion::V2AndV1
+        });
+
+        let has_v2 = tbl_info.map_or(false, |t| {
+            t.schema_version == tableinfo::SchemaVersion::V2 || t.schema_version == tableinfo::SchemaVersion::V2AndV1
+        });
+
+        let mut rc = ResultCode::OK as c_int;
+        if has_v1 {
+            rc = crsql_compact_post_alter(
+                db,
+                table_name.as_ptr() as *const c_char,
+                ext_data,
+                &mut err_msg as *mut _,
+            );
+        }
+
+        // Run V2 alter compaction only if V2 tables exist
+        if rc == ResultCode::OK as c_int && has_v2 {
+            let rc2 = crsql_compact_post_alter_v2(
+                db,
+                table_name.as_ptr() as *const c_char,
+                ext_data,
+                &mut err_msg as *mut _,
+            );
+            if rc2 != ResultCode::OK as c_int {
+                rc = rc2;
+            }
+        }
 
         if rc == ResultCode::OK as c_int {
             crsql_create_crr(
@@ -899,6 +1128,8 @@ unsafe extern "C" fn x_crsql_commit_alter(
                 schema_name.as_ptr() as *const c_char,
                 table_name.as_ptr() as *const c_char,
                 1,
+                0,
+                0,
                 0,
                 &mut err_msg as *mut _,
             )
@@ -924,7 +1155,10 @@ unsafe extern "C" fn x_crsql_commit_alter(
             "failed compacting tables post alteration: {}",
             error_str
         ));
-        let _ = db.exec_safe("ROLLBACK");
+        // Roll back to the alter_crr savepoint (not the caller's entire transaction),
+        // which restores the triggers that crsql_begin_alter dropped.
+        let _ = db.exec_safe("ROLLBACK TO alter_crr");
+        let _ = db.exec_safe("RELEASE alter_crr");
         return;
     }
 }
@@ -1068,6 +1302,8 @@ unsafe extern "C" fn x_crsql_cache_db_version(
 
 /**
  * Return the timestamp for the current transaction.
+ * Errors if timestamp has not been set via crsql_set_ts().
+ * Returns an integer (not text) for STRICT table compatibility.
  */
 unsafe extern "C" fn x_crsql_get_ts(
     ctx: *mut sqlite::context,
@@ -1075,8 +1311,45 @@ unsafe extern "C" fn x_crsql_get_ts(
     _argv: *mut *mut sqlite::value,
 ) {
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
-    let ts = (*ext_data).timestamp.to_string();
-    ctx.result_text_transient(&ts);
+    let ts = match crate::config::ensure_timestamp(ext_data) {
+        Ok(ts) => ts,
+        Err(()) => {
+            ctx.result_error("crsql_get_ts: timestamp not set. Call crsql_set_ts() or set default-ts.");
+            return;
+        }
+    };
+    ctx.result_int64(ts as sqlite::int64);
+}
+
+/**
+ * Compare incoming vs local value for LWW merge resolution.
+ * Args: (incoming_val, local_val, site_id_wins, merge_equal_values)
+ * site_id_wins is a boolean (1/0) computed by the caller via blob comparison.
+ * Returns 1 if incoming wins, 0 otherwise.
+ */
+unsafe extern "C" fn x_crsql_change_wins(
+    ctx: *mut sqlite::context,
+    argc: i32,
+    argv: *mut *mut sqlite::value,
+) {
+    if argc != 4 {
+        ctx.result_error("crsql_change_wins expects 4 args");
+        return;
+    }
+    let args = sqlite::args!(argc, argv);
+    let cmp = crate::compare_values::crsql_compare_sqlite_values(args[0], args[1]);
+    if cmp > 0 {
+        ctx.result_int(1);
+    } else if cmp < 0 {
+        ctx.result_int(0);
+    } else {
+        let merge_equal = args[3].int();
+        if merge_equal == 1 {
+            ctx.result_int(args[2].int());
+        } else {
+            ctx.result_int(0);
+        }
+    }
 }
 
 /**
@@ -1278,14 +1551,22 @@ pub extern "C" fn crsql_create_crr(
     table: *const c_char,
     is_commit_alter: c_int,
     no_tx: c_int,
+    use_rowid: c_int,
+    skip_hash: c_int,
     err: *mut *mut c_char,
 ) -> c_int {
     let schema = unsafe { CStr::from_ptr(schema).to_str() };
     let table = unsafe { CStr::from_ptr(table).to_str() };
+    // use_rowid: 1 = force rowid, -1 = force non-rowid, 0 = auto
+    let use_rowid_opt = match use_rowid {
+        1 => Some(true),
+        -1 => Some(false),
+        _ => None,
+    };
 
     match (table, schema) {
         (Ok(table), Ok(schema)) => {
-            create_crr(db, schema, table, is_commit_alter != 0, no_tx != 0, err)
+            create_crr(db, schema, table, is_commit_alter != 0, no_tx != 0, use_rowid_opt, skip_hash != 0, err)
                 .unwrap_or_else(|err| err) as c_int
         }
         _ => ResultCode::NOMEM as c_int,

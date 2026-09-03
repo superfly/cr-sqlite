@@ -6,6 +6,7 @@ fn tear_down() -> Result<(), ResultCode> {
     let db = crate::opendb()?;
     db.db
         .exec_safe("CREATE TABLE foo (a primary key not null, b);")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
     db.db.exec_safe("SELECT crsql_as_table('foo');")?;
     let stmt = db

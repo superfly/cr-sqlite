@@ -48,6 +48,8 @@ fn test_fetch_db_version_from_storage() -> Result<ResultCode, String> {
     // create some schemas
     db.exec_safe("CREATE TABLE foo (a primary key not null, b);")
         .expect("made foo");
+    db.exec_safe("SELECT crsql_set_ts('1700000000')")
+        .expect("set ts");
     db.exec_safe("SELECT crsql_as_crr('foo');")
         .expect("made foo crr");
     test_exports::db_version::fetch_db_version_from_storage(raw_db, ext_data)?;
@@ -62,6 +64,8 @@ fn test_fetch_db_version_from_storage() -> Result<ResultCode, String> {
 
     db.exec_safe("CREATE TABLE bar (a primary key not null, b);")
         .expect("created bar");
+    db.exec_safe("SELECT crsql_set_ts('1700000000')")
+        .expect("set ts");
     db.exec_safe("SELECT crsql_as_crr('bar');")
         .expect("bar as crr");
     db.exec_safe("INSERT INTO bar VALUES (1, 2)")
@@ -123,9 +127,11 @@ fn test_get_or_set_site_ordinal() -> Result<(), ResultCode> {
     db.db
         .exec_safe("CREATE TABLE foo (a primary key not null, b);")?;
 
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
 
     db.db.exec_safe("BEGIN TRANSACTION;")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
 
     let other_site_id = "other_site_id".as_bytes();
 
@@ -189,6 +195,7 @@ fn test_get_or_set_pk_cl() -> Result<(), ResultCode> {
     db.db
         .exec_safe("CREATE TABLE foo (a primary key not null, b);")?;
 
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
 
     let insert_foo_stmt = db.db.prepare_v2("INSERT INTO foo VALUES (?, ?);")?;
@@ -245,9 +252,11 @@ fn test_get_or_set_pk_cl() -> Result<(), ResultCode> {
     insert_or_replace.step()?;
     reset_cached_stmt(&insert_or_replace)?;
 
-    // insert of pk with no clock row gets no update
+    // INSERT OR REPLACE on existing pk=4: with recursive_triggers ON,
+    // DELETE trigger fires first (marking row deleted, cl→2), then INSERT
+    // trigger fires (re-inserting, cl→3).
     let key4 = get_pk_key(&get_pk_key_stmt, 4).expect("get pk key");
-    assert_eq!(-1, get_cache_cl(&get_cache_cl_stmt, "foo", key4)?);
+    assert_eq!(3, get_cache_cl(&get_cache_cl_stmt, "foo", key4)?);
 
     db.db.exec_safe("COMMIT;")?;
 
@@ -256,20 +265,21 @@ fn test_get_or_set_pk_cl() -> Result<(), ResultCode> {
     assert_eq!(-1, get_cache_cl(&get_cache_cl_stmt, "foo", key2)?);
 
     db.db.exec_safe("BEGIN TRANSACTION;")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SAVEPOINT test;")?;
 
     // new site_id in crsql_changes table
-    // pk number is 4
+    // pk number is 4 — note: pk=4 already has cl=3 from the INSERT OR REPLACE above.
     let pk: [u8; 3] = [1, 9, 4];
 
-    // insert should update the cache.
+    // remote insert with cl=1 loses to local cl=3 — cache should not update.
     insert_crsql_changes_row(db.db, &pk, "b", "e", 1, 1, 1).expect("insert crsql changes row");
     let key4 = get_pk_key(&get_pk_key_stmt, 4).expect("get pk key");
-    assert_eq!(1, get_cache_cl(&get_cache_cl_stmt, "foo", key4)?);
+    assert_eq!(3, get_cache_cl(&get_cache_cl_stmt, "foo", key4)?);
 
-    // a delete should also update the cache.
-    insert_crsql_changes_row(db.db, &pk, "-1", "", 2, 2, 2)?;
-    assert_eq!(2, get_cache_cl(&get_cache_cl_stmt, "foo", key4)?);
+    // a delete with cl=4 should update the cache (wins over local cl=3).
+    insert_crsql_changes_row(db.db, &pk, "-1", "", 2, 2, 4)?;
+    assert_eq!(4, get_cache_cl(&get_cache_cl_stmt, "foo", key4)?);
 
     // test that a resurrected cache would also get updated.
     insert_crsql_changes_row(db.db, &pk, "b", "f", 1, 3, 5)?;
@@ -378,11 +388,13 @@ fn test_insert_db_version_cache() -> Result<(), ResultCode> {
     let db = &c.db;
     db.db
         .exec_safe("CREATE TABLE foo (a primary key not null, b);")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
 
     let remote_site = "remote_site".as_bytes();
 
     db.db.exec_safe("BEGIN TRANSACTION;")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
 
     // cache should be empty before any remote inserts
     assert_eq!(-1, get_cache_db_version(db.db, remote_site)?);
@@ -431,6 +443,7 @@ fn test_insert_db_version_cache() -> Result<(), ResultCode> {
     // new transaction: inserting a lower db_version (2) should be short-circuited
     // because we fetch the latest db_version from DB on cache miss
     db.db.exec_safe("BEGIN TRANSACTION;")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     let pk4: [u8; 3] = [1, 9, 4];
     let stmt4 = db.db.prepare_v2(
         "INSERT INTO crsql_changes VALUES ('foo', ?, 'b', 4, 1, 2, ?, 1, 0, 0);",
