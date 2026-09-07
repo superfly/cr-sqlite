@@ -403,7 +403,8 @@ fn build_col_val_case(table_info: &TableInfo) -> Result<String, ResultCode> {
     let mut when_clauses = vec![];
     for (_, col) in table_info.non_pks.iter().enumerate() {
         when_clauses.push(format!(
-            "WHEN '{col_name}' THEN mt.\"{col_name}\"",
+            "WHEN '{col_name_val}' THEN mt.\"{col_name}\"",
+            col_name_val = crate::util::escape_ident_as_value(&col.name),
             col_name = crate::util::escape_ident(&col.name)
         ));
     }

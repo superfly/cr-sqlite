@@ -42,12 +42,13 @@ fn create_insert_trigger(
         String::new()
     };
     let create_trigger_sql = format!(
-        "CREATE TRIGGER IF NOT EXISTS \"{table_name}__crsql_itrig\"
-      AFTER INSERT ON \"{table_name}\" WHEN crsql_internal_sync_bit() = 0
+        "CREATE TRIGGER IF NOT EXISTS \"{escaped_ident}__crsql_itrig\"
+      AFTER INSERT ON \"{escaped_ident}\" WHEN crsql_internal_sync_bit() = 0
       BEGIN
-        VALUES (crsql_after_insert('{table_name}', {pk_new_list}{rowid_expr}));
+        VALUES (crsql_after_insert('{escaped_val}', {pk_new_list}{rowid_expr}));
       END;",
-        table_name = crate::util::escape_ident_as_value(&table_info.tbl_name),
+        escaped_ident = crate::util::escape_ident(&table_info.tbl_name),
+        escaped_val = crate::util::escape_ident_as_value(&table_info.tbl_name),
         pk_new_list = crate::util::as_identifier_list(&table_info.pks, Some("NEW."))?,
         rowid_expr = rowid_expr
     );
@@ -112,12 +113,13 @@ fn create_delete_trigger(
     let pk_old_list = crate::util::as_identifier_list(pk_columns, Some("OLD."))?;
 
     let create_trigger_sql = format!(
-        "CREATE TRIGGER IF NOT EXISTS \"{table_name}__crsql_dtrig\"
-    AFTER DELETE ON \"{table_name}\" WHEN crsql_internal_sync_bit() = 0
+        "CREATE TRIGGER IF NOT EXISTS \"{escaped_ident}__crsql_dtrig\"
+    AFTER DELETE ON \"{escaped_ident}\" WHEN crsql_internal_sync_bit() = 0
     BEGIN
-      VALUES (crsql_after_delete('{table_name}', {pk_old_list}));
+      VALUES (crsql_after_delete('{escaped_val}', {pk_old_list}));
     END;",
-        table_name = crate::util::escape_ident(table_name),
+        escaped_ident = crate::util::escape_ident(table_name),
+        escaped_val = crate::util::escape_ident_as_value(table_name),
         pk_old_list = pk_old_list
     );
 
