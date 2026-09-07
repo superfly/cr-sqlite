@@ -398,14 +398,16 @@ fn crsql_changes_query_for_table_v2_v1wire(table_info: &TableInfo) -> Result<Str
 
 /// Build a CASE expression that maps col_id → main_table column value.
 /// Used in packed (v2 sync-log) format to fetch all column values in one query.
-/// Example: CASE (c.cell_key & mask) WHEN 0 THEN mt."col0" WHEN 1 THEN mt."col1" END
+/// Uses integer col_id comparison (from v2_col_map) instead of string col_name
+/// comparison — faster and avoids string escaping issues.
+/// Example: CASE cm.col_id WHEN 0 THEN mt."col0" WHEN 1 THEN mt."col1" END
 fn build_col_val_case(table_info: &TableInfo) -> Result<String, ResultCode> {
     let mut when_clauses = vec![];
-    for (_, col) in table_info.non_pks.iter().enumerate() {
+    for (col_id, col_name) in &table_info.col_map {
         when_clauses.push(format!(
-            "WHEN '{col_name_val}' THEN mt.\"{col_name}\"",
-            col_name_val = crate::util::escape_ident_as_value(&col.name),
-            col_name = crate::util::escape_ident(&col.name)
+            "WHEN {col_id} THEN mt.\"{col_name}\"",
+            col_id = col_id,
+            col_name = crate::util::escape_ident(col_name)
         ));
     }
 
@@ -414,7 +416,7 @@ fn build_col_val_case(table_info: &TableInfo) -> Result<String, ResultCode> {
         Ok("NULL".to_string())
     } else {
         Ok(format!(
-            "CASE cm.col_name {whens} END",
+            "CASE cm.col_id {whens} END",
             whens = when_clauses.join(" ")
         ))
     }

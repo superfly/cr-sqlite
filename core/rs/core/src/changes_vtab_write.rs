@@ -1380,23 +1380,6 @@ unsafe fn v2_insert_pk_row(
     }
 }
 
-/// Get col_id from v2_col_map by col_name
-unsafe fn v2_get_col_id(
-    db: *mut sqlite3,
-    tbl_info: &TableInfo,
-    ext_data: *mut crsql_ExtData,
-    col_name: &str,
-) -> Result<Option<i64>, ResultCode> {
-    let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
-    let v2 = v2_ref.as_mut().unwrap();
-    let mut stmt = v2.col_id_lookup();
-    stmt.bind_text(1, col_name, sqlite::Destructor::STATIC)?;
-    if stmt.step()? == ResultCode::ROW {
-        return Ok(Some(stmt.column_int64(0)));
-    }
-    Ok(None)
-}
-
 /// Handle tombstone merge (cid=-2 hash tombstone or cid='-1' V1-wire delete).
 ///
 /// Hash mode (cid=-2): we only have hashed_pk, not packed PK values.
@@ -1853,8 +1836,8 @@ unsafe fn v2_apply_value_change_colval(
     // Get site ordinal
     let site_ordinal = get_site_ordinal_or_zero(ext_data, site_id)?;
 
-    // Get col_id
-    let col_id = v2_get_col_id(db, tbl_info, ext_data, col_name)?;
+    // Get col_id from in-memory col_map (loaded at TableInfo creation)
+    let col_id = tbl_info.col_map.iter().find(|(_, name)| name == col_name).map(|(id, _)| *id);
     if col_id.is_none() {
         return Ok(());
     }
