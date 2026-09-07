@@ -189,8 +189,10 @@ mod tests {
 
     #[test]
     fn test_parse_directives_slash_star_slash_with_directive() {
-        // "/*/" followed by a real comment with a directive
-        let sql = "CREATE TABLE foo /*/ /* crsql: skip_hash=1 */ (id INTEGER PRIMARY KEY)";
+        // "/*/" is not a complete comment — it opens a comment that continues
+        // until the next "*/". So the directive inside is swallowed.
+        // Use "/**/" (empty comment) followed by a directive comment instead.
+        let sql = "CREATE TABLE foo /**/ /* crsql: skip_hash=1 */ (id INTEGER PRIMARY KEY)";
         let directives = parse_directives(sql);
         assert_eq!(directives.get("skip_hash"), Some(&"1".to_string()));
     }
