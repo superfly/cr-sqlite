@@ -1805,6 +1805,496 @@ fn v2_reject_pattern_ops() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// Test: malformed blobs on the merge path must produce a clean SQL error,
+/// not abort the process. Covers:
+/// - unpack_columns with intlen > 8 (get_int panics for n > 8)
+/// - unpack_varints with a huge count header (Vec::with_capacity OOM)
+/// - malformed pk blob on an incoming V1-wire change
+/// - malformed col_version/seq on an incoming packed V2-wire change
+fn v2_malformed_blob_no_panic() -> Result<(), ResultCode> {
+    libc_println!("=== v2_malformed_blob_no_panic START ===");
+
+    // Test via the crsql_unpack_columns vtab directly.
+    {
+        let db = crate::opendb()?;
+        db.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, a)")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        let rc = db.db.exec_safe("SELECT crsql_as_crr('t')");
+        rc?;
+
+        // intlen=9 with enough padding — would panic without the guard.
+        // type_byte = (9 << 3) | 1 = 0x49, followed by 40 zero bytes.
+        let mut bad_blob = vec![0x01u8, 0x49];
+        bad_blob.extend_from_slice(&[0u8; 40]);
+        let stmt = db.db.prepare_v2("SELECT cell FROM crsql_unpack_columns WHERE package = ?")?;
+        stmt.bind_blob(1, &bad_blob, Destructor::STATIC)?;
+        let rc = stmt.step();
+        libc_println!("vtab step rc: {:?}", rc);
+        // The vtab should return an error for malformed blobs.
+        // If it returns Ok(DONE), the filter function swallowed the error.
+        assert!(rc.is_err() || rc == Ok(ResultCode::DONE), "malformed blob should error or return no rows, got {:?}", rc);
+    }
+
+    // Test via the merge path: malformed pk blob on V1-wire INSERT.
+    {
+        let db = crate::opendb()?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+        db.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+        db.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, a)")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("SELECT crsql_as_crr('t')")?;
+        let siteid_stmt = db.db.prepare_v2("SELECT crsql_site_id()")?;
+        siteid_stmt.step()?;
+        let siteid = siteid_stmt.column_blob(0)?;
+        libc_println!("siteid ok len={}", siteid.len());
+        let bad_pk = vec![0x01u8, 0x49, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let stmt = db.db.prepare_v2("INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")?;
+        stmt.bind_text(1, "t", Destructor::STATIC)?;
+        stmt.bind_blob(2, &bad_pk, Destructor::STATIC)?;
+        stmt.bind_text(3, "a", Destructor::STATIC)?;
+        stmt.bind_text(4, "v", Destructor::STATIC)?;
+        stmt.bind_int64(5, 1)?;
+        stmt.bind_int64(6, 1)?;
+        stmt.bind_blob(7, siteid, Destructor::STATIC)?;
+        stmt.bind_int64(8, 1)?;
+        stmt.bind_int64(9, 0)?;
+        stmt.bind_int64(10, 1700000000)?;
+        let rc = stmt.step();
+        libc_println!("merge path step rc: {:?}", rc);
+        assert!(rc.is_err(), "malformed pk blob on merge path should error, not crash, got {:?}", rc);
+    }
+
+    // Test: unpack_varints with a huge count header.
+    {
+        let db = crate::opendb()?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+        db.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+        db.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, a)")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("SELECT crsql_as_crr('t')")?;
+        let siteid_stmt = db.db.prepare_v2("SELECT crsql_site_id()")?;
+        siteid_stmt.step()?;
+        let siteid = siteid_stmt.column_blob(0)?;
+
+        // count = 2^63-ish: FF FF FF FF FF FF FF FF 7F
+        let bad_varint = vec![0xFFu8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F];
+        let stmt = db.db.prepare_v2("INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")?;
+        stmt.bind_text(1, "t", Destructor::STATIC)?;
+        stmt.bind_blob(2, [0x01u8, 0x01].as_ref(), Destructor::STATIC)?;
+        stmt.bind_blob(3, b"a\x00b", Destructor::STATIC)?;
+        stmt.bind_blob(4, [0x02u8, 0x01, 0x09, 0x01, 0x09].as_ref(), Destructor::STATIC)?;
+        stmt.bind_blob(5, &bad_varint, Destructor::STATIC)?;
+        stmt.bind_int64(6, 1)?;
+        stmt.bind_blob(7, siteid, Destructor::STATIC)?;
+        stmt.bind_int64(8, 1)?;
+        stmt.bind_blob(9, &bad_varint, Destructor::STATIC)?;
+        stmt.bind_int64(10, 1700000000)?;
+        let rc = stmt.step();
+        assert!(rc.is_err(), "malformed varint count on merge path should error, not crash");
+    }
+
+    libc_println!("=== v2_malformed_blob_no_panic PASS ===");
+    Ok(())
+}
+
+/// Test: a column name containing a single quote must not break crsql_changes.
+/// Also tests a table name with a single quote.
+fn v2_quoted_column_and_table_names() -> Result<(), ResultCode> {
+    libc_println!("=== v2_quoted_column_and_table_names START ===");
+
+    // Column name with single quote: o'brien
+    {
+        let db = crate::opendb()?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+        db.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+
+        db.db.exec_safe("CREATE TABLE ok_tbl (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("SELECT crsql_as_crr('ok_tbl')")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("INSERT INTO ok_tbl VALUES (1, 'fine')")?;
+
+        db.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, \"o'brien\" TEXT)")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("SELECT crsql_as_crr('t')")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("INSERT INTO t VALUES (1, 'v')")?;
+
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM crsql_changes")?;
+        stmt.step()?;
+        let count = stmt.column_int(0);
+        assert!(count >= 2, "crsql_changes should return rows for both tables, got {}", count);
+
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM crsql_changes WHERE \"table\" = 't'")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 1, "should have 1 change for table t");
+    }
+
+    // Table name with single quote: o'brien
+    {
+        let db = crate::opendb()?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+        db.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+
+        db.db.exec_safe("CREATE TABLE \"o'brien\" (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("SELECT crsql_as_crr('o''brien')")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("INSERT INTO \"o'brien\" VALUES (1, 'val')")?;
+
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM crsql_changes")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 1, "should have 1 change for table o'brien");
+
+        let stmt = db.db.prepare_v2("SELECT \"table\" FROM crsql_changes")?;
+        stmt.step()?;
+        let tbl = stmt.column_text(0)?;
+        assert_eq!(tbl, "o'brien", "table name should be o'brien in the feed");
+    }
+
+    libc_println!("=== v2_quoted_column_and_table_names PASS ===");
+    Ok(())
+}
+
+/// Test: crsql_as_crr('tbl', 'skip_hash') should work for single-column PKs
+/// and be silently ignored for composite PKs.
+fn v2_skip_hash_flag_works() -> Result<(), ResultCode> {
+    libc_println!("=== v2_skip_hash_flag_works START ===");
+
+    // Single BLOB PK + skip_hash flag
+    {
+        let db = crate::opendb()?;
+        db.db.exec_safe("CREATE TABLE t5 (id BLOB PRIMARY KEY NOT NULL, v TEXT)")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("SELECT crsql_as_crr('t5', 'skip_hash')")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("INSERT INTO t5 VALUES (x'01', 'hello')")?;
+
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM crsql_changes WHERE \"table\" = 't5'")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 1, "skip_hash BLOB PK should produce changes");
+    }
+
+    // INTEGER PK + skip_hash flag
+    {
+        let db = crate::opendb()?;
+        db.db.exec_safe("CREATE TABLE t4 (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("SELECT crsql_as_crr('t4', 'skip_hash')")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("INSERT INTO t4 VALUES (1, 'hello')")?;
+
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM crsql_changes WHERE \"table\" = 't4'")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 1, "skip_hash INTEGER PK should produce changes");
+    }
+
+    // Composite PK + skip_hash flag (design: silently ignored, not an error)
+    {
+        let db = crate::opendb()?;
+        db.db.exec_safe("CREATE TABLE t6 (a TEXT NOT NULL, b TEXT NOT NULL, v TEXT, PRIMARY KEY(a,b))")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("SELECT crsql_as_crr('t6', 'skip_hash')")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("INSERT INTO t6 VALUES ('x', 'y', 'val')")?;
+
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM crsql_changes WHERE \"table\" = 't6'")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 1, "composite PK with skip_hash flag should still work (ignored)");
+    }
+
+    libc_println!("=== v2_skip_hash_flag_works PASS ===");
+    Ok(())
+}
+
+/// Test: crsql_as_table must clean up all V2 metadata tables.
+/// Also tests that DROP TABLE on a CRR cleans up V2 metadata.
+fn v2_as_table_cleans_v2_metadata() -> Result<(), ResultCode> {
+    libc_println!("=== v2_as_table_cleans_v2_metadata START ===");
+
+    // crsql_as_table should remove all V2 tables.
+    {
+        let db = crate::opendb()?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+        db.db.exec_safe("CREATE TABLE y (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("SELECT crsql_as_crr('y')")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("INSERT INTO y VALUES (1, 'a')")?;
+
+        {
+            let stmt = db.db.prepare_v2("SELECT count(*) FROM sqlite_master WHERE name LIKE 'y__crsql_v2_%'")?;
+            stmt.step()?;
+            assert!(stmt.column_int(0) > 0, "V2 tables should exist before crsql_as_table");
+        }
+
+        db.db.exec_safe("SELECT crsql_as_table('y')")?;
+
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM sqlite_master WHERE name LIKE 'y__crsql_v2_%'")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 0, "crsql_as_table should remove all V2 metadata tables");
+
+        let stmt = db.db.prepare_v2(
+            "SELECT count(*) FROM crsql_master WHERE key LIKE '%\\_y' ESCAPE '\\'"
+        )?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 0, "crsql_as_table should remove crsql_master flags");
+    }
+
+    // DROP TABLE leaves V2 metadata behind (orphaned tables).
+    // Lazy cleanup happens on the next write to any CRR table — the trigger
+    // preamble calls crsql_ensure_table_infos_are_up_to_date, which detects
+    // the schema change (from DROP TABLE) and runs pull_all_table_infos,
+    // which cleans up orphaned V2 tables and crsql_master flags.
+    {
+        let db = crate::opendb()?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+        db.db.exec_safe("CREATE TABLE z (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("SELECT crsql_as_crr('z')")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("INSERT INTO z VALUES (1, 'a')")?;
+
+        // Create a second CRR table so we can trigger lazy cleanup via a write.
+        db.db.exec_safe("CREATE TABLE w (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("SELECT crsql_as_crr('w')")?;
+
+        // DROP TABLE z — leaves orphaned V2 metadata.
+        db.db.exec_safe("DROP TABLE z")?;
+
+        // Verify orphans exist before cleanup.
+        {
+            let stmt = db.db.prepare_v2("SELECT count(*) FROM sqlite_master WHERE name LIKE 'z__crsql_v2_%'")?;
+            stmt.step()?;
+            assert!(stmt.column_int(0) > 0, "V2 tables should be orphaned after DROP TABLE");
+        }
+
+        // Write to w — trigger preamble calls crsql_ensure_table_infos_are_up_to_date
+        // which detects schema change and runs pull_all_table_infos → schedules cleanup.
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("INSERT INTO w VALUES (1, 'a')")?;
+
+        // Orphaned V2 tables can't be dropped inside a trigger (SQLITE_LOCKED),
+        // so pull_all_table_infos schedules cleanup tasks in crsql_master.
+        // Process them via incremental_maintenance.
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.db.exec_safe("SELECT crsql_incremental_maintenance(1000)")?;
+
+        // Verify orphaned V2 tables were cleaned up.
+        {
+            let stmt = db.db.prepare_v2("SELECT count(*) FROM sqlite_master WHERE name LIKE 'z__crsql_v2_%'")?;
+            stmt.step()?;
+            assert_eq!(stmt.column_int(0), 0, "orphaned V2 tables should be cleaned up after incremental_maintenance");
+        }
+
+        // Verify crsql_master flags were cleaned up.
+        {
+            let stmt = db.db.prepare_v2(
+                "SELECT count(*) FROM crsql_master WHERE key LIKE '%\\_z' ESCAPE '\\'"
+            )?;
+            stmt.step()?;
+            assert_eq!(stmt.column_int(0), 0, "crsql_master flags for z should be cleaned up");
+        }
+    }
+
+    libc_println!("=== v2_as_table_cleans_v2_metadata PASS ===");
+    Ok(())
+}
+
+/// Test: data consistency after a statement-level rollback inside a transaction.
+/// A statement-level abort (e.g., CHECK constraint violation) undoes only the
+/// failing statement's writes via the statement journal. The transaction
+/// continues, and all statements in the same transaction share one db_version
+/// (one tx = one Lamport event). This test verifies that clock entries and
+/// table data remain consistent after such a rollback.
+fn v2_data_consistency_after_stmt_rollback() -> Result<(), ResultCode> {
+    libc_println!("=== v2_data_consistency_after_stmt_rollback START ===");
+
+    let db = crate::opendb()?;
+    // Use a CHECK constraint to trigger a statement-level rollback.
+    // CRRs don't allow UNIQUE constraints or NOT NULL without DEFAULT,
+    // so we use a CHECK constraint on a nullable column.
+    db.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, v TEXT, CHECK(v != 'bad'))")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('t')")?;
+
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("INSERT INTO t VALUES (1, 'a')")?;
+
+    // This INSERT aborts on CHECK constraint — statement journal undoes
+    // the clock table write, but the transaction continues.
+    let stmt = db.db.prepare_v2("INSERT INTO t VALUES (2, 'bad')")?;
+    let rc = stmt.step();
+    assert!(rc.is_err(), "CHECK constraint violation should fail");
+
+    // This INSERT should still succeed and be tracked in the clock table.
+    db.db.exec_safe("INSERT INTO t VALUES (3, 'c')")?;
+    db.db.exec_safe("COMMIT")?;
+
+    // Verify the rolled-back insert (id=2) is not in the table.
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM t WHERE id = 2")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 0, "rolled-back insert should not be in the table");
+    }
+
+    // Verify the successful inserts are in the table.
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM t")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 2, "should have 2 rows (ids 1 and 3)");
+    }
+
+    // Verify clock entries exist for the successful inserts.
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM t__crsql_clock")?;
+        stmt.step()?;
+        assert!(stmt.column_int(0) > 0, "clock entries should exist for successful inserts");
+    }
+
+    // Verify crsql_db_versions has at least 1 entry.
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM crsql_db_versions")?;
+        stmt.step()?;
+        assert!(stmt.column_int(0) >= 1, "should have at least 1 db_version");
+    }
+
+    libc_println!("=== v2_data_consistency_after_stmt_rollback PASS ===");
+    Ok(())
+}
+
+/// Test: transitioning metadata-write-version from 2 (dual-write) to 3 (V2-only)
+/// must clean up V1 clock tables (__crsql_clock, __crsql_pks) via incremental_maintenance.
+fn v2_cleanup_v1_tables_after_2_to_3_transition() -> Result<(), ResultCode> {
+    libc_println!("=== v2_cleanup_v1_tables_after_2_to_3_transition START ===");
+
+    let db = crate::opendb()?;
+
+    // Start in dual-write mode (V1 + V2)
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
+    db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+    // Use a transaction so ts persists across statements
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (1, 'a')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (2, 'b')")?;
+    db.db.exec_safe("COMMIT")?;
+
+    // Verify V1 tables exist
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM sqlite_master WHERE name='foo__crsql_clock'")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 1, "V1 clock table should exist in dual-write mode");
+    }
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM sqlite_master WHERE name='foo__crsql_pks'")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 1, "V1 pks table should exist in dual-write mode");
+    }
+
+    // Transition to V2-only (needs ts in same transaction for migration)
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    db.db.exec_safe("COMMIT")?;
+
+    // Run incremental maintenance to process the cleanup
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_incremental_maintenance(1000)")?;
+    db.db.exec_safe("COMMIT")?;
+
+    // Verify V1 tables were cleaned up
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM sqlite_master WHERE name='foo__crsql_clock'")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 0, "V1 clock table should be cleaned up after 2→3 transition");
+    }
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM sqlite_master WHERE name='foo__crsql_pks'")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 0, "V1 pks table should be cleaned up after 2→3 transition");
+    }
+
+    // Verify V2 tables still exist and data is intact
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM sqlite_master WHERE name LIKE 'foo__crsql_v2_%'")?;
+        stmt.step()?;
+        assert!(stmt.column_int(0) > 0, "V2 tables should still exist after cleanup");
+    }
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM foo")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 2, "data should be intact after cleanup");
+    }
+
+    // Verify writes still work after cleanup
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (3, 'c')")?;
+    db.db.exec_safe("COMMIT")?;
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM foo")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 3, "writes should work after cleanup");
+    }
+
+    libc_println!("=== v2_cleanup_v1_tables_after_2_to_3_transition PASS ===");
+    Ok(())
+}
+
+/// Test: the merge path must reject rowid values >= 2^51.
+fn v2_merge_rejects_rowid_overflow() -> Result<(), ResultCode> {
+    libc_println!("=== v2_merge_rejects_rowid_overflow START ===");
+
+    let db = crate::opendb()?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+    db.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+    db.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('t', 'use_rowid')")?;
+
+    let siteid_stmt = db.db.prepare_v2("SELECT crsql_site_id()")?;
+    siteid_stmt.step()?;
+    let siteid = siteid_stmt.column_blob(0)?;
+
+    // 2^51 = 2251799813685248 — the max allowed rowid.
+    let overflow_rowid: i64 = 1i64 << 60;
+    let pk_blob = {
+        let mut blob = vec![1u8]; // 1 column
+        blob.push(0x40); // Integer type, intlen=8
+        blob.extend_from_slice(&overflow_rowid.to_be_bytes());
+        blob
+    };
+
+    db.db.exec_safe("BEGIN")?;
+    let stmt = db.db.prepare_v2("INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")?;
+    stmt.bind_text(1, "t", Destructor::STATIC)?;
+    stmt.bind_blob(2, &pk_blob, Destructor::STATIC)?;
+    stmt.bind_text(3, "v", Destructor::STATIC)?;
+    stmt.bind_text(4, "val", Destructor::STATIC)?;
+    stmt.bind_int64(5, 1)?;
+    stmt.bind_int64(6, 1)?;
+    stmt.bind_blob(7, siteid, Destructor::STATIC)?;
+    stmt.bind_int64(8, 1)?;
+    stmt.bind_int64(9, 0)?;
+    stmt.bind_int64(10, 1700000000)?;
+    let rc = stmt.step();
+    let _ = db.db.exec_safe("ROLLBACK");
+    assert!(rc.is_err(), "merge path should reject rowid >= 2^51, got {:?}", rc);
+
+    libc_println!("=== v2_merge_rejects_rowid_overflow PASS ===");
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), ResultCode> {
     v2_basic_insert_sync()?;
     v2_update_sync()?;
@@ -1831,5 +2321,12 @@ pub fn run_suite() -> Result<(), ResultCode> {
     v2_wire_delete_then_reinsert()?;
     v2_wire_pk_only_delete()?;
     v2_wire_non_rowid_delete()?;
+    v2_malformed_blob_no_panic()?;
+    v2_quoted_column_and_table_names()?;
+    v2_skip_hash_flag_works()?;
+    v2_as_table_cleans_v2_metadata()?;
+    v2_data_consistency_after_stmt_rollback()?;
+    v2_cleanup_v1_tables_after_2_to_3_transition()?;
+    v2_merge_rejects_rowid_overflow()?;
     Ok(())
 }
