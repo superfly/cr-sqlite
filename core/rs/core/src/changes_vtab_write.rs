@@ -1350,6 +1350,9 @@ unsafe fn v2_insert_pk_row(
     // Then insert the PK row into v2_pks (unified path with RETURNING)
     if tbl_info.key_is_rowid {
         let rowid = sqlite::last_insert_rowid(db);
+        if rowid < 0 || rowid >= consts::MAX_ROWID_KEY {
+            return Err(ResultCode::CONSTRAINT);
+        }
         let mut ins = v2.pks_insert();
         if tbl_info.skip_hash {
             ins.bind_int64(1, rowid)?;
