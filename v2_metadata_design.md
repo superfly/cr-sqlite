@@ -879,8 +879,8 @@ crsql_config_set('metadata-write-version', 'v2&v1')  -- queues migration task
 
 During rollout, a node may receive both v1 (per-column) and v2 (packed) log entries simultaneously. The receiver must detect which format each row uses. Detection is per-row, not per-stream:
 
-- **Packed (v2)**: `cid` contains `char(0)` separator → split by `char(0)` to get col_name list. `col_vrsn` also contains `char(0)` → split to get versions. `cval` is a `crsql_pack_columns` blob of all values.
-- **Single (v1)**: `cid` is a plain column name or sentinel (no `char(0)`). `col_vrsn` is a single integer. `cval` is a single value.
+- **Packed (v2)**: `col_vrsn` is a BLOB (binary varint array from `crsql_pack_varint_agg`). `cid` is `GROUP_CONCAT(col_name, char(0))` — for single-column groups this is just the column name with no `char(0)` separator, so `char(0)` presence cannot be used for detection. `cval` is a `crsql_pack_agg` TLV blob. Detection is type-based: if `col_vrsn` is a BLOB, the row is packed; if it's an INTEGER, the row is a single/sentinel event. Split `cid` by `char(0)` to get the col_name list (a single-element list for single-column groups). `col_vrsn` is a varint array — unpack to get versions. `cval` is a `crsql_pack_columns` blob of all values.
+- **Single (v1)**: `col_vrsn` is a single INTEGER. `cid` is a plain column name or sentinel (TEXT). `cval` is a single value.
 - **Sentinels**: `cid = '-1'` (delete or insert sentinel — in V1 both `INSERT_SENTINEL` and `DELETE_SENTINEL` are `'-1'`, distinguished by CL parity: even = delete, odd = insert) or `'-2'` (hash-based tombstone, **new in V2**: dead row with `hashed_pk` instead of real PK) are always single events in both v1 and v2 — no packing. The merge path must handle `'-2'` as a new case not present in V1. **`'-2'` can only be accepted when the receiving node has completed V1→V2 migration** (i.e., `metadata-use-version` is `v2&v1` or `v2`), since it requires `v2_tombstones` and `v2_pks` tables to exist with full data. If a `'-2'` row is received before migration is complete, the merge path must return an error — the sender is using V2 wire format but the receiver isn't ready for it.
 
 Column names are used (not `col_id`) because names are deterministic across nodes (same schema) while internal `col_id` from `col_map` is local and non-deterministic across nodes.
@@ -891,7 +891,7 @@ Column names are used (not `col_id`) because names are deterministic across node
 |--------|-------------|
 | `tbl` | Table name (1×, not N×) |
 | `pk` | Packed PK values via `crsql_pack_columns` (1×) |
-| `cid` | `GROUP_CONCAT(col_name, char(0))` — null-separated col names. Detection: `char(0)` present → packed; absent → single/sentinel. SQLite column names cannot contain null bytes, so this is safe. |
+| `cid` | `GROUP_CONCAT(col_name, char(0))` — null-separated col names. For single-column groups, this is just the column name with no `char(0)` separator. Detection is type-based on `col_vrsn` (BLOB = packed, INTEGER = single/sentinel), not on `char(0)` presence in `cid`. SQLite column names cannot contain null bytes, so splitting by `char(0)` is safe. |
 | `cval` | `crsql_pack_agg(col_val)` — custom SQLite aggregate (`xStep` + `xFinal`) that collects values across the `GROUP BY` and produces a TLV blob using the same per-value encoding as `crsql_pack_columns`. Implemented in Rust alongside `crsql_pack_columns`, reusing the same per-value encoding logic. `GROUP_CONCAT` can't be used here because it loses type info (Integer/Text/Blob/Float/Null). Format: `[num_values:varint, ...[(type:3bits, intlen:5bits):u8, length?:varint, ...bytes]]`. Each value encodes its own type and length. Receiver calls `unpack_columns(cval)` → `Vec<ColumnValue>`, no external metadata needed. **ORDER IS THE CONTRACT**: values in `cval` are in the same order as column names in `cid` and versions in `col_vrsn`. All three aggregates run over the same group, so ordering is naturally consistent. |
 | `col_vrsn` | `crsql_pack_varint_agg(col_version)` — binary varint array (`[count:varint, ...varint(col_version_i)]`). Parallel array to `cid`; receiver zips `cid[i]` with `col_vrsn[i]`. |
 | `db_vrsn` | Single value (shared by all N columns in the group) |
@@ -1012,9 +1012,9 @@ SELECT col1, col2, ..., colN FROM "table" WHERE pk1 = ? AND pk2 = ?
 
 In `changes_next`:
 
-1. Detect packed row (`cid` contains `char(0)`)
-2. Split `cid` by `char(0)` → col_name list
-3. Split `col_vrsn` by `char(0)` → col_version list
+1. Detect packed row (`col_vrsn` is BLOB, not INTEGER)
+2. Split `cid` by `char(0)` → col_name list (single-element list if no `char(0)`)
+3. Unpack `col_vrsn` varint array → col_version list
 4. Execute all-columns `SELECT`, fetch all values
 5. Pick values for columns in the `cid` list, pack via `crsql_pack_columns` → `cval`
 
@@ -1033,8 +1033,8 @@ WHERE pk1 = ?(2N+1) AND pk2 = ?(2N+2)
 
 In `merge_insert`:
 
-1. Detect packed row (`cid` contains `char(0)`)
-2. Split `cid` → col_name list, `col_vrsn` → col_version list
+1. Detect packed row (`col_vrsn` is BLOB, not INTEGER)
+2. Split `cid` by `char(0)` → col_name list (single-element list if no `char(0)`), unpack `col_vrsn` varint array → col_version list
 3. Unpack `cval` → col_value list
 4. For each `(col_name, col_version, col_value)`:
    - (a) Run existing per-column merge logic (`did_cid_win`, etc.)
@@ -1056,7 +1056,7 @@ In `merge_insert`:
 
 ### Seq Handling
 
-Write path is unchanged — each column still gets its own seq via `bump_seq()`. The feed query packs ALL seqs via `GROUP_CONCAT(seq, char(0))`. The receiver splits these and records each one in `__corro_seq_bookkeeping`. This is critical for correctness: corrosion's `PartialVersion` tracks seqs as a `RangeInclusiveSet` and determines completeness by checking for gaps in `0..=last_seq`. If we used `MIN(seq)`, the receiver would think seqs 6,7 are missing (when they were packed into seq=5) and would request them forever — deadlock.
+Write path is unchanged — each column still gets its own seq via `bump_seq()`. The feed query packs ALL seqs via `crsql_pack_varint_agg(seq)` (binary varint array, same format as `col_vrsn`). The receiver unpacks these and records each one in `__corro_seq_bookkeeping`. This is critical for correctness: corrosion's `PartialVersion` tracks seqs as a `RangeInclusiveSet` and determines completeness by checking for gaps in `0..=last_seq`. If we used `MIN(seq)`, the receiver would think seqs 6,7 are missing (when they were packed into seq=5) and would request them forever — deadlock.
 
 Partial replays (`SyncNeedV1::Partial`) query `WHERE seq BETWEEN :start AND :end` on the `crsql_changes` vtable. This works correctly because the vtable filters on the underlying clock table's `seq` column (via `xBestIndex`/`xFilter`), not on the packed output. V2 always coalesces rows that share `(PK, db_version, site_id)` regardless of how they were selected. If the seq range covers all columns of an operation, the group is complete and packed. If the range splits an operation (e.g., seqs 5,6,7 but only 5,6 requested), the group is partial — still packed, just with fewer columns. The receiver records the seqs it got and knows the rest are still missing.
 
@@ -1151,7 +1151,7 @@ No "v2&v1" mode for reads — always reads from one schema.
 
 ### Merge Path (`changes_vtab_write.rs`)
 
-Incoming row format detected per-row (`char(0)` in `cid` = packed V2). Local schema version determines write targets:
+Incoming row format detected per-row (`col_vrsn` is BLOB = packed V2, INTEGER = single V1). Local schema version determines write targets:
 
 | Incoming | Local | Action |
 |----------|-------|--------|
@@ -1271,14 +1271,16 @@ When the last non-PK column is dropped via `ALTER TABLE ... DROP COLUMN` + `crsq
 
 This transition is handled in `sync_col_map_v2`, which checks `tbl_info.non_pks.is_empty()` after syncing the col_map and migrates/creates sentinel entries as needed.
 
-### col_id Reuse Policy
+### col_id Allocation Policy
 
-**col_ids are never reused for different columns within the same table's lifetime, except for `col_id=0`**:
+**col_ids are allocated from the first available slot, reusing ids from dropped columns**:
 
 - `col_id=0` is special: it starts as the sentinel for PK-only tables, then becomes a regular column id when a non-PK column is added. If that column is later dropped, `col_id=0` returns to sentinel duty (with clock entries migrated from the dropped column). This is safe because the sentinel and the column are never active at the same time — the transition is atomic (happens during `crsql_commit_alter`).
-- **When adding columns, always try `col_id=0` first**: if `col_id=0` is not in use (no existing col_map entry), the first new column gets `col_id=0`. This is critical for PK-only → normal transitions where sentinel entries at `col_id=0` need to become regular clock entries. After `col_id=0` is assigned, subsequent new columns get `max(col_id) + 1`.
-- For `col_id >= 1`: when a column is dropped, its `col_id` is retired. New columns always get `max(col_id) + 1` (after trying slot 0). This prevents a newly added column from inheriting stale clock entries from a previously dropped column.
+- **When adding columns, always try `col_id=0` first**: if `col_id=0` is not in use (no existing col_map entry), the first new column gets `col_id=0`. This is critical for PK-only → normal transitions where sentinel entries at `col_id=0` need to become regular clock entries.
+- For `col_id >= 1`: when a column is dropped, its `col_id` is freed and can be reused by a subsequently added column. The allocation finds the first unused slot (starting from 0). This means a newly added column can inherit stale clock entries from a previously dropped column that used the same col_id. This is acceptable because the stale entries carry old `db_version`/`seq` values that will be superseded by new writes, and the col_name in `v2_col_map` correctly identifies the new column.
 - If a table cycles through PK-only → normal → PK-only → normal multiple times, `col_id=0` is reused each time, but higher col_ids continue to increment. This is correct because each normal→PK-only transition migrates the last column's entries to `col_id=0` and deletes all other clock entries.
+
+> **Future change**: col_id reuse may be replaced with monotonically increasing allocation (`max(col_id) + 1`) once async cleanup of stale column clock data is implemented. This would prevent any possibility of a new column inheriting stale clock entries from a dropped column. The current reuse-based allocation is simpler and avoids the need for immediate cleanup of dropped column clock entries.
 
 ### Migration from V1
 
