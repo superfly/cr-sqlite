@@ -69,6 +69,8 @@ pub fn create_crr(
     // when upgrading stuff to CRRs
     let mut table_info = pull_table_info(db, table, err)?;
 
+    let metadata_write_version = get_metadata_write_version(db);
+
     // Resolve use_rowid: as_crr arg takes precedence, then schema directive, then auto.
     // Some(true)  = force rowid-key mode (caller guarantees rowids < MAX_ROWID_KEY)
     // Some(false) = force non-rowid-key mode
@@ -105,11 +107,16 @@ pub fn create_crr(
     }
 
     // Override skip_hash if explicitly requested via flag.
-    // The flag forces skip_hash on (even for non-integer PKs, though that would
-    // be unusual). To force skip_hash off on an auto-qualified table, use the
-    // schema comment `/* crsql: skip_hash=0 */` instead.
+    // Composite PKs silently ignore the flag (design: "silently ignored,
+    // falls back to hash mode"). Single-column PKs opt in.
     if skip_hash_flag && !table_info.skip_hash {
-        table_info.skip_hash = true;
+        if table_info.pks.len() == 1 {
+            table_info.skip_hash = true;
+            // Recompute skip_hash_pk_col — it was empty because pull_table_info
+            // ran before the flag override.
+            table_info.skip_hash_pk_col = crate::util::escape_ident(&table_info.pks[0].name);
+        }
+        // Composite PK: silently ignore — skip_hash stays false.
     }
 
     // Persist skip_hash preference so migration path and subsequent pull_table_info
@@ -124,8 +131,6 @@ pub fn create_crr(
     if directive.is_some() || skip_hash_flag {
         unsafe { crate::util::set_master_value(db, &format!("skip_hash_{}", table), skip_hash_val as i64) }?;
     }
-
-    let metadata_write_version = get_metadata_write_version(db);
 
     // Create V2 tables if metadata write mode is dual-write (2) or V2-only (3)
     if metadata_write_version >= config::METADATA_VERSION_V2_AND_V1 {
