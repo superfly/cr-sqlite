@@ -1166,7 +1166,9 @@ The translate step for incoming V2 → local V1 requires a hash-to-PK lookup:
 
 - If the hash is unknown locally (row never seen), the change is for a new row — `INSERT` into main table first, then proceed with V1 merge.
 - If the hash is in `v2_pks` or `v2_tombstone_pks`, resolve to PK and proceed.
-- If the hash is unknown and it's a delete (`cid='-2'`), it can be ignored — we can't delete a row we've never seen. The tombstone is still recorded in `v2_tombstones` if in V2&V1 or V2 mode.
+- If the hash is unknown and it's a delete (`cid='-2'`), the behavior depends on the node's `sync-log-version`:
+  - **`sync-log-version = 2` (V2 wire emission)**: the tombstone is recorded in `v2_tombstones` with hash only. No `v2_tombstone_pks` entry is needed — V2 wire emits `hashed_pk` directly. The delete will propagate to other V2 wire peers.
+  - **`sync-log-version = 1` (V1 wire emission)**: the merge is **rejected with an error**. The node cannot emit this delete in V1 wire format without a PK mapping (`v2_tombstone_pks` entry), and silently dropping it would cause permanent divergence with V1 wire peers. The caller must either switch to V2 wire emission (`sync-log-version = 2`) or ensure the insert is synced first (so the PK mapping exists). This prevents silent data loss during incremental V2 wire rollout.
 
 ### `ts` Type Conversion (V1 TEXT ↔ V2 INTEGER)
 

@@ -2295,6 +2295,91 @@ fn v2_merge_rejects_rowid_overflow() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// Test: V2 hash tombstone for a row not present locally must be rejected
+/// when sync-log-version is 1 (V1 wire emission), because the delete cannot
+/// be forwarded to V1 wire peers without a PK mapping.
+/// When sync-log-version is 2 (V2 wire emission), the same tombstone is accepted.
+fn v2_hash_tombstone_rejected_in_v1_wire_mode() -> Result<(), ResultCode> {
+    libc_println!("=== v2_hash_tombstone_rejected_in_v1_wire_mode START ===");
+
+    let db_a = crate::opendb()?;
+    let db_b = crate::opendb()?;
+
+    for db in [&db_a.db, &db_b.db] {
+        db.exec_safe("CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, a)")?;
+        db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        db.exec_safe("SELECT crsql_as_crr('t')")?;
+    }
+
+    // Both nodes on V2 metadata
+    migrate_to_v2(&db_a.db)?;
+    migrate_to_v2(&db_b.db)?;
+
+    // Node A: V2 wire emission, inserts and deletes a row without syncing in between
+    db_a.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+    db_a.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db_a.db.exec_safe("INSERT INTO t VALUES ('x', 1)")?;
+    db_a.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db_a.db.exec_safe("DELETE FROM t WHERE id = 'x'")?;
+
+    // Node B: V2 metadata but V1 wire emission (rollout window)
+    db_b.db.exec_safe("SELECT crsql_config_set('sync-log-version', 1)")?;
+
+    // Sync A -> B: should fail because B has never seen the row and can't emit V1 wire
+    // Use B's site_id to filter (same pattern as sync_v2_wire)
+    let siteid = {
+        let stmt = db_b.db.prepare_v2("SELECT crsql_site_id()")?;
+        stmt.step()?;
+        stmt.column_blob(0)?.to_vec()
+    };
+
+    let stmt_a = db_a.db.prepare_v2(
+        "SELECT * FROM crsql_changes WHERE db_version >= ? AND site_id IS NOT ?",
+    )?;
+    stmt_a.bind_int64(1, 0)?;
+    stmt_a.bind_blob(2, &siteid, Destructor::STATIC)?;
+
+    db_b.db.exec_safe("BEGIN")?;
+    db_b.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    let mut got_error = false;
+    while stmt_a.step()? == ResultCode::ROW {
+        let stmt_b = db_b.db
+            .prepare_v2("INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")?;
+        for x in 0..10 {
+            stmt_b.bind_value(x + 1, stmt_a.column_value(x)?)?;
+        }
+        match stmt_b.step() {
+            Ok(ResultCode::ERROR) => {
+                got_error = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                got_error = true;
+                break;
+            }
+        }
+    }
+    db_b.db.exec_safe("ROLLBACK")?;
+
+    assert!(got_error, "V2 hash tombstone must be rejected when sync-log-version=1 and row is not present locally");
+
+    // Now switch B to V2 wire emission — same tombstone should be accepted
+    db_b.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+    sync_v2_wire(&db_a.db, &db_b.db, 0)?;
+
+    // B should now have the tombstone
+    let count = {
+        let stmt = db_b.db.prepare_v2("SELECT count(*) FROM t__crsql_v2_tombstones")?;
+        stmt.step()?;
+        stmt.column_int(0)
+    };
+    assert_eq!(count, 1, "tombstone should be recorded after switching to V2 wire");
+
+    libc_println!("=== v2_hash_tombstone_rejected_in_v1_wire_mode PASS ===");
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), ResultCode> {
     v2_basic_insert_sync()?;
     v2_update_sync()?;
@@ -2328,5 +2413,6 @@ pub fn run_suite() -> Result<(), ResultCode> {
     v2_data_consistency_after_stmt_rollback()?;
     v2_cleanup_v1_tables_after_2_to_3_transition()?;
     v2_merge_rejects_rowid_overflow()?;
+    v2_hash_tombstone_rejected_in_v1_wire_mode()?;
     Ok(())
 }

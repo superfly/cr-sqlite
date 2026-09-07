@@ -1408,7 +1408,7 @@ unsafe fn v2_merge_insert_tombstone(
     insert_ts: sqlite::int64,
     _rowid: *mut sqlite::int64,
     _tbl_info_index: usize,
-    _errmsg: *mut *mut c_char,
+    errmsg: *mut *mut c_char,
 ) -> Result<ResultCode, ResultCode> {
     let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
     let is_v2_hash_tombstone = insert_col == crate::consts::V2_HASH_TOMBSTONE_CID;
@@ -1432,6 +1432,27 @@ unsafe fn v2_merge_insert_tombstone(
     // Bail early if incoming CL can't beat local CL
     if insert_cl < local_cl {
         return Ok(ResultCode::OK);
+    }
+
+    // V2 hash tombstone for a completely unknown row (no v2_pks, no v2_tombstones):
+    // we can't emit this delete in V1 wire format because we have no PK values for
+    // v2_tombstone_pks. Reject so the caller knows V1 wire peers won't get this delete.
+    // If a tombstone already exists (local_cl > 0), the delete is already recorded —
+    // we're just updating CL, so no rejection needed.
+    // Once the node switches to V2 wire emission (sync-log-version=2), hash-only
+    // tombstones are emitted directly and this check is skipped.
+    if is_v2_hash_tombstone
+        && local_key.is_none()
+        && local_cl == 0
+        && unsafe { (*ext_data).syncLogVersion } == consts::SYNC_LOG_V1
+    {
+        let err = CString::new(
+            "crsql - received V2 hash tombstone for a row not present locally \
+             while sync-log-version is 1. The delete cannot be forwarded to V1 wire peers \
+             without a PK mapping. Set sync-log-version to 2 or sync the insert first."
+        )?;
+        *errmsg = err.into_raw();
+        return Err(ResultCode::ERROR);
     }
 
     let merge_equal = unsafe { (*ext_data).mergeEqualValues };
