@@ -262,6 +262,9 @@ pub fn unpack_columns(data: &[u8]) -> Result<Vec<ColumnValue>, ResultCode> {
         let column_type_and_maybe_intlen = buf.get_u8();
         let column_type = ColumnType::from_u8(column_type_and_maybe_intlen & 0x07);
         let intlen = (column_type_and_maybe_intlen >> 3 & 0xFF) as usize;
+        if intlen > 8 {
+            return Err(ResultCode::ABORT);
+        }
 
         match column_type {
             Some(ColumnType::Blob) => {
@@ -487,7 +490,10 @@ pub unsafe extern "C" fn crsql_pack_varint_agg_final(ctx: *mut sqlite::context) 
 pub fn unpack_varints(data: &[u8]) -> Result<Vec<i64>, ResultCode> {
     let (count, header_len) = get_varint(data)?;
     let mut buf = &data[header_len..];
-    let mut out = Vec::with_capacity(count as usize);
+    // Cap allocation against remaining buffer — each varint is at least 1 byte,
+    // so count can never legitimately exceed buf.len().
+    let cap = (count as usize).min(buf.len());
+    let mut out = Vec::with_capacity(cap);
     for _ in 0..count {
         let (val, n) = get_varint(buf)?;
         out.push(val as i64);
