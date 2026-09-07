@@ -87,6 +87,12 @@ pub struct TableInfo {
     /// Only valid when skip_hash is true (which requires pks.len() == 1).
     pub skip_hash_pk_col: String,
 
+    /// V2 col_map: (col_id, col_name) pairs loaded from v2_col_map.
+    /// Used to build the feed query's CASE expression with integer col_id
+    /// comparison instead of string col_name comparison.
+    /// Empty for V1 tables or when v2_col_map doesn't exist yet.
+    pub col_map: Vec<(i64, String)>,
+
     // Lookaside --
     // insert returning?
     // select?
@@ -1178,6 +1184,28 @@ pub fn pull_table_info(
     // Detect V2 metadata tables
     let has_v2 = crate::bootstrap_v2::has_v2_tables(db, table).unwrap_or(false);
 
+    // Load col_map from v2_col_map for V2 tables (used by feed query CASE expression)
+    let col_map: Vec<(i64, String)> = if has_v2 {
+        let escaped = crate::util::escape_ident(table);
+        let stmt = db.prepare_v2(&format!(
+            "SELECT col_id, col_name FROM \"{escaped}{suffix}\" ORDER BY col_id\0",
+            escaped = escaped,
+            suffix = consts::V2_COL_MAP_SUFFIX
+        ));
+        match stmt {
+            Ok(stmt) => {
+                let mut map = vec![];
+                while stmt.step().unwrap_or(ResultCode::DONE) == ResultCode::ROW {
+                    map.push((stmt.column_int64(0), stmt.column_text(1).unwrap_or("").to_string()));
+                }
+                map
+            }
+            Err(_) => vec![],
+        }
+    } else {
+        vec![]
+    };
+
     // Detect skip_hash: auto-qualified for single integer-affinity PK,
     // or manually enabled via schema directive / crsql_master flag.
     // skip_hash requires a single-column PK — composite PKs are not supported.
@@ -1297,6 +1325,7 @@ pub fn pull_table_info(
         rowid_alias,
         skip_hash,
         skip_hash_pk_col,
+        col_map,
         set_winner_clock_stmt: RefCell::new(None),
         local_cl_stmt: RefCell::new(None),
         col_version_stmt: RefCell::new(None),
