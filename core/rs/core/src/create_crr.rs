@@ -32,6 +32,37 @@ pub fn create_crr(
         return Ok(ResultCode::OK);
     }
 
+    // If V2 metadata tables don't exist for this table, clear any stale
+    // crsql_master flags from a previous incarnation (e.g., table was dropped
+    // and re-created with a different schema).
+    // If stale V2 tables do exist (orphaned by a DROP TABLE), drop them too —
+    // they carry data from the old incarnation and would corrupt the new one.
+    // Skip this check during crsql_commit_alter (is_commit_alter=true) because
+    // crsql_begin_alter deliberately drops triggers, which would make the stale
+    // detection false-positive and destroy valid V2 metadata.
+    // This is safe for corrosion when triggers get accidentally dropped
+    // because corrosion only calls crsql_as_crr once per table (during schema apply),
+    // never re-calling it on an existing CRR.
+    if !is_commit_alter {
+        let has_v2 = crate::bootstrap_v2::has_v2_tables(db, table).unwrap_or(false);
+        if !has_v2 {
+            unsafe { crate::util::clear_crr_mode_flags(db, table); }
+        } else {
+            // V2 tables exist — check if they're stale (base table was dropped and
+            // re-created). If no crsql triggers exist, the table was likely dropped
+            // and re-created — drop the stale V2 tables and clear flags.
+            let has_triggers = db.prepare_v2(&format!(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' AND tbl_name='{}' AND name LIKE '%crsql%'",
+                crate::util::escape_ident_as_value(table)
+            ))?;
+            let has_triggers = has_triggers.step()? == ResultCode::ROW;
+            if !has_triggers {
+                crate::teardown_v2::remove_crr_v2_tables(db, table)?;
+                unsafe { crate::util::clear_crr_mode_flags(db, table); }
+            }
+        }
+    }
+
     // We do not / can not pull this from the cached set of table infos
     // since nothing would exist in it for a table not yet made into a crr.
     // TODO: Note: we can optimize out our `ensureTableInfosAreUpToDate` by mutating our ext data

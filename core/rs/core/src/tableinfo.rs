@@ -1009,12 +1009,41 @@ pub fn pull_all_table_infos(
 
     let mut seen = alloc::collections::BTreeSet::new();
     let mut ret = vec![];
-    for base_name in clock_table_names {
+    for base_name in &clock_table_names {
         if seen.contains(base_name.as_str()) {
             continue;
         }
         seen.insert(base_name.clone());
-        ret.push(pull_table_info(db, &base_name, err)?);
+
+        // Check if the base table still exists. If it was dropped but V2
+        // metadata tables survived, clean them up and skip.
+        let check = db.prepare_v2(&format!(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='{}'\0",
+            crate::util::escape_ident_as_value(base_name)
+        ))?;
+        let exists = check.step()? == ResultCode::ROW;
+        drop(check);
+
+        if !exists {
+            // Orphaned metadata — schedule cleanup via crsql_master marker.
+            // We can't DROP TABLE here because we may be inside a trigger context
+            // (trigger preamble calls crsql_ensure_table_infos_are_up_to_date),
+            // and DDL inside a trigger fails with SQLITE_LOCKED.
+            // Instead, write a cleanup marker that incremental_maintenance will
+            // process later. crsql_as_crr also checks for stale V2 tables
+            // synchronously if the same table name is re-registered.
+            unsafe {
+                // Schedule V2 table cleanup
+                let _ = crate::util::set_master_text_value(db, &format!("cleanup_v2_tables_{}", base_name), "1");
+                // Schedule V1 table cleanup
+                let _ = crate::util::set_master_text_value(db, &format!("cleanup_v1_tables_{}", base_name), "1");
+                // Clear mode flags immediately (these are just crsql_master rows, no DDL)
+                crate::util::clear_crr_mode_flags(db, base_name);
+            }
+            continue;
+        }
+
+        ret.push(pull_table_info(db, base_name, err)?);
     }
 
     Ok(ret)
@@ -1031,7 +1060,8 @@ pub fn pull_table_info(
     table: &str,
     err: *mut *mut c_char,
 ) -> Result<TableInfo, ResultCode> {
-    let sql = format!("SELECT count(*) FROM pragma_table_info('{table}')");
+    let escaped_table = crate::util::escape_ident_as_value(table);
+    let sql = format!("SELECT count(*) FROM pragma_table_info('{escaped_table}')");
     let columns_len = match db.prepare_v2(&sql).and_then(|stmt| {
         stmt.step()?;
         stmt.column_int(0).to_usize().ok_or(ResultCode::ERROR)
@@ -1045,7 +1075,7 @@ pub fn pull_table_info(
 
     let sql = format!(
         "SELECT \"cid\", \"name\", \"type\", \"pk\"
-         FROM pragma_table_info('{table}') ORDER BY cid ASC"
+         FROM pragma_table_info('{escaped_table}') ORDER BY cid ASC"
     );
     let column_infos = match db.prepare_v2(&sql) {
         Ok(stmt) => {
@@ -1301,8 +1331,8 @@ pub fn is_table_compatible(
 ) -> Result<bool, ResultCode> {
     // No unique indices besides primary key
     if db.count(&format!(
-        "SELECT count(*) FROM pragma_index_list('{table}')
-            WHERE \"origin\" != 'pk' AND \"unique\" = 1"
+        "SELECT count(*) FROM pragma_index_list('{escaped_table}') WHERE \"origin\" != 'pk' AND \"unique\" = 1",
+        escaped_table = crate::util::escape_ident_as_value(table)
     ))? != 0
     {
         err.set(&format!(
@@ -1314,11 +1344,8 @@ pub fn is_table_compatible(
 
     // Must have a primary key
     let valid_pks = db.count(&format!(
-        // pragma_index_list does not include primary keys that alias rowid...
-        // hence why we cannot use
-        // `select * from pragma_index_list where origin = pk`
-        "SELECT count(*) FROM pragma_table_info('{table}')
-        WHERE \"pk\" > 0 AND \"notnull\" > 0"
+        "SELECT count(*) FROM pragma_table_info('{escaped_table}') WHERE \"pk\" > 0 AND \"notnull\" > 0",
+        escaped_table = crate::util::escape_ident_as_value(table)
     ))?;
     if valid_pks == 0 {
         err.set(&format!(
@@ -1330,7 +1357,8 @@ pub fn is_table_compatible(
 
     // All primary keys have to be non-nullable
     if db.count(&format!(
-        "SELECT count(*) FROM pragma_table_info('{table}') WHERE \"pk\" > 0"
+        "SELECT count(*) FROM pragma_table_info('{escaped_table}') WHERE \"pk\" > 0",
+        escaped_table = crate::util::escape_ident_as_value(table)
     ))? != valid_pks
     {
         err.set(&format!(
@@ -1358,7 +1386,8 @@ pub fn is_table_compatible(
 
     // No checked foreign key constraints
     if db.count(&format!(
-        "SELECT count(*) FROM pragma_foreign_key_list('{table}')"
+        "SELECT count(*) FROM pragma_foreign_key_list('{escaped_table}')",
+        escaped_table = crate::util::escape_ident_as_value(table)
     ))? != 0
     {
         err.set(&format!(
@@ -1372,8 +1401,9 @@ pub fn is_table_compatible(
 
     // Check for default value or nullable
     if db.count(&format!(
-        "SELECT count(*) FROM pragma_table_xinfo('{table}')
-        WHERE \"notnull\" = 1 AND \"dflt_value\" IS NULL AND \"pk\" = 0"
+        "SELECT count(*) FROM pragma_table_xinfo('{escaped_table}')
+        WHERE \"notnull\" = 1 AND \"dflt_value\" IS NULL AND \"pk\" = 0",
+        escaped_table = crate::util::escape_ident_as_value(table)
     ))? != 0
     {
         err.set(&format!(

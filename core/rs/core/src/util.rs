@@ -138,7 +138,7 @@ impl Countable for *mut sqlite::sqlite3 {
 /// Get an integer value from crsql_master by exact key.
 /// Returns None if the key does not exist.
 pub unsafe fn get_master_value(db: *mut sqlite3, key: &str) -> Result<Option<i64>, ResultCode> {
-    let sql = "SELECT value FROM crsql_master WHERE key = ?\0";
+    let sql = "SELECT value FROM crsql_master WHERE key = ?";
     let stmt = db.prepare_v2(sql)?;
     stmt.bind_text(1, key, Destructor::STATIC)?;
     if stmt.step()? == ResultCode::ROW {
@@ -169,7 +169,7 @@ pub unsafe fn get_or_count(
 
 /// Set an integer value in crsql_master by exact key (insert or replace).
 pub unsafe fn set_master_value(db: *mut sqlite3, key: &str, value: i64) -> Result<(), ResultCode> {
-    let sql = "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, ?)\0";
+    let sql = "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, ?)";
     let stmt = db.prepare_v2(sql)?;
     stmt.bind_text(1, key, Destructor::STATIC)?;
     stmt.bind_int64(2, value)?;
@@ -179,17 +179,24 @@ pub unsafe fn set_master_value(db: *mut sqlite3, key: &str, value: i64) -> Resul
 
 /// Delete a key from crsql_master by exact key.
 pub unsafe fn clear_master_key(db: *mut sqlite3, key: &str) -> Result<(), ResultCode> {
-    let sql = "DELETE FROM crsql_master WHERE key = ?\0";
+    let sql = "DELETE FROM crsql_master WHERE key = ?";
     let stmt = db.prepare_v2(sql)?;
     stmt.bind_text(1, key, Destructor::STATIC)?;
     stmt.step()?;
     Ok(())
 }
 
+/// Clear all crsql_master mode flags for a table (use_rowid, skip_hash, v2_pks).
+pub unsafe fn clear_crr_mode_flags(db: *mut sqlite3, table: &str) {
+    let _ = clear_master_key(db, &format!("use_rowid_{}", table));
+    let _ = clear_master_key(db, &format!("skip_hash_{}", table));
+    let _ = clear_master_key(db, &format!("v2_pks_{}", table));
+}
+
 /// Get a text value from crsql_master by exact key.
 /// Returns None if the key does not exist.
 pub unsafe fn get_master_text_value(db: *mut sqlite3, key: &str) -> Result<Option<alloc::string::String>, ResultCode> {
-    let sql = "SELECT value FROM crsql_master WHERE key = ?\0";
+    let sql = "SELECT value FROM crsql_master WHERE key = ?";
     let stmt = db.prepare_v2(sql)?;
     stmt.bind_text(1, key, Destructor::STATIC)?;
     if stmt.step()? == ResultCode::ROW {
@@ -200,7 +207,7 @@ pub unsafe fn get_master_text_value(db: *mut sqlite3, key: &str) -> Result<Optio
 
 /// Set a text value in crsql_master by exact key (insert or replace).
 pub unsafe fn set_master_text_value(db: *mut sqlite3, key: &str, value: &str) -> Result<(), ResultCode> {
-    let sql = "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, ?)\0";
+    let sql = "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, ?)";
     let stmt = db.prepare_v2(sql)?;
     stmt.bind_text(1, key, Destructor::TRANSIENT)?;
     stmt.bind_text(2, value, Destructor::TRANSIENT)?;

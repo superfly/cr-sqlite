@@ -204,7 +204,7 @@ unsafe fn process_cleanup_tasks(
     suffixes: &[&str],
 ) -> Result<(), ResultCode> {
     let like_pattern = format!("{}_%", marker_prefix);
-    let stmt = db.prepare_v2("SELECT key FROM crsql_master WHERE key LIKE ?\0")?;
+    let stmt = db.prepare_v2("SELECT key FROM crsql_master WHERE key LIKE ?")?;
     stmt.bind_text(1, &like_pattern, sqlite_nostd::Destructor::TRANSIENT)?;
     let strip = format!("{}_", marker_prefix);
     let mut tables: Vec<String> = Vec::new();
@@ -232,6 +232,17 @@ unsafe fn process_cleanup_tasks(
 /// The total row count is cached in crsql_master on the first call. When a DELETE
 /// removes 0 rows, the table is empty. If the estimate goes negative (possible if
 /// rows were added concurrently), we re-count to correct it.
+unsafe fn table_exists(db: *mut sqlite3, escaped: &str, suffix: &str) -> bool {
+    let sql = format!(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=\"{escaped}{suffix}\"",
+        escaped = escaped, suffix = suffix,
+    );
+    match db.prepare_v2(&sql) {
+        Ok(stmt) => stmt.step().unwrap_or(ResultCode::DONE) == ResultCode::ROW,
+        Err(_) => false,
+    }
+}
+
 unsafe fn cleanup_tables_chunk(
     db: *mut sqlite3,
     tbl_name: &str,
@@ -250,11 +261,14 @@ unsafe fn cleanup_tables_chunk(
         let cached_total: i64 = match crate::util::get_master_value(db, &total_key)? {
             Some(v) => v,
             None => {
-                // First call: count all rows across suffixes
+                // First call: count all rows across suffixes (skip missing tables)
                 let mut total: i64 = 0;
                 for suffix in suffixes {
+                    if !table_exists(db, &escaped, suffix) {
+                        continue;
+                    }
                     let count_sql = format!(
-                        "SELECT count(*) FROM \"{escaped}{suffix}\"\0",
+                        "SELECT count(*) FROM \"{escaped}{suffix}\"",
                         escaped = escaped, suffix = suffix,
                     );
                     let stmt = db.prepare_v2(&count_sql)?;
@@ -267,16 +281,36 @@ unsafe fn cleanup_tables_chunk(
         };
 
         for suffix in suffixes {
+            if !table_exists(db, &escaped, suffix) {
+                continue;
+            }
             let table_name = format!("\"{escaped}{suffix}\"", escaped = escaped, suffix = suffix);
-            db.exec_safe(&format!(
-                "DELETE FROM {table_name} LIMIT {chunk_size}",
-                table_name = table_name,
-                chunk_size = chunk_size,
-            ))?;
-            let deleted = db.changes64();
+            // Chunked deletion. Each metadata table has a known PK column that
+            // serves as a rowid alias (rowid tables) or the actual PK (WITHOUT ROWID).
+            // Use it in a subquery to delete in bounded chunks without DELETE ... LIMIT.
+            // WITHOUT ROWID tables need their explicit PK for chunked deletion;
+            // rowid tables can use rowid directly.
+            let pk_col = match *suffix {
+                consts::V2_TOMBSTONES_SUFFIX => "site_id, db_version, seq",
+                consts::V2_TOMBSTONE_PKS_SUFFIX => "hashed_pk",
+                "__crsql_clock" => "key, col_name",
+                _ => "rowid",
+            };
+            let deleted = if pk_col == "rowid" {
+                db.exec_safe(&format!(
+                    "DELETE FROM {table_name} WHERE rowid IN (SELECT rowid FROM {table_name} LIMIT {chunk_size})",
+                    table_name = table_name, chunk_size = chunk_size,
+                ))?;
+                db.changes64()
+            } else {
+                db.exec_safe(&format!(
+                    "DELETE FROM {table_name} WHERE ({pk_col}) IN (SELECT {pk_col} FROM {table_name} LIMIT {chunk_size})",
+                    table_name = table_name, pk_col = pk_col, chunk_size = chunk_size,
+                ))?;
+                db.changes64()
+            };
             total_deleted += deleted;
             if deleted > 0 {
-                // Deleted something → table might still have rows
                 all_empty = false;
             }
         }
@@ -301,8 +335,11 @@ unsafe fn cleanup_tables_chunk(
             // Re-count to verify
             let mut actual: i64 = 0;
             for suffix in suffixes {
+                if !table_exists(db, &escaped, suffix) {
+                    continue;
+                }
                 let count_sql = format!(
-                    "SELECT count(*) FROM \"{escaped}{suffix}\"\0",
+                    "SELECT count(*) FROM \"{escaped}{suffix}\"",
                     escaped = escaped, suffix = suffix,
                 );
                 let stmt = db.prepare_v2(&count_sql)?;

@@ -135,7 +135,12 @@ pub extern "C" fn crsql_as_table(
 
 fn crsql_as_table_impl(db: *mut sqlite::sqlite3, table: &str) -> Result<ResultCode, ResultCode> {
     remove_crr_clock_table_if_exists(db, table)?;
-    remove_crr_triggers_if_exist(db, table)
+    remove_crr_triggers_if_exist(db, table)?;
+    // Also remove V2 metadata tables and crsql_master flags.
+    crate::teardown_v2::remove_crr_v2_tables(db, table)?;
+    // Clean up remaining crsql_master mode flags (use_rowid, skip_hash, v2_pks).
+    unsafe { crate::util::clear_crr_mode_flags(db, table); }
+    Ok(ResultCode::OK)
 }
 
 #[no_mangle]
