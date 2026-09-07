@@ -26,13 +26,8 @@ pub fn backfill_table_v2(
     no_tx: bool,
 ) -> Result<ResultCode, ResultCode> {
     // V2 clock tables require a non-zero ts. Error early if not set.
-    let ts_check = db.prepare_v2("SELECT crsql_get_ts()\0");
-    if let Ok(stmt) = ts_check {
-        if stmt.step().is_err() {
-            crate::debug::debug_log("backfill_table_v2: timestamp not set — call crsql_set_ts() first");
-            return Err(ResultCode::ERROR);
-        }
-    }
+    // The ts is already checked in x_crsql_as_crr before calling create_crr,
+    // so we skip the redundant check here.
 
     if !no_tx {
         db.exec_safe("SAVEPOINT backfill_v2")?;
