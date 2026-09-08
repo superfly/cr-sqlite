@@ -153,8 +153,8 @@ Examples:
 
 **Detection logic at `as_crr` time**: query `pragma_table_info('<table>')` to determine the mode:
 
-1. Check if any column has `pk > 0` AND `type = 'INTEGER'` → `INTEGER PRIMARY KEY` exists. This is the rowid alias, but **rowid reuse is opt-in for `INTEGER PRIMARY KEY`** (see "Rowid Reuse: Opt-in vs Opt-out" below). Default: `key_is_rowid = false` (auto-increment fallback with stored PK column). Enable via `as_crr` option when the application knows its PK values are small (e.g., sequential, not random 64-bit, or random but within the safe range).
-2. Otherwise (no `INTEGER PRIMARY KEY`), check if none of `rowid`, `oid`, `_rowid_` appear as column names in `pragma_table_info` → at least one alias is unshadowed → use `rowid` as `__crsql_key`. **Rowid reuse is opt-out for plain rowid tables** (SQLite assigns small sequential rowids). Default: `key_is_rowid = true`. Disable via `as_crr` option to force auto-increment fallback.
+1. Check if any column has `pk > 0` AND `type = 'INTEGER'` → `INTEGER PRIMARY KEY` exists. This is the rowid alias, but **rowid reuse is opt-in for `INTEGER PRIMARY KEY`** (see "Rowid Reuse: Opt-in Only" below). Default: `key_is_rowid = false` (auto-increment fallback with stored PK column). Enable via `use_rowid=1` directive or `as_crr` option when the application knows its PK values are small (e.g., sequential, not random 64-bit, or random but within the safe range).
+2. Otherwise (no `INTEGER PRIMARY KEY`), check if none of `rowid`, `oid`, `_rowid_` appear as column names in `pragma_table_info` → at least one alias is unshadowed. **Rowid reuse is disabled by default** — implicit rowids are renumbered by `VACUUM` and are unsafe as persistent keys. Default: `key_is_rowid = false` (auto-increment fallback). `use_rowid=1` is rejected for these tables (no `INTEGER PRIMARY KEY`).
 3. If all three aliases are shadowed AND no `INTEGER PRIMARY KEY` → fall back to auto-increment with stored PK columns.
 
 **Tests required**: write tests covering all cases — (a) plain rowid table (rowid reuse on by default), (b) `INTEGER PRIMARY KEY` table (rowid reuse off by default, on when opted in), (c) all-three-aliases-shadowed table, (d) `INTEGER PRIMARY KEY` + shadowed aliases, (e) plain rowid table with rowid reuse opted out. Verify that `__crsql_key` is correctly assigned and that feed/merge queries work in each case.
@@ -163,14 +163,14 @@ This eliminates the `INSERT OR IGNORE` + auto-increment round-trip on local writ
 - Local insert: `NEW.rowid` is available directly in the trigger.
 - Local update: `NEW.rowid` is available directly in the trigger.
 
-### Rowid Reuse: Opt-in vs Opt-out
+### Rowid Reuse: Opt-in Only
 
-The rowid reuse optimization (`key_is_rowid = true`) has different default policies depending on the table type, due to the `cell_key` packing constraint (see "Large Rowid Handling" below):
+The rowid reuse optimization (`key_is_rowid = true`) is **disabled by default for all table types**. Implicit rowids (tables without `INTEGER PRIMARY KEY`) are not stable — SQLite can renumber them during `VACUUM`, making them unsafe as persistent cross-node keys. `INTEGER PRIMARY KEY` rowids are stable (the rowid IS the PK value), but in distributed systems they're commonly used with large random 64-bit values (snowflake IDs, random IDs, timestamp-based IDs) that exceed the `2^51` `cell_key` limit and overflow into the sign bit.
 
-| Table type | Default | `as_crr` option | Rationale |
+| Table type | Default | `as_crr` option / directive | Rationale |
 |---|---|---|---|
-| **Plain rowid table** (no `INTEGER PRIMARY KEY`, accessible rowid) | **Opt-out** (`key_is_rowid = true`) | `use_rowid_key = 0` to disable | SQLite assigns small sequential rowids (1, 2, 3, ...) that stay well within the `2^51` cell_key limit. Safe by default. |
-| **`INTEGER PRIMARY KEY` table** | **Opt-in** (`key_is_rowid = false`) | `use_rowid_key = 1` to enable | The PK value IS the rowid. In distributed systems, `INTEGER PRIMARY KEY` is commonly used with large random 64-bit values (snowflake IDs, random IDs, timestamp-based IDs) that will exceed the `2^51` cell_key limit and overflow into the sign bit. Disabling by default prevents silent corruption. The application must explicitly opt in when it knows its PK values are small (e.g., sequential auto-increment starting from 1). |
+| **Plain rowid table** (no `INTEGER PRIMARY KEY`, accessible rowid) | **Off** (`key_is_rowid = false`) | `use_rowid=1` to enable (requires `INTEGER PRIMARY KEY`) | Implicit rowids are renumbered by `VACUUM` — never safe as persistent keys. |
+| **`INTEGER PRIMARY KEY` table** | **Off** (`key_is_rowid = false`) | `use_rowid=1` to enable | The PK value IS the rowid. Large random 64-bit PKs (snowflake IDs, etc.) will exceed the `2^51` cell_key limit. The application must explicitly opt in when it knows its PK values are small (e.g., sequential auto-increment starting from 1). |
 
 When `key_is_rowid = false` for an `INTEGER PRIMARY KEY` table, the table falls back to auto-increment with stored PK columns (same as WITHOUT ROWID or shadowed-alias tables). The PK column is stored in `v2_pks` and lookups go through it. The `skip_hash` optimization still applies — the PK value is used directly instead of a hash, just stored as a column rather than as `__crsql_key`.
 
@@ -189,15 +189,9 @@ For WITHOUT ROWID tables, use auto-increment fallback in both cases.
 
 `cell_key = (__crsql_key << CRSQL_COL_ID_BITS) | col_id` must fit in a **signed** `INT64` (SQLite's `INTEGER` type is 64-bit signed), so `cell_key` must stay positive. This means `__crsql_key` is limited to `2^(63 - CRSQL_COL_ID_BITS)`. With the default `CRSQL_COL_ID_BITS = 12`, the limit is `2^51 = 2,251,799,813,685,248`.
 
-If a rowid table may have rowids `>= 2^(63 - CRSQL_COL_ID_BITS)`, it should be converted to WITHOUT ROWID at CRR registration time (per-table decision). The `as_crr` call accepts an option to convert a rowid table to WITHOUT ROWID (storing the full PK as the primary key). This is a one-time schema decision made when the table is registered as a CRR. For `INTEGER PRIMARY KEY` tables, rowid reuse is disabled by default (see "Rowid Reuse: Opt-in vs Opt-out" above) precisely because of this risk — the application must opt in and accept the `CHECK` constraint when it knows its PK values are safe. The `as_crr` call also accepts an opt-out parameter to skip the `CHECK` constraint below (for applications that know their rowids are safe and want to avoid the per-write overhead).
+If a rowid table may have rowids `>= 2^(63 - CRSQL_COL_ID_BITS)`, it should be registered with `without_rowid` or `use_rowid=0` to use `hashed_pk` as the key instead of rowid. This is a one-time schema decision made when the table is registered as a CRR. For `INTEGER PRIMARY KEY` tables, rowid reuse is disabled by default (see "Rowid Reuse: Opt-in Only" above) precisely because of this risk — the application must explicitly opt in via `use_rowid=1` when it knows its PK values are safe.
 
-`CHECK` constraint on main table (rowid tables only):
-
-```sql
-CHECK (rowid >= 0 AND rowid < 2251799813685248)  -- 2^(63 - CRSQL_COL_ID_BITS), signed INT64 safe
-```
-
-Ensures `cell_key = (rowid << CRSQL_COL_ID_BITS) | col_id` fits in a positive signed `INT64` without overflow. Using `2^(63 - bits)` (not `2^(64 - bits)`) because `key << 12` with `key >= 2^51` would overflow into the sign bit, producing negative `cell_key` values that sort before all positive ones — breaking `PRIMARY KEY` ordering. `rowid >= 0` allows `INTEGER PRIMARY KEY` tables that use 0 as a valid key value (`cell_key = 0 | col_id = col_id`, which is fine). Overhead is one integer comparison per write. Rowid changes (e.g., `UPDATE rowid = ...`) are handled by triggers which update `__crsql_key` in `v2_pks` and `cell_key` in `v2_clock` accordingly.
+**Rowid range validation at `as_crr` time:** SQLite has no `ALTER TABLE ADD CONSTRAINT`, so a `CHECK` constraint cannot be added to an existing table. Instead, `as_crr` performs a **one-time scan** (`validate_rowid_range` in `create_crr.rs`) that checks all existing rowids are within `[0, 2^51)`. If any rowid is out of range, `as_crr` returns an error. This catches existing data but does not prevent future inserts of out-of-range rowids — the application is responsible for ensuring rowids stay within bounds after opt-in. Using `2^(63 - bits)` (not `2^(64 - bits)`) because `key << 12` with `key >= 2^51` would overflow into the sign bit, producing negative `cell_key` values that sort before all positive ones — breaking `PRIMARY KEY` ordering. `rowid >= 0` allows `INTEGER PRIMARY KEY` tables that use 0 as a valid key value (`cell_key = 0 | col_id = col_id`, which is fine). Rowid changes (e.g., `UPDATE rowid = ...`) are handled by triggers which update `__crsql_key` in `v2_pks` and `cell_key` in `v2_clock` accordingly.
 
 ### Schema
 
@@ -353,22 +347,16 @@ The two flags are orthogonal:
 | `skip_hash = false` | Plain rowid table with accessible rowid + text/composite/blob PK | WITHOUT ROWID + text/composite/blob PK, or rowid table with all aliases shadowed |
 
 When both flags are true, there are two sub-cases:
-- **`INTEGER PRIMARY KEY` (opted in)**: `__crsql_key = rowid = PK value` — the PK value is the stable cross-node identity directly, with zero indirection. No PK column stored in `v2_pks`, no hash, no extra lookup. Requires the application to opt in via `as_crr` and accept the rowid bounds `CHECK` constraint.
+- **`INTEGER PRIMARY KEY` (opted in)**: `__crsql_key = rowid = PK value` — the PK value is the stable cross-node identity directly, with zero indirection. No PK column stored in `v2_pks`, no hash, no extra lookup. Requires the application to opt in via `use_rowid=1` and pass the one-time rowid range validation at `as_crr` time.
 - **Plain rowid table with `INT PRIMARY KEY`** (or any single int-affinity PK on a rowid table with accessible rowid): `__crsql_key = rowid` (≠ PK value — the int PK is a regular column, not the rowid alias). PK values are fetched from the main table via `SELECT pk_col WHERE rowid = ?`. Lookups by PK value go through the main table first (`SELECT rowid FROM main_table WHERE pk_col = ?`), then `v2_pks WHERE __crsql_key = ?`. No hash, but one extra hop vs `INTEGER PRIMARY KEY`.
 
 ### Runtime Guard
 
-For **auto-qualified** integer PKs: integer affinity does not *force* integer storage — SQLite's affinity conversion is best-effort (text that doesn't look like an integer stays as text). To guarantee the PK is always an integer, a `CHECK` constraint is added to the main table:
+For **auto-qualified** integer PKs: integer affinity does not *force* integer storage — SQLite's affinity conversion is best-effort (text that doesn't look like an integer stays as text). SQLite has no `ALTER TABLE ADD CONSTRAINT`, so a `CHECK (typeof("pk_col") = 'integer')` constraint cannot be added to an existing table. The application is responsible for ensuring PK values are always integers. If a non-integer value is stored, skip-hash lookups will fail to match (the value won't equal the integer key in `v2_pks`), resulting in a missed sync — not corruption, but a data gap.
 
-```sql
-CHECK (typeof("pk_col") = 'integer')
-```
+**Exception**: when the PK is exactly `INTEGER PRIMARY KEY` and rowid reuse is opted in (`key_is_rowid = true`), no `typeof` guard is needed — the rowid alias is always an integer by SQLite's own rules. The one-time rowid range validation at `as_crr` time (§"Large Rowid Handling") still applies.
 
-This is the same category of guard as the existing rowid bounds `CHECK` (§3, "Large Rowid Handling") — declarative, enforced by SQLite at insert/update time, never reaches cr-sqlite's trigger code.
-
-**Exception**: when the PK is exactly `INTEGER PRIMARY KEY` and rowid reuse is opted in (`key_is_rowid = true`), no `typeof` `CHECK` is needed — the rowid alias is always an integer by SQLite's own rules. The rowid bounds `CHECK` (§3, "Large Rowid Handling") still applies. Other rowid tables with a single int PK (e.g., `INT PRIMARY KEY`) still need the `typeof` `CHECK` because the PK column is a regular column, not the rowid alias.
-
-For **manually-enabled** non-integer PKs (blob, text): no `typeof` `CHECK` is added — the application is responsible for ensuring the PK values are bounded and comparison is unambiguous. The tombstone table stores the PK value in its native type (BLOB, TEXT, etc.). If the application's guarantee is violated (e.g., variable-length blobs larger than expected), the only consequence is larger tombstone storage — no correctness issue, since the PK value is still a valid cross-node identity.
+For **manually-enabled** non-integer PKs (blob, text): no `typeof` guard is needed — the application is responsible for ensuring the PK values are bounded and comparison is unambiguous. The tombstone table stores the PK value in its native type (BLOB, TEXT, etc.). If the application's guarantee is violated (e.g., variable-length blobs larger than expected), the only consequence is larger tombstone storage — no correctness issue, since the PK value is still a valid cross-node identity.
 
 ### Schema Changes
 
@@ -491,7 +479,7 @@ pub struct TableInfo {
 - **Auto-qualified**: `pks.len() == 1` AND the PK column's declared type (from `pragma_table_info`) contains `"INT"`.
 - **Manually enabled**: `pks.len() == 1` AND a `skip_hash=1` directive is present in the schema (see §"Schema-Embedded Configuration Directives") or the `as_crr` option is set. Works with any single-column PK type (blob, text, etc.).
 
-**Persistence**: when `v2_pks` exists, infer from its schema — if `v2_pks` has no `hashed_pk` column, `skip_hash = true`. When `v2_pks` doesn't exist yet, persist in `crsql_master` (same pattern as the `without_rowid` flag).
+**Persistence**: when `v2_pks` exists, infer from its schema — if `v2_pks` has no `hashed_pk` column, `skip_hash = true`. When `v2_pks` doesn't exist yet, persist in `crsql_master` (same pattern as the `use_rowid` flag).
 
 **Inference detail**: the existing `key_is_rowid` inference (column count == 3) breaks with skip-hash mode, since a non-rowid skip-hash `v2_pks` also has 3 columns (`__crsql_key`, `pk_col`, `cl`). The inference must check for the `hashed_pk` column by name instead:
 - `v2_pks` has `hashed_pk` column → hash mode (existing logic applies: 3 columns = rowid-key, >3 = non-rowid)
@@ -510,7 +498,7 @@ When migrating an existing V1 table that qualifies for skip-hash mode:
 - Create `v2_pks` / `v2_tombstones` with the skip-hash schema (no `hashed_pk`).
 - Do not create `v2_tombstone_pks`.
 - For each `__crsql_pks` row: use the PK value directly (no `xxh128` computation).
-- Add the `CHECK (typeof("pk_col") = 'integer')` constraint to the main table (only for auto-qualified integer PKs that are not `INTEGER PRIMARY KEY`; manually-enabled non-integer PKs get no `typeof` CHECK).
+- No `CHECK (typeof("pk_col") = 'integer')` constraint is added to the main table (SQLite has no `ALTER TABLE ADD CONSTRAINT`). The application is responsible for ensuring integer PK values are always stored as integers.
 
 ### ALTER TABLE: PK Columns Changed
 
@@ -547,7 +535,7 @@ The `key_is_rowid` and `skip_hash` modes (and future per-table options) are curr
 SQLite preserves comments inside `CREATE TABLE` statements verbatim in `sqlite_master.sql`. Comments between the table name and the opening paren survive all ALTER TABLE operations (ADD/DROP COLUMN):
 
 ```sql
-CREATE TABLE foo /* crsql: use_rowid_key=1, skip_hash=1 */ (
+CREATE TABLE foo /* crsql: use_rowid=1, skip_hash=1 */ (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL
 )
@@ -575,9 +563,10 @@ Supported keys:
 
 | Key | Values | Effect | Default (no directive) |
 |---|---|---|---|
-| `use_rowid_key` | `0` / `1` | Enable/disable rowid reuse (overrides opt-in/opt-out default) | Per-table-type default (see §3 "Rowid Reuse: Opt-in vs Opt-out") |
+| `use_rowid` | `0` / `1` | Enable/disable rowid reuse (overrides default). Only allowed on `INTEGER PRIMARY KEY` tables — implicit rowids are unstable under `VACUUM`. | `0` (disabled for all table types) |
 | `skip_hash` | `0` / `1` | Force enable/disable skip-hash mode (use PK value directly instead of XXH128 hash) | Auto-detected: `1` if single int-affinity PK, else `0`. Can be manually set to `1` for any single-column PK (e.g., fixed-size blob PKs). |
-| `without_rowid` | `0` / `1` | Force WITHOUT ROWID layout | `0` (rowid tables stay rowid unless converted) |
+
+Note: `without_rowid` is not a schema directive key, but it is accepted as an `as_crr` runtime flag (e.g., `SELECT crsql_as_crr('t', 'without_rowid')`). It is equivalent to `use_rowid=0` — forces non-rowid-key mode, using `hashed_pk` instead of rowid as the key.
 
 If a key is absent from the directive, the existing auto-detection / default applies. The directive only overrides what it explicitly specifies.
 
@@ -602,7 +591,7 @@ Corrosion does not need to understand or propagate the directive — it creates 
 ### Precedence
 
 1. **Schema directive** (if present) — highest priority, explicit user intent.
-2. **`as_crr` runtime option** (if provided) — overrides auto-detection but not the schema directive. Useful for migration scenarios where you want to change the mode without recreating the table (e.g., enabling `use_rowid_key` after verifying PKs are small).
+2. **`as_crr` runtime option** (if provided) — overrides auto-detection but not the schema directive. Useful for migration scenarios where you want to change the mode without recreating the table (e.g., enabling `use_rowid` after verifying PKs are small).
 3. **Auto-detection / default** — the existing logic based on `pragma_table_info`.
 
 If the schema directive and `as_crr` option conflict, `as_crr` logs a warning and uses the schema directive. The schema is the source of truth in a declarative system.
@@ -611,13 +600,13 @@ If the schema directive and `as_crr` option conflict, `as_crr` logs a warning an
 
 ```sql
 -- INTEGER PRIMARY KEY with rowid reuse explicitly enabled (small sequential IDs)
-CREATE TABLE users /* crsql: use_rowid_key=1 */ (
+CREATE TABLE users /* crsql: use_rowid=1 */ (
   id INTEGER PRIMARY KEY,
   email TEXT NOT NULL UNIQUE
 );
 
 -- INTEGER PRIMARY KEY with random 64-bit IDs — rowid reuse off (default), skip-hash on (auto)
-CREATE TABLE events /* crsql: use_rowid_key=0 */ (
+CREATE TABLE events /* crsql: use_rowid=0 */ (
   id INTEGER PRIMARY KEY,
   data TEXT
 );
@@ -630,8 +619,9 @@ CREATE TABLE edges (
   PRIMARY KEY (src, dst)
 ) WITHOUT ROWID;
 
--- Plain rowid table, rowid reuse on (default), skip-hash on (auto)
-CREATE TABLE notes /* crsql: use_rowid_key=1 */ (
+-- Plain rowid table — rowid reuse off (default, implicit rowids are unstable)
+-- No directive needed; use_rowid=1 would error (no INTEGER PRIMARY KEY)
+CREATE TABLE notes (
   id INTEGER PRIMARY KEY,
   body TEXT
 );
@@ -758,7 +748,7 @@ Controlled by application-level config flags, not wire-level:
 
 Nodes accept v2 logs regardless of their own `sync-log-version` — `sync-log-version` controls what a node emits, not what it can receive. Reception requires:
 
-1. `metadata-write-version` is `v2` or `v2&v1` (V2 tables are actively written to).
+1. `metadata-write-version` is `2` or `3` (V2 tables are actively written to).
 2. V1→V2 migration is complete (all PK hashes available in `v2_pks`/`v2_tombstone_pks`).
 
 During migration (before completion), v2 logs are rejected with an error because not all PK hashes are available yet for resolving incoming v2 dead-row events (hash-only PKs). Once migration completes in `v2&v1` mode, the node has all hashes and can fully process v2 logs, emit them, and use v2 for feed/processing.
@@ -771,32 +761,33 @@ This allows gradual rollout: migrate schema → flip write → flip use → flip
 
 | From | To | Allowed? | Notes |
 |------|-----|----------|-------|
-| `v1` | `v2&v1` | Yes | Forward always allowed |
-| `v2&v1` | `v2` | Yes | Forward always allowed |
-| `v2&v1` | `v1` | Yes | V1 tables were kept in sync during dual write. Stops any in-progress migration and queues V2 table cleanup (dropped by `crsql_incremental_maintenance` as a background task). |
-| `v2` | `v2&v1` | **Forbidden** | V1 tables stopped receiving writes, now stale |
-| `v2` | `v1` | **Forbidden** | V1 tables stale |
+| `1` (v1) | `2` (v2&v1) | Yes | Forward always allowed |
+| `1` (v1) | `3` (v2) | Yes | Only if no CRR tables exist yet (new database starting on V2) |
+| `2` (v2&v1) | `3` (v2) | Yes | Forward always allowed |
+| `2` (v2&v1) | `1` (v1) | Yes | V1 tables were kept in sync during dual write. Stops any in-progress migration and queues V2 table cleanup (dropped by `crsql_incremental_maintenance` as a background task). |
+| `3` (v2) | `2` (v2&v1) | **Forbidden** | V1 tables stopped receiving writes, now stale |
+| `3` (v2) | `1` (v1) | **Forbidden** | V1 tables stale |
 
 **`metadata-use-version`:**
 
 | From | To | Allowed? | Notes |
 |------|-----|----------|-------|
-| `v1` | `v2` | Yes | Forward allowed (guarded — see below) |
-| `v2` | `v1` | Yes | Only if `metadata-write-version` is `v1` or `v2&v1` (V1 tables still active). Forbidden if write is `v2`. |
+| `1` (v1) | `2` (v2) | Yes | Forward allowed (guarded — see below) |
+| `2` (v2) | `1` (v1) | Yes | Only if `metadata-write-version` is `1` or `2` (V1 tables still active). Forbidden if write is `3`. |
 
 **`sync-log-version`:**
 
 | From | To | Allowed? | Notes |
 |------|-----|----------|-------|
-| `v1` | `v2` | Yes | Forward allowed (guarded — see below) |
-| `v2` | `v1` | Yes | Only if `metadata-use-version` is `v1` and `v2_tombstone_pks` pruning has not started (v1 compat emission needs to resolve hash→PK for dead rows from that table). Forbidden once pruning has removed entries. |
+| `1` (v1) | `2` (v2) | Yes | Forward allowed (guarded — see below) |
+| `2` (v2) | `1` (v1) | Yes | Only if `metadata-use-version` is `1` and `v2_tombstone_pks` pruning has not started (v1 compat emission needs to resolve hash→PK for dead rows from that table). Forbidden once pruning has removed entries. |
 
 ### Re-enabling v2&v1 After Rollback to v1
 
 V2 tables were dropped during the `v2&v1` → `v1` transition. Going forward to `v2&v1` again is just setting the flag, which queues a fresh migration:
 
 ```sql
-crsql_config_set('metadata-write-version', 'v2&v1')  -- queues migration
+crsql_config_set('metadata-write-version', 2)  -- queues migration
 crsql_incremental_maintenance(N)  -- rebuilds V2 from scratch
 ```
 
@@ -804,30 +795,41 @@ The migration function creates V2 tables if they don't exist, so this is equival
 
 ### Config API (Same Mechanism as `merge-equal-values`)
 
+Config values are **integers**, not strings:
+
 ```sql
-crsql_config_set('metadata-write-version', 'v1')   -- default
-crsql_config_set('metadata-write-version', 'v2')
-crsql_config_set('metadata-write-version', 'v2&v1')
-crsql_config_get('metadata-write-version') -> 'v1'
--- same pattern for 'metadata-use-version' and 'sync-log-version'
--- defaults: all 'v1' (existing behavior unchanged until explicitly switched)
+-- metadata-write-version: 1 = v1 (default), 2 = v2&v1 (dual write), 3 = v2 only
+crsql_config_set('metadata-write-version', 1)   -- default
+crsql_config_set('metadata-write-version', 2)  -- start dual-write migration
+crsql_config_set('metadata-write-version', 3)  -- v2 only (stop writing v1 tables)
+
+-- metadata-use-version: 1 = v1 (default), 2 = v2
+crsql_config_set('metadata-use-version', 2)
+
+-- sync-log-version: 1 = v1 wire (default), 2 = v2 wire (packed)
+crsql_config_set('sync-log-version', 2)
+
+crsql_config_get('metadata-write-version') -> 1
+-- defaults: all 1 (existing behavior unchanged until explicitly switched)
 -- stored in crsql_master (same table as other config keys)
--- crsql_config_set enforces progression rules (see above)
+-- crsql_config_set enforces progression rules (see below)
 ```
+
+**Direct `v1 → v2` transition:** when no CRR tables exist yet, `metadata-write-version` can be set directly to `3` (v2 only), skipping the `v2&v1` dual-write phase. This is useful for new databases that start on V2 from the beginning.
 
 ### Guards on `metadata-use-version` and `sync-log-version`
 
-**`metadata-use-version = 'v2'` requires:**
+**`metadata-use-version = 2` requires:**
 
 1. V2 schema is fully populated for ALL CRR tables — either:
    - (a) The table was registered as a CRR with V2 from the start (no V1 tables ever existed), or
    - (b) `crsql_incremental_maintenance` has completed the V1→V2 migration (returned 0 for all migration tasks).
-2. `metadata-write-version` is `v2` or `v2&v1` (V2 tables are actively written to).
+2. `metadata-write-version` is `2` or `3` (V2 tables are actively written to).
 
-**`sync-log-version = 'v2'` requires:**
+**`sync-log-version = 2` requires:**
 
-1. `metadata-use-version` is `v2` (feed reads from V2 tables).
-2. `metadata-write-version` is `v2` or `v2&v1` (V2 tables are actively written to).
+1. `metadata-use-version` is `2` (feed reads from V2 tables).
+2. `metadata-write-version` is `2` or `3` (V2 tables are actively written to).
 
 Guards are global: `crsql_config_set` checks that ALL CRR tables meet prerequisites before accepting the change. This prevents reading from or emitting from stale V2 tables on any table.
 
@@ -837,7 +839,7 @@ Single entry point for all background maintenance work. Dispatches to whatever t
 
 **Dispatch logic (priority order):**
 
-1. **V1→V2 schema migration** (if `metadata-write-version` was set to `v2&v1` for any table that still has V1 tables and no V2 tables):
+1. **V1→V2 schema migration** (if `metadata-write-version` was set to `2` for any table that still has V1 tables and no V2 tables):
    - **(a)** First call for a table: create V2 tables (`col_map`, `clock`, `pks`, `tombstones`, `tombstone_pks`).
    - **(b)** Populate `v2_col_map` from existing `col_name` values in `__crsql_clock`.
    - **(c)** For each chunk of `__crsql_pks` rows (up to `chunk_size` per call):
@@ -847,8 +849,8 @@ Single entry point for all background maintenance work. Dispatches to whatever t
      - If row is dead (`DELETE_SENTINEL`): `INSERT OR REPLACE` into `v2_tombstones` with `cl` from sentinel `col_version` (even), and `INSERT OR REPLACE` into `v2_tombstone_pks`. If `ts = 0` or unparseable, assign the migration start timestamp rather than skipping — the tombstone is still valid, just missing its timestamp.
      - Repack clock rows: for each `(key, col_name)` in `__crsql_clock` for this PK, `INSERT OR REPLACE` into `v2_clock` with `cell_key = (key << COL_ID_BITS) | col_id`. `INSERT OR REPLACE` ensures the cursor pass overwrites any dual-written entries with the authoritative migrated values. Clock entries with `ts = 0` or unparseable `ts` are also assigned the migration start timestamp rather than failing the `CHECK (ts > 0)` constraint.
      - Orphan PK handling: if a `__crsql_pks` row has NO clock entries at all (not even a sentinel) AND the row does not exist in the base table, skip it entirely — it's stale/corrupt metadata with no corresponding data. Do not insert anything into V2 tables for it.
-   - **(d)** First call for a table: set `metadata-write-version` to `v2&v1` automatically. Dual write begins immediately so updates during the cursor sweep are captured in V2 tables. The cursor only processes new `__crsql_pks` rows; without dual write, updates to existing rows would be missed.
-   - **(e)** Final call for a table (returns 0 for that table): migration is complete. All PK hashes are now available. The node can now accept v2 logs, set `metadata-use-version` to `v2`, and set `sync-log-version` to `v2`.
+   - **(d)** First call for a table: set `metadata-write-version` to `2` (v2&v1) automatically. Dual write begins immediately so updates during the cursor sweep are captured in V2 tables. The cursor only processes new `__crsql_pks` rows; without dual write, updates to existing rows would be missed.
+   - **(e)** Final call for a table (returns 0 for that table): migration is complete. All PK hashes are now available. The node can now accept v2 logs, set `metadata-use-version` to `2`, and set `sync-log-version` to `2`.
    - *(Additional maintenance tasks — tombstone pruning, post-alter compaction, backfill — will be added to the dispatcher in the future.)*
 
 **Task queue**: stored in `crsql_master`. Each pending task has:
@@ -862,18 +864,18 @@ Single entry point for all background maintenance work. Dispatches to whatever t
 **Enabling `v2&v1` IS starting the migration:**
 
 ```sql
-crsql_config_set('metadata-write-version', 'v2&v1')  -- queues migration task
+crsql_config_set('metadata-write-version', 2)  -- queues migration task
 -- Then call crsql_incremental_maintenance(N) periodically until it returns 0.
 ```
 
 ### Recommended Rollout Sequence
 
-1. `crsql_config_set('metadata-write-version', 'v2&v1')` — global flag, queues migration tasks for all V1 CRR tables; dual write begins on first maintenance call, capturing updates during migration.
+1. `crsql_config_set('metadata-write-version', 2)` — global flag, queues migration tasks for all V1 CRR tables; dual write begins on first maintenance call, capturing updates during migration.
 2. Call `crsql_incremental_maintenance(N)` periodically until it returns 0. — migration complete for all tables, all PK hashes available, node can now accept v2 logs.
-3. Set `metadata-use-version` to `v2` (guarded: all migrations must be complete).
-4. Set `sync-log-version` to `v2` when all peers can accept V2 format.
-5. Set `metadata-write-version` to `v2` to stop writing to V1 tables. (V1 tables are now stale — progression rules prevent going back.)
-6. `crsql_incremental_maintenance` will clean up V1 tables as a background task: drops `__crsql_clock` and `__crsql_pks` for tables where `metadata-write-version` is `v2` and no V1 feed reads or V1 log emission remain.
+3. Set `metadata-use-version` to `2` (guarded: all migrations must be complete).
+4. Set `sync-log-version` to `2` when all peers can accept V2 format.
+5. Set `metadata-write-version` to `3` to stop writing to V1 tables. (V1 tables are now stale — progression rules prevent going back.)
+6. `crsql_incremental_maintenance` will clean up V1 tables as a background task: drops `__crsql_clock` and `__crsql_pks` for tables where `metadata-write-version` is `3` and no V1 feed reads or V1 log emission remain.
 
 ### V1/V2 Coexistence
 
@@ -881,7 +883,7 @@ During rollout, a node may receive both v1 (per-column) and v2 (packed) log entr
 
 - **Packed (v2)**: `col_vrsn` is a BLOB (binary varint array from `crsql_pack_varint_agg`). `cid` is `GROUP_CONCAT(col_name, char(0))` — for single-column groups this is just the column name with no `char(0)` separator, so `char(0)` presence cannot be used for detection. `cval` is a `crsql_pack_agg` TLV blob. Detection is type-based: if `col_vrsn` is a BLOB, the row is packed; if it's an INTEGER, the row is a single/sentinel event. Split `cid` by `char(0)` to get the col_name list (a single-element list for single-column groups). `col_vrsn` is a varint array — unpack to get versions. `cval` is a `crsql_pack_columns` blob of all values.
 - **Single (v1)**: `col_vrsn` is a single INTEGER. `cid` is a plain column name or sentinel (TEXT). `cval` is a single value.
-- **Sentinels**: `cid = '-1'` (delete or insert sentinel — in V1 both `INSERT_SENTINEL` and `DELETE_SENTINEL` are `'-1'`, distinguished by CL parity: even = delete, odd = insert) or `'-2'` (hash-based tombstone, **new in V2**: dead row with `hashed_pk` instead of real PK) are always single events in both v1 and v2 — no packing. The merge path must handle `'-2'` as a new case not present in V1. **`'-2'` can only be accepted when the receiving node has completed V1→V2 migration** (i.e., `metadata-use-version` is `v2&v1` or `v2`), since it requires `v2_tombstones` and `v2_pks` tables to exist with full data. If a `'-2'` row is received before migration is complete, the merge path must return an error — the sender is using V2 wire format but the receiver isn't ready for it.
+- **Sentinels**: `cid = '-1'` (delete or insert sentinel — in V1 both `INSERT_SENTINEL` and `DELETE_SENTINEL` are `'-1'`, distinguished by CL parity: even = delete, odd = insert) or `'-2'` (hash-based tombstone, **new in V2**: dead row with `hashed_pk` instead of real PK) are always single events in both v1 and v2 — no packing. The merge path must handle `'-2'` as a new case not present in V1. **V2 wire format (packed rows and `'-2'` tombstones) can only be accepted when the receiving node has `metadata-use-version = 2`.** This is enforced by a gate in the merge path: if `metadata-use-version != 2`, the merge returns an error. Setting `metadata-use-version` to 2 requires `crsql_incremental_maintenance()` to report migration complete (validated by the config setter), so `metadata-use-version = 2` is a reliable signal that all V2 tables exist with full data. No additional hot-path migration check is needed.
 
 Column names are used (not `col_id`) because names are deterministic across nodes (same schema) while internal `col_id` from `col_map` is local and non-deterministic across nodes.
 
@@ -957,7 +959,7 @@ GROUP BY t1.cell_key >> CRSQL_COL_ID_BITS, t1.db_version, site_tbl.site_id
 > For rowid tables, `pk_cols_for_table = mt.<pk1>, mt.<pk2>, ...`
 > For WITHOUT ROWID tables, `pk_cols_for_table = ah.<pk1>, ah.<pk2>, ...`
 
-**UNION ALL — Dead rows, V2 wire format** (`sync-log-version = 'v2'`):
+**UNION ALL — Dead rows, V2 wire format** (`sync-log-version = 2`):
 
 Tombstones ARE the sentinel/delete events. There are no separate sentinel rows in the clock table — the tombstones table serves that role. `cid = '-2'` distinguishes hash-based tombstones from V1 `'-1'` delete sentinels.
 
@@ -978,9 +980,9 @@ LEFT JOIN crsql_site_id AS site_tbl ON d.site_id = site_tbl.ordinal
 WHERE d.site_id = ? AND d.db_version > ?
 ```
 
-**UNION ALL — Dead rows, V1 compat wire format** (`sync-log-version = 'v1'`, metadata in V2):
+**UNION ALL — Dead rows, V1 compat wire format** (`sync-log-version = 1`, metadata in V2):
 
-Real PK columns resolved from `v2_tombstone_pks`. `cid = '-1'` (V1 delete sentinel). Emitted when `sync-log-version = 'v1'` but metadata is stored in V2 tables.
+Real PK columns resolved from `v2_tombstone_pks`. `cid = '-1'` (V1 delete sentinel). Emitted when `sync-log-version = 1` but metadata is stored in V2 tables.
 
 ```sql
 SELECT
@@ -1066,7 +1068,7 @@ Partial replays (`SyncNeedV1::Partial`) query `WHERE seq BETWEEN :start AND :end
 
 ## Backfill (V2): `crsql_backfill_v2`
 
-Called when a table is first registered as a CRR with V2 schema (`metadata-write-version` is `v2` at `as_crr` time, no V1 tables exist).
+Called when a table is first registered as a CRR with V2 schema (`metadata-write-version` is `3` at `as_crr` time, no V1 tables exist).
 
 For each row in the main table not yet in `v2_pks`:
 
@@ -1145,7 +1147,7 @@ V2 write functions live in `local_writes/v2.rs` (single file). Trigger SQL is un
 Feed query selection based on `metadata-use-version`:
 
 - **V1** → existing V1 feed query (V1 clock tables, per-column rows)
-- **V2** → V2 feed query (V2 tables, packed if `sync-log-version = v2`)
+- **V2** → V2 feed query (V2 tables, packed if `sync-log-version = 2`)
 
 No "v2&v1" mode for reads — always reads from one schema.
 
