@@ -955,6 +955,9 @@ pub extern "C" fn crsql_init_table_info_vec(ext_data: *mut crsql_ExtData) {
 #[no_mangle]
 pub extern "C" fn crsql_drop_table_info_vec(ext_data: *mut crsql_ExtData) {
     unsafe {
+        if (*ext_data).tableInfos.is_null() {
+            return;
+        }
         drop(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>));
         (*ext_data).tableInfos = core::ptr::null_mut();
     }
@@ -1190,7 +1193,7 @@ pub fn pull_table_info(
     let is_without_rowid = db.count(&format!(
         "SELECT wr FROM pragma_table_list('{name}')",
         name = crate::util::escape_ident_as_value(table),
-    )).map(|v| v == 1).unwrap_or(false);
+    )).map(|v| v == 1)?;
     // Initial value: false for all tables. Only set to true if:
     // 1. The table has INTEGER PRIMARY KEY (rowid alias, stable), AND
     // 2. The table is not WITHOUT ROWID, AND
@@ -1236,13 +1239,9 @@ pub fn pull_table_info(
         let has_hashed_pk_stmt = db.prepare_v2(&format!(
             "SELECT count(*) FROM pragma_table_info('{name}') WHERE name = 'hashed_pk'",
             name = v2_pks_name,
-        ));
-        if let Ok(stmt) = has_hashed_pk_stmt {
-            if stmt.step().unwrap_or(ResultCode::DONE) == ResultCode::ROW {
-                Some(stmt.column_int(0) == 0) // no hashed_pk column → skip_hash mode
-            } else {
-                None
-            }
+        ))?;
+        if has_hashed_pk_stmt.step()? == ResultCode::ROW {
+            Some(has_hashed_pk_stmt.column_int(0) == 0) // no hashed_pk column → skip_hash mode
         } else {
             None
         }
@@ -1257,7 +1256,7 @@ pub fn pull_table_info(
             Some(p)
         } else {
             // Check schema directive in sqlite_master (tri-state)
-            crate::schema_directive::read_skip_hash_directive_opt(db, table).unwrap_or(None)
+            crate::schema_directive::read_skip_hash_directive_opt(db, table)?
         }
     };
 

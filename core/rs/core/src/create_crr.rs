@@ -28,6 +28,20 @@ pub fn create_crr(
     if !is_table_compatible(db, table, err)? {
         return Err(ResultCode::ERROR);
     }
+
+    create_crr_inner(db, _schema, table, is_commit_alter, no_tx, use_rowid, skip_hash_flag, err)
+}
+
+fn create_crr_inner(
+    db: *mut sqlite::sqlite3,
+    _schema: &str,
+    table: &str,
+    is_commit_alter: bool,
+    no_tx: bool,
+    use_rowid: Option<bool>,
+    skip_hash_flag: bool,
+    err: *mut *mut c_char,
+) -> Result<ResultCode, ResultCode> {
     if is_crr(db, table)? {
         return Ok(ResultCode::OK);
     }

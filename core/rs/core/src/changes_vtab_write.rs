@@ -488,7 +488,7 @@ unsafe fn post_v2_merge(
     if mwv == config::METADATA_VERSION_V2_AND_V1 {
         let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
         let (v2_key_opt, v2_cl) =
-            v2_lookup_key_and_cl(db, &escaped, tbl_info, hashed_pk, unpacked_pks.unwrap_or(&Vec::new()), ext_data).unwrap_or((None, 0));
+            v2_lookup_key_and_cl(db, &escaped, tbl_info, hashed_pk, unpacked_pks.unwrap_or(&Vec::new()), ext_data)?;
         v2_to_v1_mirror_metadata(
             db,
             ext_data,

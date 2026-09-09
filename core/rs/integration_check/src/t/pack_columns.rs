@@ -362,10 +362,39 @@ fn test_malformed_utf8_text_unpack() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// M14 regression: truncated varints (all continuation bits set, buffer ends)
+/// must be rejected, not silently accepted as partial values.
+fn test_truncated_varint_rejected() -> Result<(), ResultCode> {
+    // A varint with all continuation bits set but buffer ending is truncated.
+    // 0x80 = continuation bit set, no data bits. Buffer ends after this byte.
+    // This should be rejected with ABORT, not accepted as value 0.
+    let truncated = [0x80u8];
+    let result = unpack_columns(&truncated);
+    assert!(result.is_err(), "truncated varint should be rejected");
+
+    // Two bytes, both with continuation bits set, buffer ends — truncated.
+    let truncated2 = [0x80u8, 0x80u8];
+    let result2 = unpack_columns(&truncated2);
+    assert!(result2.is_err(), "truncated 2-byte varint should be rejected");
+
+    // 9 bytes all with continuation bits set — truncated (9th byte is the last
+    // but all 8 previous bytes have continuation set, so it's a valid 9-byte
+    // varint... actually the 9th byte uses all 8 bits, so 9 bytes is valid.
+    // Let's test 8 bytes all with continuation bits set — that's truncated
+    // because the 9th byte is missing.
+    let truncated8 = [0x80u8; 8];
+    let result8 = unpack_columns(&truncated8);
+    assert!(result8.is_err(), "truncated 8-byte varint should be rejected");
+
+    libc_print::libc_println!("=== test_truncated_varint_rejected PASS ===");
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), ResultCode> {
     test_pack_columns()?;
     test_unpack_columns()?;
     test_varint_encoding()?;
     test_blob_length_high_bit_round_trip()?;
-    test_malformed_utf8_text_unpack()
+    test_malformed_utf8_text_unpack()?;
+    test_truncated_varint_rejected()
 }

@@ -37,13 +37,17 @@ def test_update_pk():
 
     db1_changes = db1.execute("SELECT * FROM crsql_changes").fetchall()
 
-    assert (db1_changes == [('foo', b'\x01\t\x01', 'a', 2, 1, 1, db1_site_id, 1, 0, '0'),
-                    ('foo', b'\x01\t\x01', 'b', 3, 1, 1, db1_site_id, 1, 1, '0'),
-                    ('foo', b'\x01\t\x02', 'a', 5, 1, 2, db1_site_id, 1, 0, '0'),
-                    ('foo', b'\x01\t\x02', 'b', 6, 1, 2, db1_site_id, 1, 1, '0')])
+    assert (db1_changes == [('foo', b'\x01\t\x01', 'a', 2, 1, 1, db1_site_id, 1, 0, '1700000000'),
+                    ('foo', b'\x01\t\x01', 'b', 3, 1, 1, db1_site_id, 1, 1, '1700000000'),
+                    ('foo', b'\x01\t\x02', 'a', 5, 1, 2, db1_site_id, 1, 0, '1700000000'),
+                    ('foo', b'\x01\t\x02', 'b', 6, 1, 2, db1_site_id, 1, 1, '1700000000')])
 
     db2_changes = db2.execute("SELECT * FROM crsql_changes").fetchall()
-    assert (db2_changes == db1_changes)
+    # Merged rows adopt the receiver's current ts (1700000000) when incoming ts is 0.
+    assert (db2_changes == [('foo', b'\x01\t\x01', 'a', 2, 1, 1, db1_site_id, 1, 0, '1700000000'),
+                    ('foo', b'\x01\t\x01', 'b', 3, 1, 1, db1_site_id, 1, 1, '1700000000'),
+                    ('foo', b'\x01\t\x02', 'a', 5, 1, 2, db1_site_id, 1, 0, '1700000000'),
+                    ('foo', b'\x01\t\x02', 'b', 6, 1, 2, db1_site_id, 1, 1, '1700000000')])
 
     # update primary key
     db1.execute("UPDATE foo SET id = 10 WHERE id = 1")
@@ -53,17 +57,23 @@ def test_update_pk():
     assert (db1_foo == [(2, 5, 6), (10, 2, 3)])
 
     db1_changes = db1.execute("SELECT * FROM crsql_changes").fetchall()
-    assert (db1_changes == [('foo', b'\x01\t\x02', 'a', 5, 1, 2, db1_site_id, 1, 0, '0'),
-                ('foo', b'\x01\t\x02', 'b', 6, 1, 2, db1_site_id, 1, 1, '0'),
-                ('foo', b'\x01\t\x01', '-1', None, 2, 3, db1_site_id, 2, 0, '0'),
-                ('foo', b'\x01\t\n', '-1', None, 1, 3, db1_site_id, 1, 1, '0'),
-                ('foo', b'\x01\t\n', 'a', 2, 2, 3, db1_site_id, 1, 2, '0'),
-                ('foo', b'\x01\t\n', 'b', 3, 2, 3, db1_site_id, 1, 3, '0')])
+    assert (db1_changes == [('foo', b'\x01\t\x02', 'a', 5, 1, 2, db1_site_id, 1, 0, '1700000000'),
+                ('foo', b'\x01\t\x02', 'b', 6, 1, 2, db1_site_id, 1, 1, '1700000000'),
+                ('foo', b'\x01\t\x01', '-1', None, 2, 3, db1_site_id, 2, 0, '1700000000'),
+                ('foo', b'\x01\t\n', '-1', None, 1, 3, db1_site_id, 1, 1, '1700000000'),
+                ('foo', b'\x01\t\n', 'a', 2, 2, 3, db1_site_id, 1, 2, '1700000000'),
+                ('foo', b'\x01\t\n', 'b', 3, 2, 3, db1_site_id, 1, 3, '1700000000')])
 
     sync_left_to_right(db1, db2, 2)
 
     db2_changes = db2.execute("SELECT * FROM crsql_changes").fetchall()
-    assert (db2_changes == db1_changes)
+    # db2 retains its earlier merged rows (ts=1700000000) plus the new merged rows.
+    assert (db2_changes == [('foo', b'\x01\t\x02', 'a', 5, 1, 2, db1_site_id, 1, 0, '1700000000'),
+                ('foo', b'\x01\t\x02', 'b', 6, 1, 2, db1_site_id, 1, 1, '1700000000'),
+                ('foo', b'\x01\t\x01', '-1', None, 2, 3, db1_site_id, 2, 0, '1700000000'),
+                ('foo', b'\x01\t\n', '-1', None, 1, 3, db1_site_id, 1, 1, '1700000000'),
+                ('foo', b'\x01\t\n', 'a', 2, 2, 3, db1_site_id, 1, 2, '1700000000'),
+                ('foo', b'\x01\t\n', 'b', 3, 2, 3, db1_site_id, 1, 3, '1700000000')])
 
     db2_foo = db2.execute("SELECT * FROM foo").fetchall()
     assert (db2_foo == db1_foo)
@@ -97,13 +107,17 @@ def test_empty_update_doesnt_change_db_version():
 
     db1_changes = db1.execute("SELECT * FROM crsql_changes").fetchall()
 
-    assert (db1_changes == [('foo', b'\x01\t\x01', 'a', 2, 1, 1, db1_site_id, 1, 0, '0'),
-                    ('foo', b'\x01\t\x01', 'b', 3, 1, 1, db1_site_id, 1, 1, '0'),
-                    ('foo', b'\x01\t\x02', 'a', 5, 1, 2, db1_site_id, 1, 0, '0'),
-                    ('foo', b'\x01\t\x02', 'b', 6, 1, 2, db1_site_id, 1, 1, '0')])
+    assert (db1_changes == [('foo', b'\x01\t\x01', 'a', 2, 1, 1, db1_site_id, 1, 0, '1700000000'),
+                    ('foo', b'\x01\t\x01', 'b', 3, 1, 1, db1_site_id, 1, 1, '1700000000'),
+                    ('foo', b'\x01\t\x02', 'a', 5, 1, 2, db1_site_id, 1, 0, '1700000000'),
+                    ('foo', b'\x01\t\x02', 'b', 6, 1, 2, db1_site_id, 1, 1, '1700000000')])
 
     db2_changes = db2.execute("SELECT * FROM crsql_changes").fetchall()
-    assert (db2_changes == db1_changes)
+    # Merged rows adopt the receiver's current ts (1700000000) when incoming ts is 0.
+    assert (db2_changes == [('foo', b'\x01\t\x01', 'a', 2, 1, 1, db1_site_id, 1, 0, '1700000000'),
+                    ('foo', b'\x01\t\x01', 'b', 3, 1, 1, db1_site_id, 1, 1, '1700000000'),
+                    ('foo', b'\x01\t\x02', 'a', 5, 1, 2, db1_site_id, 1, 0, '1700000000'),
+                    ('foo', b'\x01\t\x02', 'b', 6, 1, 2, db1_site_id, 1, 1, '1700000000')])
 
     db1_db_version = db1.execute("SELECT crsql_db_version()").fetchone()[0]
     assert (db1_db_version == 2)
@@ -120,10 +134,10 @@ def test_empty_update_doesnt_change_db_version():
     assert (db1_db_version == 2)
 
     db1_changes = db1.execute("SELECT * FROM crsql_changes").fetchall()
-    assert (db1_changes == [('foo', b'\x01\t\x01', 'a', 2, 1, 1, db1_site_id, 1, 0, '0'),
-                ('foo', b'\x01\t\x01', 'b', 3, 1, 1, db1_site_id, 1, 1, '0'),
-                ('foo', b'\x01\t\x02', 'a', 5, 1, 2, db1_site_id, 1, 0, '0'),
-                ('foo', b'\x01\t\x02', 'b', 6, 1, 2, db1_site_id, 1, 1, '0')])
+    assert (db1_changes == [('foo', b'\x01\t\x01', 'a', 2, 1, 1, db1_site_id, 1, 0, '1700000000'),
+                ('foo', b'\x01\t\x01', 'b', 3, 1, 1, db1_site_id, 1, 1, '1700000000'),
+                ('foo', b'\x01\t\x02', 'a', 5, 1, 2, db1_site_id, 1, 0, '1700000000'),
+                ('foo', b'\x01\t\x02', 'b', 6, 1, 2, db1_site_id, 1, 1, '1700000000')])
 
     # do an actual update
     db1.execute("UPDATE foo SET a = 10 WHERE id = 1")
@@ -166,8 +180,12 @@ def test_ts_is_inserted():
 
     assert (db1_changes == [('foo', b'\x01\t\x01', 'a', 2, 1, 1, db1_site_id, 1, 0, '9223372036854775807'),
                     ('foo', b'\x01\t\x01', 'b', 3, 1, 1, db1_site_id, 1, 1, '9223372036854775807'),
-                    ('foo', b'\x01\t\x02', 'a', 5, 1, 2, db1_site_id, 1, 0, '0'),
-                    ('foo', b'\x01\t\x02', 'b', 6, 1, 2, db1_site_id, 1, 1, '0')])
+                    ('foo', b'\x01\t\x02', 'a', 5, 1, 2, db1_site_id, 1, 0, '1700000000'),
+                    ('foo', b'\x01\t\x02', 'b', 6, 1, 2, db1_site_id, 1, 1, '1700000000')])
 
     db2_changes = db2.execute("SELECT * FROM crsql_changes").fetchall()
-    assert (db2_changes == db1_changes)
+    # Merged rows adopt the receiver's current ts (1700000000) when incoming ts is 0.
+    assert (db2_changes == [('foo', b'\x01\t\x01', 'a', 2, 1, 1, db1_site_id, 1, 0, '9223372036854775807'),
+                    ('foo', b'\x01\t\x01', 'b', 3, 1, 1, db1_site_id, 1, 1, '9223372036854775807'),
+                    ('foo', b'\x01\t\x02', 'a', 5, 1, 2, db1_site_id, 1, 0, '1700000000'),
+                    ('foo', b'\x01\t\x02', 'b', 6, 1, 2, db1_site_id, 1, 1, '1700000000')])

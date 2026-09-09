@@ -65,6 +65,7 @@ int syncLeftToRight(sqlite3 *db1, sqlite3 *db2, sqlite3_int64 since) {
   // Set ts so merge_insert doesn't reject the sync
   sqlite3_exec(db2, "BEGIN", 0, 0, 0);
   sqlite3_exec(db2, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  sqlite3_exec(db2, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
 
   while (sqlite3_step(pStmtRead) == SQLITE_ROW) {
     for (int i = 0; i < 9; ++i) {
@@ -113,6 +114,7 @@ static int createSimpleSchema(sqlite3 *db, char **err) {
   rc += sqlite3_exec(db, "create table foo (a primary key not null, b);", 0, 0,
                      err);
   rc += sqlite3_exec(db, "select crsql_set_ts('1700000000')", 0, 0, err);
+  rc += sqlite3_exec(db, "select crsql_config_set('default-ts', 1700000000)", 0, 0, err);
   rc += sqlite3_exec(db, "select crsql_as_crr('foo');", 0, 0, err);
 
   return rc;
@@ -295,6 +297,7 @@ static void testSelectChangesAfterChangingColumnName() {
   rc +=
       sqlite3_exec(db, "CREATE TABLE foo(a primary key not null, b);", 0, 0, 0);
   rc += sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc += sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   rc += sqlite3_exec(db, "SELECT crsql_as_crr('foo')", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
@@ -303,12 +306,14 @@ static void testSelectChangesAfterChangingColumnName() {
   assert(rc == SQLITE_OK);
 
   rc += sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc += sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   rc = sqlite3_exec(db, "SELECT crsql_begin_alter('foo')", 0, 0, &err);
   rc += sqlite3_exec(db, "ALTER TABLE foo DROP COLUMN b", 0, 0, 0);
   rc += sqlite3_exec(db, "ALTER TABLE foo ADD COLUMN c", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
   rc += sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc += sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   rc = sqlite3_exec(db, "SELECT crsql_commit_alter('foo')", 0, 0, &err);
   printf("rc: %d, err: %s\n", rc, err);
   assert(rc == SQLITE_OK);
@@ -506,8 +511,10 @@ static void testLamportCondition() {
       db2, "CREATE TABLE \"hoot\" (\"a\", \"b\" primary key not null, \"c\")",
       0, 0, 0);
   rc += sqlite3_exec(db1, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc += sqlite3_exec(db1, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   rc += sqlite3_exec(db1, "SELECT crsql_as_crr('hoot');", 0, 0, 0);
   rc += sqlite3_exec(db2, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc += sqlite3_exec(db2, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   rc += sqlite3_exec(db2, "SELECT crsql_as_crr('hoot');", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
@@ -579,8 +586,10 @@ static void noopsDoNotMoveClocks() {
       db2, "CREATE TABLE \"hoot\" (\"a\", \"b\" primary key not null, \"c\")",
       0, 0, 0);
   rc += sqlite3_exec(db1, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc += sqlite3_exec(db1, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   rc += sqlite3_exec(db1, "SELECT crsql_as_crr('hoot');", 0, 0, 0);
   rc += sqlite3_exec(db2, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc += sqlite3_exec(db2, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   rc += sqlite3_exec(db2, "SELECT crsql_as_crr('hoot');", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
@@ -630,6 +639,7 @@ static void testPullingOnlyLocalChanges() {
   rc += sqlite3_exec(db, "CREATE TABLE node (id primary key not null, content)",
                      0, 0, 0);
   rc += sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc += sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   rc += sqlite3_exec(db, "SELECT crsql_as_crr('node')", 0, 0, 0);
   rc += sqlite3_exec(db, "INSERT INTO node VALUES (1, 'some str')", 0, 0, 0);
   rc += sqlite3_exec(db, "INSERT INTO node VALUES (2, 'other str')", 0, 0, 0);

@@ -3128,5 +3128,92 @@ pub fn run_suite() -> Result<(), ResultCode> {
     v2_on_demand_hydration_local_write_and_remote_merge()?;
     v2_on_demand_hydration_clock_comparison()?;
     v2_backfill_db_version_per_row_not_per_cell()?;
+    v2_mixed_order_by_directions()?;
+    Ok(())
+}
+
+/// M20 regression: mixed ORDER BY directions (e.g., `ORDER BY db_version ASC, seq DESC`)
+/// must be preserved per-column, not collapsed to a single direction.
+fn v2_mixed_order_by_directions() -> Result<(), ResultCode> {
+    let c = crate::opendb().expect("db opened");
+    let db = &c.db;
+
+    db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, val)")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+
+    // Insert rows that will have different db_version and seq values.
+    // We need multiple changes with known ordering to test mixed directions.
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (1, 'a')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (2, 'b')")?;
+    db.db.exec_safe("COMMIT")?;
+
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (3, 'c')")?;
+    db.db.exec_safe("UPDATE foo SET val = 'a2' WHERE id = 1")?;
+    db.db.exec_safe("COMMIT")?;
+
+    // Test: ORDER BY db_version ASC, seq DESC
+    // This should return rows sorted by db_version ascending, then seq descending.
+    // If directions were collapsed (all ASC or all DESC), the seq ordering within
+    // the same db_version would be wrong.
+
+    let stmt = db.db.prepare_v2(
+        "SELECT db_version, seq FROM crsql_changes ORDER BY db_version ASC, seq DESC"
+    )?;
+    let mut rows: Vec<(i64, i64)> = Vec::new();
+    while stmt.step()? == ResultCode::ROW {
+        rows.push((stmt.column_int64(0), stmt.column_int64(1)));
+    }
+
+    // Verify db_version is non-decreasing (ASC)
+    for i in 1..rows.len() {
+        assert!(rows[i].0 >= rows[i-1].0,
+            "db_version should be non-decreasing (ASC), got {} after {}",
+            rows[i].0, rows[i-1].0);
+    }
+
+    // Within the same db_version, seq should be non-increasing (DESC)
+    let mut i = 1;
+    while i < rows.len() {
+        if rows[i].0 == rows[i-1].0 {
+            assert!(rows[i].1 <= rows[i-1].1,
+                "seq should be non-increasing (DESC) within same db_version, got {} after {}",
+                rows[i].1, rows[i-1].1);
+        }
+        i += 1;
+    }
+
+    // Test the reverse: ORDER BY db_version DESC, seq ASC
+    let stmt2 = db.db.prepare_v2(
+        "SELECT db_version, seq FROM crsql_changes ORDER BY db_version DESC, seq ASC"
+    )?;
+    let mut rows2: Vec<(i64, i64)> = Vec::new();
+    while stmt2.step()? == ResultCode::ROW {
+        rows2.push((stmt2.column_int64(0), stmt2.column_int64(1)));
+    }
+
+    // Verify db_version is non-increasing (DESC)
+    for i in 1..rows2.len() {
+        assert!(rows2[i].0 <= rows2[i-1].0,
+            "db_version should be non-increasing (DESC), got {} after {}",
+            rows2[i].0, rows2[i-1].0);
+    }
+
+    // Within the same db_version, seq should be non-decreasing (ASC)
+    let mut i = 1;
+    while i < rows2.len() {
+        if rows2[i].0 == rows2[i-1].0 {
+            assert!(rows2[i].1 >= rows2[i-1].1,
+                "seq should be non-decreasing (ASC) within same db_version, got {} after {}",
+                rows2[i].1, rows2[i-1].1);
+        }
+        i += 1;
+    }
+
+    libc_print::libc_println!("=== v2_mixed_order_by_directions PASS ===");
     Ok(())
 }

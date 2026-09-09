@@ -26,6 +26,7 @@ def test_insert_row():
 
     changes = c.execute("SELECT * FROM crsql_changes").fetchall()
     # what we wrote should be what we get back
+    # incoming ts=0 falls back to the current set ts (1700000000)
     assert (changes == [('foo',
                          b'\x01\t\x01',
                          '-1',
@@ -35,7 +36,7 @@ def test_insert_row():
                          b"\x1d\xc8\xd6\xbb\x7f\x89A\x08\x83'\xd9C\x9ay'\xa4",
                          3,
                          6,
-                         '0'),
+                         '1700000000'),
                         ('foo',
                          b'\x01\t\x01',
                          'b',
@@ -45,7 +46,7 @@ def test_insert_row():
                          b"\x1d\xc8\xd6\xbb\x7f\x89A\x08\x83'\xd9C\x9ay'\xa4",
                          3,
                          6,
-                         '0')])
+                         '1700000000')])
 
 
 def test_update_row():
@@ -57,6 +58,7 @@ def test_update_row():
         "INSERT INTO crsql_changes VALUES ('foo', x'010901', 'b', 1, 4, 4, x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF', 3, 6, '0')")
     changes = c.execute("SELECT * FROM crsql_changes").fetchall()
     # what we wrote should be what we get back since we win the merge
+    # incoming ts=0 falls back to the current set ts (1700000000)
     assert (changes == [('foo',
                          b'\x01\t\x01',
                          '-1',
@@ -66,7 +68,7 @@ def test_update_row():
                          b'\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff',
                          3,
                          6,
-                         '0'),
+                         '1700000000'),
                         ('foo',
                          b'\x01\t\x01',
                          'b',
@@ -76,7 +78,7 @@ def test_update_row():
                          b'\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff',
                          3,
                          6,
-                         '0')])
+                         '1700000000')])
 
 
 def test_delete_row():
@@ -88,6 +90,7 @@ def test_delete_row():
     c.execute("INSERT INTO crsql_changes VALUES ('foo', x'010901', '-1', 1, 4, 4, x'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF', 4, 6, '0')")
     c.commit()
     changes = c.execute("SELECT * FROM crsql_changes").fetchall()
+    # incoming ts=0 falls back to the current set ts (1700000000)
     assert (changes == [('foo',
                         b'\x01\t\x01',
                          '-1',
@@ -97,7 +100,7 @@ def test_delete_row():
                          b'\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff',
                          4,
                          6,
-                         '0')])
+                         '1700000000')])
 
 
 def test_custom_trigger():

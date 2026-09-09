@@ -287,6 +287,11 @@ pub fn v2_after_update(
     if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
         return Err("v2_after_update: timestamp not set — call crsql_set_ts() first or set default-ts".to_string());
     }
+    // Skip db_version allocation for no-op updates (no columns changed).
+    // This avoids wasting a version number on empty updates.
+    if changed_col_indices.is_empty() {
+        return Ok(ResultCode::OK);
+    }
     let db_version = crate::db_version::next_db_version(db, ext_data)
         .map_err(|_| "failed to get next db_version".to_string())?;
 

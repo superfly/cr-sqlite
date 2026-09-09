@@ -47,26 +47,25 @@ pub struct ChangesIdxHeader {
     pub magic: [u8; 11],         // "Rust magic\0"
     pub num_constraints: u8,
     pub num_order_by: u8,
-    pub order_by_desc: u8,       // 1 for DESC, 0 for ASC
     pub has_order_by: u8,        // 1 if user provided ORDER BY, 0 if default
 }
 
 /// Read the constraints from a ChangesIdxHeader pointer.
-/// Returns (constraints, order_by_cols, order_by_desc, has_order_by).
+/// Returns (constraints, order_by_cols, order_by_descs, has_order_by).
 pub unsafe fn read_idx_plan(
     ptr: *const c_char,
 ) -> (
     Vec<PlanConstraint>,
     Vec<crate::c::CrsqlChangesColumn>,
-    bool,
+    Vec<bool>,
     bool,
 ) {
     if ptr.is_null() {
-        return (vec![], vec![], false, false);
+        return (vec![], vec![], vec![], false);
     }
     let header = &*(ptr as *const ChangesIdxHeader);
     if header.magic != IDX_MAGIC {
-        return (vec![], vec![], false, false);
+        return (vec![], vec![], vec![], false);
     }
     let nc = header.num_constraints as usize;
     let no = header.num_order_by as usize;
@@ -81,7 +80,15 @@ pub unsafe fn read_idx_plan(
         core::slice::from_raw_parts(order_ptr as *const crate::c::CrsqlChangesColumn, no)
             .to_vec();
 
-    (constraints, order_by, header.order_by_desc != 0, header.has_order_by != 0)
+    // Per-column desc flags follow the order_by column IDs.
+    let desc_ptr = order_ptr.add(no);
+    let order_by_descs: Vec<bool> = if no > 0 {
+        core::slice::from_raw_parts(desc_ptr, no).iter().map(|&b| b != 0).collect()
+    } else {
+        Vec::new()
+    };
+
+    (constraints, order_by, order_by_descs, header.has_order_by != 0)
 }
 
 /// Allocate a ChangesIdxHeader + trailing arrays with sqlite3_malloc.
@@ -89,13 +96,14 @@ pub unsafe fn read_idx_plan(
 pub fn alloc_idx_plan(
     constraints: &[PlanConstraint],
     order_by_cols: &[crate::c::CrsqlChangesColumn],
-    order_by_desc: bool,
+    order_by_descs: &[bool],
     has_order_by: bool,
 ) -> *mut c_char {
     let header_size = core::mem::size_of::<ChangesIdxHeader>();
     let constraint_size = constraints.len() * core::mem::size_of::<PlanConstraint>();
     let order_size = order_by_cols.len();
-    let total = header_size + constraint_size + order_size;
+    let desc_size = order_by_descs.len();
+    let total = header_size + constraint_size + order_size + desc_size;
 
     let ptr = unsafe { sqlite::malloc(total) } as *mut u8;
     if ptr.is_null() {
@@ -107,7 +115,6 @@ pub fn alloc_idx_plan(
         (*header).magic = IDX_MAGIC;
         (*header).num_constraints = constraints.len() as u8;
         (*header).num_order_by = order_by_cols.len() as u8;
-        (*header).order_by_desc = if order_by_desc { 1 } else { 0 };
         (*header).has_order_by = if has_order_by { 1 } else { 0 };
 
         let c_ptr = ptr.add(header_size) as *mut PlanConstraint;
@@ -122,6 +129,12 @@ pub fn alloc_idx_plan(
         let o_ptr = (c_ptr as *mut u8).add(constraint_size);
         for (i, &col) in order_by_cols.iter().enumerate() {
             *o_ptr.add(i) = col as u8;
+        }
+
+        // Per-column desc flags follow the order_by column IDs.
+        let d_ptr = o_ptr.add(order_size);
+        for (i, &desc) in order_by_descs.iter().enumerate() {
+            *d_ptr.add(i) = if desc { 1 } else { 0 };
         }
     }
 
@@ -227,18 +240,19 @@ fn changes_best_index(
         }
     }
 
-    let mut desc = false;
+    let mut order_by_descs: Vec<bool> = Vec::new();
     let order_bys = sqlite::args!((*index_info).nOrderBy, (*index_info).aOrderBy);
     let mut order_by_consumed = true;
     let mut order_by_cols: Vec<CrsqlChangesColumn> = Vec::new();
     let has_order_by = !order_bys.is_empty();
     for order_by in order_bys {
-        desc = order_by.desc != 0;
+        let desc = order_by.desc != 0;
         let col = CrsqlChangesColumn::from_i32(order_by.iColumn);
         if let Some(col_enum) = col {
             // Only include columns we recognize (skip pk, cval)
             if !matches!(col_enum, CrsqlChangesColumn::Pk | CrsqlChangesColumn::Cval) {
                 order_by_cols.push(col_enum);
+                order_by_descs.push(desc);
             } else {
                 order_by_consumed = false;
             }
@@ -276,7 +290,7 @@ fn changes_best_index(
         }
     }
 
-    let ptr = alloc_idx_plan(&plan_constraints, &order_by_cols, desc, has_order_by);
+    let ptr = alloc_idx_plan(&plan_constraints, &order_by_cols, &order_by_descs, has_order_by);
     unsafe {
         (*index_info).idxNum = idx_num;
         (*index_info).orderByConsumed = if order_by_consumed { 1 } else { 0 };

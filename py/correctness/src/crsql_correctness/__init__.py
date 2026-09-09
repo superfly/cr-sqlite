@@ -7,6 +7,7 @@ def connect(db_file, uri=False):
     c = sqlite3.connect(db_file, uri=uri)
     c.enable_load_extension(True)
     c.load_extension(extension)
+    c.execute("SELECT crsql_config_set('default-ts', 1700000000)")
     c.execute("SELECT crsql_set_ts('1700000000')")
     return c
 

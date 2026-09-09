@@ -228,21 +228,25 @@ fn get_varint(buf: &[u8]) -> Result<(u64, usize), ResultCode> {
     }
     let mut result: u64 = 0;
     let mut i = 0;
+    let mut terminated = false;
     while i < buf.len() && i < 9 {
         let byte = buf[i];
         if i == 8 {
             // 9th byte uses all 8 bits
             result = (result << 8) | byte as u64;
             i += 1;
+            terminated = true;
             break;
         }
         result = (result << 7) | (byte & 0x7F) as u64;
         i += 1;
         if byte & 0x80 == 0 {
+            terminated = true;
             break;
         }
     }
-    if i > buf.len() {
+    if !terminated {
+        // Buffer exhausted before a non-continuation byte was found.
         return Err(ResultCode::ABORT);
     }
     Ok((result, i))

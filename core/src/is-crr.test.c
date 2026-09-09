@@ -31,6 +31,7 @@ static void testCrrIsCrr() {
       sqlite3_exec(db, "CREATE TABLE foo (a PRIMARY KEY NOT NULL, b)", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_as_crr('foo')", 0, 0, 0);
   assert(rc == SQLITE_OK);
@@ -51,6 +52,7 @@ static void testDestroyedCrrIsNotCrr() {
       sqlite3_exec(db, "CREATE TABLE foo (a PRIMARY KEY NOT NULL, b)", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_as_crr('foo')", 0, 0, 0);
   assert(rc == SQLITE_OK);
