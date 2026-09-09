@@ -251,6 +251,9 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     }
 
     let sync_bit_ptr = sqlite::malloc(mem::size_of::<c_int>()) as *mut c_int;
+    if sync_bit_ptr.is_null() {
+        return null_mut();
+    }
     unsafe {
         *sync_bit_ptr = 0;
     }
@@ -312,6 +315,10 @@ pub extern "C" fn sqlite3_crsqlcore_init(
 
     let site_id_buffer =
         sqlite::malloc((consts::SITE_ID_LEN as usize) * mem::size_of::<*const c_char>());
+    if site_id_buffer.is_null() {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
     let rc = crate::bootstrap::crsql_init_site_id(db, site_id_buffer);
     if rc != ResultCode::OK as c_int {
         sqlite::free(site_id_buffer as *mut c_void);
@@ -326,7 +333,10 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     }
 
     if let Err(_) = crate::bootstrap::create_site_id_triggers(db) {
-        sqlite::free(site_id_buffer as *mut c_void);
+        // crsql_initSiteIdExt transferred ownership of site_id_buffer to
+        // ext_data->siteId, so crsql_freeExtData will free it. Do NOT
+        // separately free site_id_buffer here (would double-free).
+        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -1516,6 +1526,9 @@ unsafe extern "C" fn x_crsql_sync_bit(
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn crsql_is_crr(db: *mut sqlite::sqlite3, table: *const c_char) -> c_int {
+    if table.is_null() {
+        return (ResultCode::MISUSE as c_int) * -1;
+    }
     if let Ok(table) = unsafe { CStr::from_ptr(table).to_str() } {
         match is_crr(db, table) {
             Ok(b) => {
@@ -1539,6 +1552,9 @@ pub extern "C" fn crsql_is_table_compatible(
     table: *const c_char,
     err: *mut *mut c_char,
 ) -> c_int {
+    if table.is_null() {
+        return (ResultCode::MISUSE as c_int) * -1;
+    }
     if let Ok(table) = unsafe { CStr::from_ptr(table).to_str() } {
         is_table_compatible(db, table, err)
             .map(|x| x as c_int)
@@ -1560,6 +1576,9 @@ pub extern "C" fn crsql_create_crr(
     skip_hash: c_int,
     err: *mut *mut c_char,
 ) -> c_int {
+    if table.is_null() || schema.is_null() {
+        return ResultCode::MISUSE as c_int;
+    }
     let schema = unsafe { CStr::from_ptr(schema).to_str() };
     let table = unsafe { CStr::from_ptr(table).to_str() };
     // use_rowid: 1 = force rowid, -1 = force non-rowid, 0 = auto

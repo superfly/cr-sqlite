@@ -18,6 +18,10 @@ void crsql_drop_last_db_versions_map(crsql_ExtData *pExtData);
 // The initialization here is incomplete! We need to call crsql_initSiteIdExt after this.
 crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   crsql_ExtData *pExtData = sqlite3_malloc(sizeof *pExtData);
+  if (pExtData == 0) {
+    return 0;
+  }
+  memset(pExtData, 0, sizeof *pExtData);
 
   pExtData->siteId = 0;
   pExtData->pPragmaSchemaVersionStmt = 0;
@@ -153,6 +157,9 @@ int crsql_initSiteIdExt(sqlite3 *db, crsql_ExtData *pExtData, unsigned char *sit
 }
 
 void crsql_freeExtData(crsql_ExtData *pExtData) {
+  if (pExtData == 0) {
+    return;
+  }
   // printf("free ext\n");
   if (pExtData->siteId != 0) {
     sqlite3_free(pExtData->siteId);
@@ -192,6 +199,9 @@ void crsql_freeExtData(crsql_ExtData *pExtData) {
 // see https://sqlite.org/forum/forumpost/c94f943821
 // `freeExtData` is called after finalization when the extension unloads
 void crsql_finalize(crsql_ExtData *pExtData) {
+  if (pExtData == 0) {
+    return;
+  }
   // printf("crsql_finalize\n");
   sqlite3_finalize(pExtData->pDbVersionStmt);
   sqlite3_finalize(pExtData->pSetDbVersionStmt);

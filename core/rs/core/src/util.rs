@@ -67,8 +67,16 @@ pub fn slab_rowid(idx: i32, rowid: sqlite::int64) -> sqlite::int64 {
         return -1;
     }
 
-    let modulo = rowid % crate::consts::ROWID_SLAB_SIZE;
-    return (idx as i64) * crate::consts::ROWID_SLAB_SIZE + modulo;
+    // Use Euclidean remainder to ensure non-negative modulo even for negative rowids.
+    let modulo = rowid.rem_euclid(crate::consts::ROWID_SLAB_SIZE);
+    // Use checked arithmetic to detect overflow rather than wrapping silently.
+    match (idx as i64).checked_mul(crate::consts::ROWID_SLAB_SIZE) {
+        Some(product) => match product.checked_add(modulo) {
+            Some(result) => result,
+            None => -1,
+        },
+        None => -1,
+    }
 }
 
 pub fn where_list(columns: &Vec<ColumnInfo>, prefix: Option<&str>) -> Result<String, Utf8Error> {

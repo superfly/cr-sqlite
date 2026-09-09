@@ -1151,7 +1151,9 @@ pub fn pull_table_info(
             );
             db.prepare_v2(&type_sql).and_then(|stmt| {
                 stmt.step()?;
-                Ok(stmt.column_text(0)?.to_string() == "INTEGER")
+                // SQLite treats INTEGER PRIMARY KEY as a rowid alias
+                // case-insensitively (any mixture of upper/lower case).
+                Ok(stmt.column_text(0)?.to_string().eq_ignore_ascii_case("INTEGER"))
             }).unwrap_or(false)
         })
     } else {

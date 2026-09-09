@@ -177,7 +177,9 @@ fn maybe_update_db_inner(
     if recorded_version < consts::CRSQLITE_VERSION_0_17_0 && !is_blank_slate {
         let cstring = CString::new(format!("Opening a db created with cr-sqlite version {} is not supported. Upcoming release 0.17.0 is a breaking change.", recorded_version))?;
         unsafe {
-            (*err_msg) = cstring.into_raw();
+            if !err_msg.is_null() {
+                *err_msg = cstring.into_raw();
+            }
             return Err(ResultCode::ERROR);
         }
     }
@@ -242,7 +244,9 @@ fn validate_or_store_compile_constants(
                     key, compile_val, stored_val
                 ))?;
                 unsafe {
-                    (*err_msg) = cstring.into_raw();
+                    if !err_msg.is_null() {
+                        *err_msg = cstring.into_raw();
+                    }
                 }
                 return Err(ResultCode::ERROR);
             }
@@ -303,14 +307,14 @@ pub fn create_clock_table(
     db.exec_safe(
         &format!(
         "CREATE TABLE IF NOT EXISTS \"{table_name}__crsql_pks\" (__crsql_key INTEGER PRIMARY KEY, {pk_list})",
-        table_name = table_name,
+        table_name = crate::util::escape_ident(table_name),
         pk_list = pk_list,
         )
     )?;
     db.exec_safe(
         &format!(
         "CREATE UNIQUE INDEX IF NOT EXISTS \"{table_name}__crsql_pks_pks\" ON \"{table_name}__crsql_pks\" ({pk_list})",
-        table_name = table_name,
+        table_name = crate::util::escape_ident(table_name),
         pk_list = pk_list
         )
     )
