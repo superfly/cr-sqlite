@@ -90,7 +90,8 @@ fn bind_pks_insert(
             pks[0]
         } else {
             // Use the explicit rowid — bind as int64
-            stmt.bind_int64(1, rowid.ok_or("rowid-key table missing rowid for pks_insert")?);
+            stmt.bind_int64(1, rowid.ok_or("rowid-key table missing rowid for pks_insert")?)
+                .map_err(|e| format!("bind rowid: {:?}", e))?;
             // Still need to bind PK columns for the index (skip_hash) or hashed_pk
             if tbl_info.skip_hash {
                 return Ok(2);
