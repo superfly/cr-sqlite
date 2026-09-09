@@ -982,6 +982,17 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
         unsafe { Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>) };
 
     if schema_changed > 0 || table_infos.len() == 0 {
+        // SAFETY: Replacing the cached Vec<TableInfo> contents is safe because
+        // callers of `crsql_ensure_table_infos_are_up_to_date` call it *before*
+        // borrowing any `&TableInfo` from the vec. No operation performed
+        // during `pull_all_table_infos` can re-enter this function while a
+        // borrowed reference exists, because:
+        //   - SQLite is single-threaded per connection.
+        //   - `pull_all_table_infos` only reads schema metadata (sqlite_master,
+        //     pragma_table_info) and does not fire triggers.
+        // If a caller ever holds a `&TableInfo` across an operation that could
+        // re-enter this function, the reference would dangle. See the safety
+        // comment in `alter_v2.rs::compact_post_alter_v2` for details.
         match pull_all_table_infos(db, ext_data, err) {
             Ok(new_table_infos) => {
                 *table_infos = new_table_infos;

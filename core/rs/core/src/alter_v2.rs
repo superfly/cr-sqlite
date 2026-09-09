@@ -56,6 +56,20 @@ unsafe fn compact_post_alter_v2(
         return Err(ResultCode::ERROR);
     }
 
+    // SAFETY: We borrow `tbl_info` from the cached `Vec<TableInfo>` and then
+    // perform DDL/DML below. This is safe because:
+    //   - SQLite is single-threaded per connection (no concurrent access).
+    //   - The operations below (drop_v2_tables, create_v2_tables,
+    //     backfill_table_v2, sync_col_map_v2) only touch `__crsql_v2_*`
+    //     metadata tables, which have no triggers. `backfill_table_v2`
+    //     reads from the base table (SELECT, no triggers fire) and writes
+    //     to metadata tables (no triggers).
+    //   - Therefore none of these operations can re-enter
+    //     `crsql_ensure_table_infos_are_up_to_date`, which is the only
+    //     function that replaces the cached `Vec<TableInfo>`.
+    // If triggers are ever added to metadata tables, or backfill starts
+    // writing to base tables, this safety assumption breaks and the
+    // borrow must be restructured (e.g., clone the needed fields first).
     let table_infos =
         mem::ManuallyDrop::new(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>));
     let tbl_info = table_infos.iter().find(|x| x.tbl_name == tbl_name_str);

@@ -1,3 +1,7 @@
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 use crsql_bundle::test_exports::pack_columns::unpack_columns;
 use crsql_bundle::test_exports::pack_columns::unpack_varints;
 use crsql_bundle::test_exports::pack_columns::ColumnValue;
@@ -261,8 +265,107 @@ fn test_varint_encoding() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// CR3 regression: BLOB lengths 128-255 round-trip correctly.
+/// The `bytes` crate's `get_int(nbytes)` for `nbytes < 8` does NOT sign-extend —
+/// it copies bytes into the LSB of an 8-byte zeroed buffer and uses `from_be_bytes`.
+/// So `get_int(1)` on byte 0x80 returns 128, not -128. This test confirms
+/// the correct behavior for BLOB lengths whose 1-byte encoding has the high bit set.
+fn test_blob_length_high_bit_round_trip() -> Result<(), ResultCode> {
+    let db = crate::opendb()?;
+    db.db.exec_safe("CREATE TABLE foo (id PRIMARY KEY, data BLOB)")?;
+
+    // Test BLOB lengths that produce a 1-byte length encoding with the high bit set.
+    // These are the lengths 128-255 where the encoded byte is 0x80-0xFF.
+    let test_lengths: &[usize] = &[128, 200, 255];
+
+    for &len in test_lengths {
+        let blob: Vec<u8> = vec![0xAB; len];
+        db.db.exec_safe("DELETE FROM foo")?;
+        let insert_stmt = db.db.prepare_v2("INSERT INTO foo VALUES (?, ?)")?;
+        insert_stmt.bind_int(1, len as i32)?;
+        insert_stmt.bind_blob(2, &blob, sqlite::Destructor::STATIC)?;
+        insert_stmt.step()?;
+
+        let select_stmt =
+            db.db.prepare_v2("SELECT crsql_pack_columns(data) FROM foo")?;
+        select_stmt.step()?;
+        let packed = select_stmt.column_blob(0)?;
+        let unpacked = unpack_columns(packed)?;
+        assert_eq!(unpacked.len(), 1, "expected 1 column for len {}", len);
+        match &unpacked[0] {
+            ColumnValue::Blob(b) => {
+                assert_eq!(b.len(), len, "BLOB length mismatch for len {}", len);
+                assert!(b.iter().all(|&x| x == 0xAB), "BLOB content mismatch for len {}", len);
+            }
+            _ => assert!(false, "expected Blob for len {}", len),
+        }
+    }
+
+    // Also test 256 (2-byte length encoding, high bit NOT set — should already work)
+    db.db.exec_safe("DELETE FROM foo")?;
+    let blob: Vec<u8> = vec![0xCD; 256];
+    let insert_stmt = db.db.prepare_v2("INSERT INTO foo VALUES (?, ?)")?;
+    insert_stmt.bind_int(1, 256)?;
+    insert_stmt.bind_blob(2, &blob, sqlite::Destructor::STATIC)?;
+    insert_stmt.step()?;
+    let select_stmt = db.db.prepare_v2("SELECT crsql_pack_columns(data) FROM foo")?;
+    select_stmt.step()?;
+    let packed = select_stmt.column_blob(0)?;
+    let unpacked = unpack_columns(packed)?;
+    assert_eq!(unpacked.len(), 1);
+    match &unpacked[0] {
+        ColumnValue::Blob(b) => assert_eq!(b.len(), 256),
+        _ => assert!(false, "expected Blob for len 256"),
+    }
+
+    Ok(())
+}
+
+/// CR4 repro: Malformed UTF-8 in packed text should return an error,
+/// not trigger undefined behavior via `from_utf8_unchecked`.
+fn test_malformed_utf8_text_unpack() -> Result<(), ResultCode> {
+    // Construct a packed blob with invalid UTF-8 text bytes.
+    // Format: [num_columns:varint][type_byte][len][bytes...]
+    // Text type = 3, intlen = 1 → type_byte = (1 << 3) | 3 = 0x0B
+    let mut packed: Vec<u8> = vec![];
+    packed.push(0x01); // 1 column
+    packed.push(0x0B); // type=Text(3), intlen=1
+    packed.push(0x02); // length = 2
+    packed.push(0xFF); // invalid UTF-8 continuation byte
+    packed.push(0xFE); // invalid UTF-8
+
+    // This should return an error, not UB
+    let result = unpack_columns(&packed);
+    assert!(result.is_err(), "malformed UTF-8 should return error, not succeed");
+
+    // Also test via the virtual table interface
+    let db = crate::opendb()?;
+    db.db.exec_safe("CREATE TABLE foo (id PRIMARY KEY)")?;
+    let insert_stmt = db.db.prepare_v2("INSERT INTO foo VALUES (1)")?;
+    insert_stmt.step()?;
+
+    // Use the unpack_columns vtab with malformed packed data
+    let hex = packed.iter().map(|b| format!("{:02X}", b)).collect::<String>();
+    let select_stmt = db.db.prepare_v2(&format!(
+        "SELECT cell FROM crsql_unpack_columns WHERE package = X'{}'",
+        hex
+    ))?;
+    // This should error or return no rows, not crash
+    let rc = select_stmt.step();
+    // Either it errors (ABORT) or returns no rows (DONE) — both are acceptable.
+    // What's NOT acceptable is a crash or UB.
+    assert!(
+        rc == Ok(ResultCode::DONE) || rc.is_err(),
+        "malformed UTF-8 via vtab should error or return DONE"
+    );
+
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), ResultCode> {
     test_pack_columns()?;
     test_unpack_columns()?;
-    test_varint_encoding()
+    test_varint_encoding()?;
+    test_blob_length_high_bit_round_trip()?;
+    test_malformed_utf8_text_unpack()
 }

@@ -38,203 +38,264 @@ pub extern "C" fn crsql_config_set(
     let name = args[0].text();
     let ext_data = ctx.user_data() as *mut crsql_ExtData;
 
-    let value = match name {
-        MERGE_EQUAL_VALUES => {
-            let value = args[1];
-            unsafe { (*ext_data).mergeEqualValues = value.int() };
-            value
-        }
-        METADATA_WRITE_VERSION => {
-            let new_val = args[1].int();
-            let old_val = unsafe { (*ext_data).metadataWriteVersion };
-            if !validate_write_version_transition(old_val, new_val) {
-                ctx.result_error("Invalid metadata-write-version transition");
-                ctx.result_error_code(ResultCode::ERROR);
-                return;
-            }
-            let db = ctx.db_handle();
-            // Direct 1->3 transition: skip migration/cleanup, just verify no CRR tables exist
-            if old_val == METADATA_VERSION_V1 && new_val == METADATA_VERSION_V2 {
-                match has_no_crr_tables(db) {
-                    Ok(true) => {
-                        // No CRR tables — safe to go directly to V2-only
-                    },
-                    Ok(false) => {
-                        ctx.result_error("Cannot set metadata-write-version to v2 directly: existing CRR tables found. Migrate via v2&v1 first.");
-                        ctx.result_error_code(ResultCode::ERROR);
-                        return;
-                    },
-                    Err(rc) => {
-                        ctx.result_error("Failed to check for existing CRR tables");
-                        ctx.result_error_code(rc);
-                        return;
-                    }
-                }
-            } else {
-                // Any other transition requires prior cleanup tasks to be done
-                match is_cleanup_complete(db) {
-                    Ok(true) => {},
-                    Ok(false) => {
-                        ctx.result_error("Cannot transition metadata-write-version: cleanup tasks still pending");
-                        ctx.result_error_code(ResultCode::ERROR);
-                        return;
-                    },
-                    Err(rc) => {
-                        ctx.result_error("Failed to check cleanup status");
-                        ctx.result_error_code(rc);
-                        return;
-                    }
-                }
-                // Setting to v2&v1 queues migration tasks for all V1 CRR tables
-                if new_val == METADATA_VERSION_V2_AND_V1 && old_val == METADATA_VERSION_V1 {
-                    // Create V2 tables for all existing CRR tables so dual-write
-                    // triggers have somewhere to write immediately.
-                    if let Err(rc) = create_v2_tables_for_existing_crrs(db, ext_data) {
-                        ctx.result_error("Failed to create V2 tables during transition");
-                        ctx.result_error_code(rc);
-                        return;
-                    }
-                    if let Err(rc) = queue_migration_tasks(db) {
-                        ctx.result_error("Failed to queue migration tasks");
-                        ctx.result_error_code(rc);
-                        return;
-                    }
-                }
-                // Transitioning to v2 (dropping V1 tables) requires migration to be complete
-                if new_val == METADATA_VERSION_V2 {
-                    match is_migration_complete(db) {
-                        Ok(true) => {
-                            // Queue V1 table cleanup tasks
-                            if let Err(rc) = queue_v1_cleanup_tasks(db) {
-                                ctx.result_error("Failed to queue V1 cleanup tasks");
-                                ctx.result_error_code(rc);
-                                return;
-                            }
-                        },
-                        Ok(false) => {
-                            ctx.result_error("Cannot set metadata-write-version to v2: migration not complete for all tables");
-                            ctx.result_error_code(ResultCode::ERROR);
-                            return;
-                        },
-                        Err(rc) => {
-                            ctx.result_error("Failed to check migration status");
-                            ctx.result_error_code(rc);
-                            return;
-                        }
-                    }
-                }
-                // Rolling back to v1 queues V2 table cleanup tasks and aborts migration
-                if new_val == METADATA_VERSION_V1 && old_val == METADATA_VERSION_V2_AND_V1 {
-                    // Clear any pending migration markers since we're aborting migration
-                    if let Err(rc) = clear_migration_markers(db) {
-                        ctx.result_error("Failed to clear migration markers");
-                        ctx.result_error_code(rc);
-                        return;
-                    }
-                    if let Err(rc) = queue_v2_cleanup_tasks(db) {
-                        ctx.result_error("Failed to queue V2 cleanup tasks");
-                        ctx.result_error_code(rc);
-                        return;
-                    }
-                }
-            }
-            // Auto-cascade dependent config values to prevent invalid states
-            if new_val == METADATA_VERSION_V1 {
-                // Rolling back to V1: force use-version and sync-log-version to V1
-                unsafe { (*ext_data).metadataUseVersion = 1; }
-                unsafe { (*ext_data).syncLogVersion = 1; }
-            } else if new_val == METADATA_VERSION_V2 {
-                // Moving to V2-only: force use-version to V2
-                unsafe { (*ext_data).metadataUseVersion = 2; }
-            }
-            unsafe { (*ext_data).metadataWriteVersion = new_val };
-            args[1]
-        }
-        METADATA_USE_VERSION => {
-            let new_val = args[1].int();
-            let old_val = unsafe { (*ext_data).metadataUseVersion };
-            let write_version = unsafe { (*ext_data).metadataWriteVersion };
-            if !validate_use_version_transition(old_val, new_val, write_version) {
-                let msg = if old_val == 1 && new_val == 2 {
-                    "Cannot set metadata-use-version to v2: requires metadata-write-version to be v2&v1 or v2 first, and all V1→V2 migrations must be complete. Run crsql_incremental_maintenance() until it returns 0."
-                } else if old_val == 2 && new_val == 1 {
-                    "Cannot set metadata-use-version to v1: requires metadata-write-version to be v1 or v2&v1 first."
-                } else {
-                    "Invalid metadata-use-version transition"
-                };
-                ctx.result_error(msg);
-                ctx.result_error_code(ResultCode::ERROR);
-                return;
-            }
-            // Setting to v2 requires all migrations to be complete
-            if new_val == 2 {
-                let db = ctx.db_handle();
-                if check_migration_complete_or_error(ctx, db, "metadata-use-version").is_err() {
-                    return;
-                }
-            }
-            unsafe { (*ext_data).metadataUseVersion = new_val };
-            args[1]
-        }
-        SYNC_LOG_VERSION => {
-            let new_val = args[1].int();
-            let old_val = unsafe { (*ext_data).syncLogVersion };
-            let use_version = unsafe { (*ext_data).metadataUseVersion };
-            let write_version = unsafe { (*ext_data).metadataWriteVersion };
-            if !validate_sync_log_transition(old_val, new_val, use_version, write_version) {
-                let msg = if old_val == 1 && new_val == 2 {
-                    if use_version != 2 {
-                        "Cannot set sync-log-version to v2: requires metadata-use-version to be v2 first. Run crsql_incremental_maintenance() to complete V1→V2 migration, then set metadata-use-version to 2."
-                    } else {
-                        "Cannot set sync-log-version to v2: requires metadata-write-version to be v2 or v2&v1."
-                    }
-                } else if old_val == 2 && new_val == 1 {
-                    "Cannot set sync-log-version to v1: requires metadata-use-version to be v1 first."
-                } else {
-                    "Invalid sync-log-version transition"
-                };
-                ctx.result_error(msg);
-                ctx.result_error_code(ResultCode::ERROR);
-                return;
-            }
-            // Setting to v2 requires all migrations to be complete
-            if new_val == 2 {
-                let db = ctx.db_handle();
-                if check_migration_complete_or_error(ctx, db, "sync-log-version").is_err() {
-                    return;
-                }
-            }
-            unsafe { (*ext_data).syncLogVersion = new_val };
-            args[1]
-        }
-        DEFAULT_TS => {
-            let v = args[1].int64();
-            if v < 0 {
-                ctx.result_error("default-ts must be >= 0 (0 disables, >0 used when crsql_set_ts was not called)");
-                ctx.result_error_code(ResultCode::ERROR);
-                return;
-            }
-            unsafe { (*ext_data).defaultTimestamp = v as u64 };
-            // Per-connection only — not persisted to crsql_master.
-            ctx.result_int64(v);
-            return;
-        }
-        _ => {
-            ctx.result_error(&format!("Unknown setting name: {name}"));
+    // DEFAULT_TS is per-connection only — not persisted to crsql_master,
+    // so no savepoint or persistence is needed.
+    if name == DEFAULT_TS {
+        let v = args[1].int64();
+        if v < 0 {
+            ctx.result_error("default-ts must be >= 0 (0 disables, >0 used when crsql_set_ts was not called)");
             ctx.result_error_code(ResultCode::ERROR);
             return;
         }
-    };
+        unsafe { (*ext_data).defaultTimestamp = v as u64 };
+        ctx.result_int64(v);
+        return;
+    }
 
     let db = ctx.db_handle();
-    match insert_config_setting(db, name, value) {
-        Ok((_stmt, value)) => {
-            ctx.result_value(value);
+
+    // Wrap the entire transition in a savepoint so that schema changes
+    // (V2 table creation, migration task queueing, cleanup task queueing)
+    // are atomic with config persistence. If insert_config_setting fails,
+    // the savepoint is rolled back, undoing the schema changes.
+    // ext_data mutations are deferred until after persistence succeeds
+    // to prevent in-memory state from diverging from persisted state.
+    if db.exec_safe("SAVEPOINT config_set").is_err() {
+        ctx.result_error("Failed to start savepoint for config_set");
+        ctx.result_error_code(ResultCode::ERROR);
+        return;
+    }
+
+    // Collect ext_data mutations to apply only after persistence succeeds.
+    let mut ext_data_updates: Option<alloc::boxed::Box<dyn FnOnce()>> = None;
+
+    let value_result = (|| -> Result<*mut sqlite::value, ()> {
+        let value = match name {
+            MERGE_EQUAL_VALUES => {
+                let value = args[1];
+                let v = value.int();
+                ext_data_updates = Some(alloc::boxed::Box::new(move || {
+                    unsafe { (*ext_data).mergeEqualValues = v; }
+                }));
+                value
+            }
+            METADATA_WRITE_VERSION => {
+                let new_val = args[1].int();
+                let old_val = unsafe { (*ext_data).metadataWriteVersion };
+                if !validate_write_version_transition(old_val, new_val) {
+                    ctx.result_error("Invalid metadata-write-version transition");
+                    ctx.result_error_code(ResultCode::ERROR);
+                    return Err(());
+                }
+                // Direct 1->3 transition: skip migration/cleanup, just verify no CRR tables exist
+                if old_val == METADATA_VERSION_V1 && new_val == METADATA_VERSION_V2 {
+                    match has_no_crr_tables(db) {
+                        Ok(true) => {
+                            // No CRR tables — safe to go directly to V2-only
+                        },
+                        Ok(false) => {
+                            ctx.result_error("Cannot set metadata-write-version to v2 directly: existing CRR tables found. Migrate via v2&v1 first.");
+                            ctx.result_error_code(ResultCode::ERROR);
+                            return Err(());
+                        },
+                        Err(rc) => {
+                            ctx.result_error("Failed to check for existing CRR tables");
+                            ctx.result_error_code(rc);
+                            return Err(());
+                        }
+                    }
+                } else {
+                    // Any other transition requires prior cleanup tasks to be done
+                    match is_cleanup_complete(db) {
+                        Ok(true) => {},
+                        Ok(false) => {
+                            ctx.result_error("Cannot transition metadata-write-version: cleanup tasks still pending");
+                            ctx.result_error_code(ResultCode::ERROR);
+                            return Err(());
+                        },
+                        Err(rc) => {
+                            ctx.result_error("Failed to check cleanup status");
+                            ctx.result_error_code(rc);
+                            return Err(());
+                        }
+                    }
+                    // Setting to v2&v1 queues migration tasks for all V1 CRR tables
+                    if new_val == METADATA_VERSION_V2_AND_V1 && old_val == METADATA_VERSION_V1 {
+                        // Create V2 tables for all existing CRR tables so dual-write
+                        // triggers have somewhere to write immediately.
+                        if let Err(rc) = create_v2_tables_for_existing_crrs(db, ext_data) {
+                            ctx.result_error("Failed to create V2 tables during transition");
+                            ctx.result_error_code(rc);
+                            return Err(());
+                        }
+                        if let Err(rc) = queue_migration_tasks(db) {
+                            ctx.result_error("Failed to queue migration tasks");
+                            ctx.result_error_code(rc);
+                            return Err(());
+                        }
+                    }
+                    // Transitioning to v2 (dropping V1 tables) requires migration to be complete
+                    if new_val == METADATA_VERSION_V2 {
+                        match is_migration_complete(db) {
+                            Ok(true) => {
+                                // Queue V1 table cleanup tasks
+                                if let Err(rc) = queue_v1_cleanup_tasks(db) {
+                                    ctx.result_error("Failed to queue V1 cleanup tasks");
+                                    ctx.result_error_code(rc);
+                                    return Err(());
+                                }
+                            },
+                            Ok(false) => {
+                                ctx.result_error("Cannot set metadata-write-version to v2: migration not complete for all tables");
+                                ctx.result_error_code(ResultCode::ERROR);
+                                return Err(());
+                            },
+                            Err(rc) => {
+                                ctx.result_error("Failed to check migration status");
+                                ctx.result_error_code(rc);
+                                return Err(());
+                            }
+                        }
+                    }
+                    // Rolling back to v1 queues V2 table cleanup tasks and aborts migration
+                    if new_val == METADATA_VERSION_V1 && old_val == METADATA_VERSION_V2_AND_V1 {
+                        // Clear any pending migration markers since we're aborting migration
+                        if let Err(rc) = clear_migration_markers(db) {
+                            ctx.result_error("Failed to clear migration markers");
+                            ctx.result_error_code(rc);
+                            return Err(());
+                        }
+                        if let Err(rc) = queue_v2_cleanup_tasks(db) {
+                            ctx.result_error("Failed to queue V2 cleanup tasks");
+                            ctx.result_error_code(rc);
+                            return Err(());
+                        }
+                    }
+                }
+                // Collect ext_data mutations to apply after persistence succeeds.
+                // Auto-cascade dependent config values to prevent invalid states.
+                let new_use_version = if new_val == METADATA_VERSION_V1 {
+                    Some(1)
+                } else if new_val == METADATA_VERSION_V2 {
+                    Some(2)
+                } else {
+                    None
+                };
+                let new_sync_log = if new_val == METADATA_VERSION_V1 { Some(1) } else { None };
+                let new_write_version = new_val;
+                ext_data_updates = Some(alloc::boxed::Box::new(move || {
+                    if let Some(uv) = new_use_version {
+                        unsafe { (*ext_data).metadataUseVersion = uv; }
+                    }
+                    if let Some(sl) = new_sync_log {
+                        unsafe { (*ext_data).syncLogVersion = sl; }
+                    }
+                    unsafe { (*ext_data).metadataWriteVersion = new_write_version; }
+                }));
+                args[1]
+            }
+            METADATA_USE_VERSION => {
+                let new_val = args[1].int();
+                let old_val = unsafe { (*ext_data).metadataUseVersion };
+                let write_version = unsafe { (*ext_data).metadataWriteVersion };
+                if !validate_use_version_transition(old_val, new_val, write_version) {
+                    let msg = if old_val == 1 && new_val == 2 {
+                        "Cannot set metadata-use-version to v2: requires metadata-write-version to be v2&v1 or v2 first, and all V1→V2 migrations must be complete. Run crsql_incremental_maintenance() until it returns 0."
+                    } else if old_val == 2 && new_val == 1 {
+                        "Cannot set metadata-use-version to v1: requires metadata-write-version to be v1 or v2&v1 first."
+                    } else {
+                        "Invalid metadata-use-version transition"
+                    };
+                    ctx.result_error(msg);
+                    ctx.result_error_code(ResultCode::ERROR);
+                    return Err(());
+                }
+                // Setting to v2 requires all migrations to be complete
+                if new_val == 2 {
+                    if check_migration_complete_or_error(ctx, db, "metadata-use-version").is_err() {
+                        return Err(());
+                    }
+                }
+                let nv = new_val;
+                ext_data_updates = Some(alloc::boxed::Box::new(move || {
+                    unsafe { (*ext_data).metadataUseVersion = nv; }
+                }));
+                args[1]
+            }
+            SYNC_LOG_VERSION => {
+                let new_val = args[1].int();
+                let old_val = unsafe { (*ext_data).syncLogVersion };
+                let use_version = unsafe { (*ext_data).metadataUseVersion };
+                let write_version = unsafe { (*ext_data).metadataWriteVersion };
+                if !validate_sync_log_transition(old_val, new_val, use_version, write_version) {
+                    let msg = if old_val == 1 && new_val == 2 {
+                        if use_version != 2 {
+                            "Cannot set sync-log-version to v2: requires metadata-use-version to be v2 first. Run crsql_incremental_maintenance() to complete V1→V2 migration, then set metadata-use-version to 2."
+                        } else {
+                            "Cannot set sync-log-version to v2: requires metadata-write-version to be v2 or v2&v1."
+                        }
+                    } else if old_val == 2 && new_val == 1 {
+                        "Cannot set sync-log-version to v1: requires metadata-use-version to be v1 first."
+                    } else {
+                        "Invalid sync-log-version transition"
+                    };
+                    ctx.result_error(msg);
+                    ctx.result_error_code(ResultCode::ERROR);
+                    return Err(());
+                }
+                // Setting to v2 requires all migrations to be complete
+                if new_val == 2 {
+                    if check_migration_complete_or_error(ctx, db, "sync-log-version").is_err() {
+                        return Err(());
+                    }
+                }
+                let nv = new_val;
+                ext_data_updates = Some(alloc::boxed::Box::new(move || {
+                    unsafe { (*ext_data).syncLogVersion = nv; }
+                }));
+                args[1]
+            }
+            _ => {
+                ctx.result_error(&format!("Unknown setting name: {name}"));
+                ctx.result_error_code(ResultCode::ERROR);
+                return Err(());
+            }
+        };
+        Ok(value)
+    })();
+
+    match value_result {
+        Ok(value) => {
+            match insert_config_setting(db, name, value) {
+                Ok((_stmt, value)) => {
+                    // Copy the result value into the SQLite context before
+                    // releasing the savepoint — sqlite3_result_value copies
+                    // the value, so it's safe to drop the statement after.
+                    ctx.result_value(value);
+                    // Drop the prepared statement before releasing the
+                    // savepoint. SQLite returns BUSY if you try to RELEASE
+                    // while a statement is still active.
+                    drop(_stmt);
+                    // Persistence succeeded — apply ext_data mutations and release savepoint.
+                    if let Some(f) = ext_data_updates {
+                        f();
+                    }
+                    let _ = db.exec_safe("RELEASE config_set");
+                }
+                Err(rc) => {
+                    // Persistence failed — rollback schema changes, don't apply ext_data mutations.
+                    let _ = db.exec_safe("ROLLBACK TO config_set");
+                    let _ = db.exec_safe("RELEASE config_set");
+                    ctx.result_error("Could not persist config in database");
+                    ctx.result_error_code(rc);
+                }
+            }
         }
-        Err(rc) => {
-            ctx.result_error("Could not persist config in database");
-            ctx.result_error_code(rc);
-            return;
+        Err(()) => {
+            // Error already reported to ctx via result_error.
+            // Rollback any schema changes made before the error.
+            let _ = db.exec_safe("ROLLBACK TO config_set");
+            let _ = db.exec_safe("RELEASE config_set");
         }
     }
 }
