@@ -11,6 +11,7 @@ use sqlite_nostd::{sqlite3, Connection, ResultCode};
 use crate::c::crsql_ExtData;
 use crate::consts;
 use crate::tableinfo::{crsql_ensure_table_infos_are_up_to_date, TableInfo, SchemaVersion};
+use alloc::ffi::CString;
 use core::mem;
 
 /// Compact V2 metadata tables after an ALTER TABLE operation.
@@ -26,7 +27,17 @@ pub unsafe extern "C" fn crsql_compact_post_alter_v2(
     errmsg: *mut *mut c_char,
 ) -> c_int {
     match compact_post_alter_v2(db, tbl_name, ext_data, errmsg) {
-        Ok(rc) | Err(rc) => rc as c_int,
+        Ok(rc) => rc as c_int,
+        Err(rc) => {
+            if !errmsg.is_null() {
+                let msg = CString::new(format!(
+                    "crsql_compact_post_alter_v2 failed: {:?}",
+                    rc
+                )).unwrap_or_default();
+                unsafe { *errmsg = msg.into_raw(); }
+            }
+            rc as c_int
+        }
     }
 }
 

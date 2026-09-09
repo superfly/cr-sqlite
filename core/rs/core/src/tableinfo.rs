@@ -956,6 +956,7 @@ pub extern "C" fn crsql_init_table_info_vec(ext_data: *mut crsql_ExtData) {
 pub extern "C" fn crsql_drop_table_info_vec(ext_data: *mut crsql_ExtData) {
     unsafe {
         drop(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>));
+        (*ext_data).tableInfos = core::ptr::null_mut();
     }
 }
 
@@ -1192,20 +1193,15 @@ pub fn pull_table_info(
     let col_map: Vec<(i64, String)> = if has_v2 {
         let escaped = crate::util::escape_ident(table);
         let stmt = db.prepare_v2(&format!(
-            "SELECT col_id, col_name FROM \"{escaped}{suffix}\" ORDER BY col_id\0",
+            "SELECT col_id, col_name FROM \"{escaped}{suffix}\" ORDER BY col_id",
             escaped = escaped,
             suffix = consts::V2_COL_MAP_SUFFIX
-        ));
-        match stmt {
-            Ok(stmt) => {
-                let mut map = vec![];
-                while stmt.step().unwrap_or(ResultCode::DONE) == ResultCode::ROW {
-                    map.push((stmt.column_int64(0), stmt.column_text(1).unwrap_or("").to_string()));
-                }
-                map
-            }
-            Err(_) => vec![],
+        ))?;
+        let mut map = vec![];
+        while stmt.step()? == ResultCode::ROW {
+            map.push((stmt.column_int64(0), stmt.column_text(1)?.to_string()));
         }
+        map
     } else {
         vec![]
     };
@@ -1296,7 +1292,9 @@ pub fn pull_table_info(
         // The rowid is an alias for the PK in a regular table, but WITHOUT ROWID
         // tables don't have a rowid at all — using key_is_rowid would generate
         // invalid SQL like NEW."" or fail to map OLD.pk to __crsql_key.
-        key_is_rowid = force_rowid && !is_without_rowid;
+        // Also guard against tables that no longer have INTEGER PRIMARY KEY
+        // (e.g., PK type changed via ALTER TABLE) — the persisted flag is stale.
+        key_is_rowid = force_rowid && !is_without_rowid && has_integer_pk;
     } else {
         // Auto-detect: only use rowid-key mode for INTEGER PRIMARY KEY tables.
         // INTEGER PK is a rowid alias — the rowid IS the PK value, so it's stable.

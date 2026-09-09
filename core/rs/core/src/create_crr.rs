@@ -140,6 +140,12 @@ pub fn create_crr(
         unsafe { crate::util::set_master_value(db, &format!("skip_hash_{}", table), skip_hash_val as i64) }?;
     }
 
+    // Validate rowid range BEFORE creating any metadata tables or triggers.
+    // If validation fails, the table is not partially registered.
+    if table_info.key_is_rowid {
+        validate_rowid_range(db, table, &table_info.rowid_alias, err)?;
+    }
+
     // Create V2 tables if metadata write mode is dual-write (2) or V2-only (3)
     if metadata_write_version >= config::METADATA_VERSION_V2_AND_V1 {
         if let Err(rc) = crate::bootstrap_v2::create_v2_tables(db, &table_info) {
@@ -164,9 +170,7 @@ pub fn create_crr(
 
     // For rowid tables (not converted to without_rowid), validate rowid range.
     // Enforcement is done within the existing triggers, not separate ones.
-    if table_info.key_is_rowid {
-        validate_rowid_range(db, table, &table_info.rowid_alias, err)?;
-    }
+    // (Validation was already done above before table/trigger creation.)
 
     // Backfill appropriate metadata tables based on write mode.
     // V1=1, V2_AND_V1=2, V2=3. Dual-write (2) backfills both.
