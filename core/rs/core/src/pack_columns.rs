@@ -303,9 +303,9 @@ pub fn unpack_columns(data: &[u8]) -> Result<Vec<ColumnValue>, ResultCode> {
                     return Err(ResultCode::ABORT);
                 }
                 let bytes = buf.copy_to_bytes(len);
-                ret.push(ColumnValue::Text(unsafe {
-                    String::from_utf8_unchecked(bytes.to_vec())
-                }))
+                let s = alloc::string::String::from_utf8(bytes.to_vec())
+                    .map_err(|_| ResultCode::ABORT)?;
+                ret.push(ColumnValue::Text(s));
             }
             None => return Err(ResultCode::MISUSE),
         }
