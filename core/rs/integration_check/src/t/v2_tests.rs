@@ -1859,6 +1859,7 @@ fn test_ts_not_set_errors() -> Result<(), ResultCode> {
     // --- crsql_as_crr without ts in V2 mode ---
     {
         let db = crate::opendb()?;
+        db.db.exec_safe("SELECT crsql_config_set('default-ts', 0)")?;
         db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
         db.db.exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, a)")?;
         // Do NOT call crsql_set_ts — should error
@@ -1883,7 +1884,8 @@ fn test_ts_not_set_errors() -> Result<(), ResultCode> {
             remaining = stmt.column_int(0) as i32;
             if remaining < 0 { panic!("migration failed"); }
         }
-        // Do NOT call crsql_set_ts — should error
+        // Disable default-ts, then do NOT call crsql_set_ts — should error
+        db.db.exec_safe("SELECT crsql_config_set('default-ts', 0)")?;
         let rc = db.db.exec_safe("SELECT crsql_begin_alter('foo')");
         assert!(rc.is_err(), "crsql_begin_alter should fail when ts not set");
         libc_println!("  crsql_begin_alter without ts: correctly rejected");
@@ -1915,7 +1917,9 @@ fn test_ts_not_set_errors() -> Result<(), ResultCode> {
         db.db.exec_safe("ALTER TABLE foo ADD COLUMN b TEXT")?;
         // Release the begin_alter savepoint — this commits and resets ts
         db.db.exec_safe("RELEASE SAVEPOINT alter_crr")?;
-        // Now ts=0, commit_alter should error
+        // Disable default-ts so commit_alter can't fall back to it
+        db.db.exec_safe("SELECT crsql_config_set('default-ts', 0)")?;
+        // Now ts=0 and default-ts=0, commit_alter should error
         let rc = db.db.exec_safe("SELECT crsql_commit_alter('foo')");
         assert!(rc.is_err(), "crsql_commit_alter should fail when ts not set after savepoint release");
         libc_println!("  crsql_commit_alter without ts: correctly rejected");
@@ -1928,7 +1932,8 @@ fn test_ts_not_set_errors() -> Result<(), ResultCode> {
         db.db.exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, a)")?;
         db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
         db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
-        // Do NOT call crsql_set_ts — INSERT trigger should error
+        // Disable default-ts, then do NOT call crsql_set_ts — INSERT trigger should error
+        db.db.exec_safe("SELECT crsql_config_set('default-ts', 0)")?;
         let rc = db.db.exec_safe("INSERT INTO foo VALUES (1, 'x')");
         assert!(rc.is_err(), "INSERT on V2 CRR should fail when ts not set");
         libc_println!("  INSERT without ts: correctly rejected");
@@ -1943,7 +1948,8 @@ fn test_ts_not_set_errors() -> Result<(), ResultCode> {
         db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
         db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
         db.db.exec_safe("INSERT INTO foo VALUES (1, 'x')")?;
-        // Do NOT call crsql_set_ts — UPDATE trigger should error
+        // Disable default-ts, then do NOT call crsql_set_ts — UPDATE trigger should error
+        db.db.exec_safe("SELECT crsql_config_set('default-ts', 0)")?;
         let rc = db.db.exec_safe("UPDATE foo SET a = 'y' WHERE id = 1");
         assert!(rc.is_err(), "UPDATE on V2 CRR should fail when ts not set");
         libc_println!("  UPDATE without ts: correctly rejected");
@@ -1958,7 +1964,8 @@ fn test_ts_not_set_errors() -> Result<(), ResultCode> {
         db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
         db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
         db.db.exec_safe("INSERT INTO foo VALUES (1, 'x')")?;
-        // Do NOT call crsql_set_ts — DELETE trigger should error
+        // Disable default-ts, then do NOT call crsql_set_ts — DELETE trigger should error
+        db.db.exec_safe("SELECT crsql_config_set('default-ts', 0)")?;
         let rc = db.db.exec_safe("DELETE FROM foo WHERE id = 1");
         assert!(rc.is_err(), "DELETE on V2 CRR should fail when ts not set");
         libc_println!("  DELETE without ts: correctly rejected");
@@ -1972,7 +1979,8 @@ fn test_ts_not_set_errors() -> Result<(), ResultCode> {
         db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
         db.db.exec_safe("INSERT INTO foo VALUES (1, 'x')")?;
         db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
-        // Do NOT call crsql_set_ts — should error
+        // Disable default-ts, then do NOT call crsql_set_ts — should error
+        db.db.exec_safe("SELECT crsql_config_set('default-ts', 0)")?;
         let stmt = db.db.prepare_v2("SELECT crsql_incremental_maintenance(1000)")?;
         let rc = stmt.step();
         // incremental_maintenance returns -1 via result_int when ts not set,
@@ -1994,7 +2002,8 @@ fn test_ts_not_set_errors() -> Result<(), ResultCode> {
         // Read changes from source
         let read_stmt = db.db.prepare_v2("SELECT * FROM crsql_changes")?;
         read_stmt.step()?;
-        // Try to merge back without ts — should error
+        // Disable default-ts, then try to merge back without ts — should error
+        db.db.exec_safe("SELECT crsql_config_set('default-ts', 0)")?;
         let merge_stmt = db.db.prepare_v2(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )?;
@@ -2229,6 +2238,8 @@ fn test_default_ts_not_persisted() -> Result<(), ResultCode> {
     // Connection 2: reopen — default-ts should be 0
     {
         let db = crate::opendb_file(path_str)?;
+        // Reset the default-ts that opendb_file sets, to verify non-persistence
+        db.db.exec_safe("SELECT crsql_config_set('default-ts', 0)")?;
 
         // config_get should return 0 (not persisted)
         let stmt = db.db.prepare_v2("SELECT crsql_config_get('default-ts')")?;

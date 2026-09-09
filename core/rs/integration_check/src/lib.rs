@@ -49,6 +49,7 @@ pub fn opendb() -> Result<CRConnection, ResultCode> {
     let connection = sqlite::open(sqlite::strlit!(":memory:"))?;
     // connection.enable_load_extension(true)?;
     // connection.load_extension("../../dbg/crsqlite", None)?;
+    connection.exec_safe("SELECT crsql_config_set('default-ts', 1700000000)")?;
     Ok(CRConnection { db: connection })
 }
 
@@ -57,6 +58,7 @@ pub fn opendb_file(f: &str) -> Result<CRConnection, ResultCode> {
     let connection = sqlite::open(f.as_ptr())?;
     // connection.enable_load_extension(true)?;
     // connection.load_extension("../../dbg/crsqlite", None)?;
+    connection.exec_safe("SELECT crsql_config_set('default-ts', 1700000000)")?;
     Ok(CRConnection { db: connection })
 }
 

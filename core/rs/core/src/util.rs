@@ -40,7 +40,19 @@ pub fn get_dflt_value(
         return Ok(None);
     }
 
-    return Ok(Some(String::from(stmt.column_text(0)?)));
+    let raw = String::from(stmt.column_text(0)?);
+    // pragma_table_info returns string defaults with surrounding quotes
+    // (e.g., "'2018-01-01'" for DEFAULT '2018-01-01'). Strip them so the
+    // value matches what IS stored in the column for comparison purposes.
+    let stripped = if raw.len() >= 2
+        && ((raw.starts_with('\'') && raw.ends_with('\''))
+            || (raw.starts_with('"') && raw.ends_with('"')))
+    {
+        raw[1..raw.len() - 1].to_string()
+    } else {
+        raw
+    };
+    Ok(Some(stripped))
 }
 
 pub fn get_db_version_union_query(tbl_names: &[String]) -> String {

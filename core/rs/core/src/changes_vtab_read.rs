@@ -146,7 +146,7 @@ fn build_pushed_where(
 fn rebuild_outer_idx_str(
     other_clauses: &[&PlanConstraint],
     order_by_cols: &[CrsqlChangesColumn],
-    order_by_desc: bool,
+    order_by_descs: &[bool],
     has_order_by: bool,
 ) -> String {
     let mut str = String::new();
@@ -165,15 +165,16 @@ fn rebuild_outer_idx_str(
     // ORDER BY: replace seq with _seq_order for packed mode
     if has_order_by && !order_by_cols.is_empty() {
         str.push_str(" ORDER BY ");
-        let suffix = if order_by_desc { " DESC" } else { " ASC" };
         let cols: Vec<String> = order_by_cols
             .iter()
-            .map(|&c| {
+            .enumerate()
+            .map(|(i, &c)| {
                 let name = if c == CrsqlChangesColumn::Seq {
                     "_seq_order"
                 } else {
                     col_to_name(c).unwrap_or("db_vrsn")
                 };
+                let suffix = if order_by_descs.get(i).copied().unwrap_or(false) { " DESC" } else { " ASC" };
                 format!("{}{}", name, suffix)
             })
             .collect();
@@ -660,7 +661,12 @@ fn query_for_table(
                 crsql_changes_query_for_table_v2_v1wire(table_info)
             }
         }
-        SchemaVersion::V1 => crsql_changes_query_for_table(table_info),
+        SchemaVersion::V1 => {
+            // This should never happen — config guards prevent setting
+            // metadata-use-version=2 while any table is still V1-only.
+            // If we get here, the DB is in an inconsistent state.
+            return Err(ResultCode::ERROR);
+        }
     }
 }
 
@@ -681,7 +687,7 @@ pub fn changes_union_query(
     let has_cval = query_has_cval(metadata_use_version);
 
     // Read the binary plan from idx_str (allocated by changes_best_index).
-    let (constraints, order_by_col_ids, order_by_desc, has_order_by) =
+    let (constraints, order_by_col_ids, order_by_descs, has_order_by) =
         unsafe { read_idx_plan(idx_str) };
 
     // Reject LIKE/MATCH/GLOB/REGEXP on all crsql_changes columns. These ops
@@ -738,7 +744,7 @@ pub fn changes_union_query(
         let outer = rebuild_outer_idx_str(
             &other_constraints,
             &order_by_col_ids,
-            order_by_desc,
+            &order_by_descs,
             has_order_by,
         );
         (pushed, outer)
@@ -757,10 +763,14 @@ pub fn changes_union_query(
         }
         if has_order_by && !order_by_col_ids.is_empty() {
             outer.push_str(" ORDER BY ");
-            let suffix = if order_by_desc { " DESC" } else { " ASC" };
             let cols: Vec<String> = order_by_col_ids
                 .iter()
-                .filter_map(|&c| col_to_name(c).map(|s| format!("{}{}", s, suffix)))
+                .enumerate()
+                .filter_map(|(i, &c)| {
+                    let name = col_to_name(c)?;
+                    let suffix = if order_by_descs.get(i).copied().unwrap_or(false) { " DESC" } else { " ASC" };
+                    Some(format!("{}{}", name, suffix))
+                })
                 .collect();
             outer.push_str(&cols.join(", "));
         } else {

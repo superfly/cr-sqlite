@@ -32,9 +32,14 @@ unsafe fn compact_post_alter(
     ext_data: *mut crsql_ExtData,
     errmsg: *mut *mut c_char,
 ) -> Result<ResultCode, ResultCode> {
+    if tbl_name.is_null() {
+        return Err(ResultCode::MISUSE);
+    }
     let tbl_name_str = CStr::from_ptr(tbl_name).to_str()?;
     fill_db_version_if_needed(db, ext_data).or_else(|msg| {
-        errmsg.set(&msg);
+        if !errmsg.is_null() {
+            errmsg.set(&msg);
+        }
         Err(ResultCode::ERROR)
     })?;
     let current_db_version = (*ext_data).dbVersion;

@@ -21,6 +21,7 @@ static void testInsertOrReplaceBasic() {
   rc = sqlite3_exec(db, "CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b TEXT);", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_as_crr('foo');", 0, 0, 0);
   if (rc != SQLITE_OK) {
@@ -80,6 +81,7 @@ static void testInsertOrReplaceNoLingeringMetadata() {
   rc = sqlite3_exec(db, "CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b TEXT);", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_as_crr('foo');", 0, 0, 0);
   if (rc != SQLITE_OK) {
@@ -138,6 +140,7 @@ static void testInsertOrReplaceNewRow() {
   rc = sqlite3_exec(db, "CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b TEXT);", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_as_crr('foo');", 0, 0, 0);
   if (rc != SQLITE_OK) {
@@ -177,6 +180,7 @@ static void testRecursiveTriggersEnabled() {
 
   // Load cr-sqlite — should enable recursive_triggers
   rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
   rc = sqlite3_prepare_v2(db, "PRAGMA recursive_triggers;", -1, &pStmt, 0);

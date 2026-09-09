@@ -97,7 +97,7 @@ unsafe fn incremental_maintenance(
         mem::ManuallyDrop::new(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>));
     crate::debug::debug_log(&format!("incremental_maintenance: {} table infos", table_infos.len()));
 
-    let mut total_remaining: c_int = 0;
+    let mut total_remaining: i64 = 0;
 
     // Priority 1: V1 table cleanup tasks (from v2&v1 -> v2 transition)
     process_cleanup_tasks(
@@ -142,7 +142,7 @@ unsafe fn incremental_maintenance(
                         let total_key = format!("migration_v1_to_v2_remaining_{}", tbl_info.tbl_name);
                         let cached = crate::util::get_master_value(db, &total_key)?;
                         if let Some(v) = cached {
-                            total_remaining += v as c_int;
+                            total_remaining += v;
                         } else {
                             // No cached value — fall back to COUNT(*)
                             let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
@@ -154,7 +154,7 @@ unsafe fn incremental_maintenance(
                             );
                             let stmt = db.prepare_v2(&count_sql)?;
                             stmt.step()?;
-                            total_remaining += stmt.column_int64(0) as c_int;
+                            total_remaining += stmt.column_int64(0);
                         }
                     }
                 }
@@ -206,7 +206,7 @@ unsafe fn incremental_maintenance(
         match migrate_v1_to_v2_chunk(db, ext_data, tbl_info, budget) {
             Ok((processed, remaining)) => {
                 crate::debug::debug_log(&format!("migration: {} processed={} remaining={}", tbl_info.tbl_name, processed, remaining));
-                total_remaining += remaining as c_int;
+                total_remaining += remaining;
                 budget -= processed;
             }
             Err(e) => {
@@ -218,7 +218,7 @@ unsafe fn incremental_maintenance(
         }
     }
 
-    Ok(total_remaining)
+    Ok(total_remaining.min(c_int::MAX as i64) as c_int)
 }
 
 /// Process chunked cleanup tasks for tables registered in crsql_master.
@@ -227,7 +227,7 @@ unsafe fn incremental_maintenance(
 unsafe fn process_cleanup_tasks(
     db: *mut sqlite3,
     chunk_size: c_int,
-    total_remaining: &mut c_int,
+    total_remaining: &mut i64,
     marker_prefix: &str,
     suffixes: &[&str],
 ) -> Result<(), ResultCode> {
@@ -242,15 +242,54 @@ unsafe fn process_cleanup_tasks(
             tables.push(String::from(tbl));
         }
     }
+    let mut budget = chunk_size as i64;
     for tbl_name in &tables {
-        let remaining = cleanup_tables_chunk(db, tbl_name, chunk_size as i64, suffixes)?;
+        if budget <= 0 {
+            // Budget exhausted — remaining tables will be processed on next call.
+            // Still report their remaining count so the caller knows work is pending.
+            let remaining = get_cleanup_remaining(db, tbl_name, suffixes)?;
+            if remaining > 0 {
+                *total_remaining += remaining;
+            }
+            continue;
+        }
+        let remaining = cleanup_tables_chunk(db, tbl_name, budget, suffixes)?;
+        budget -= chunk_size as i64 - remaining.max(0);
         if remaining == 0 {
             crate::util::clear_master_key(db, &format!("{}_{}", marker_prefix, tbl_name))?;
         } else {
-            *total_remaining += remaining as c_int;
+            *total_remaining += remaining;
         }
     }
     Ok(())
+}
+
+/// Estimate remaining rows for a table across all suffixes without deleting.
+unsafe fn get_cleanup_remaining(
+    db: *mut sqlite3,
+    tbl_name: &str,
+    suffixes: &[&str],
+) -> Result<i64, ResultCode> {
+    let escaped = crate::util::escape_ident(tbl_name);
+    let total_key = format!("cleanup_remaining_{}", tbl_name);
+    if let Some(v) = crate::util::get_master_value(db, &total_key)? {
+        return Ok(v);
+    }
+    // No cached value — count rows
+    let mut total: i64 = 0;
+    for suffix in suffixes {
+        if !table_exists(db, &escaped, suffix) {
+            continue;
+        }
+        let count_sql = format!(
+            "SELECT count(*) FROM \"{escaped}{suffix}\"",
+            escaped = escaped, suffix = suffix,
+        );
+        let stmt = db.prepare_v2(&count_sql)?;
+        stmt.step()?;
+        total += stmt.column_int64(0);
+    }
+    Ok(total)
 }
 
 /// Chunked table cleanup: DELETE rows in batches from each suffixed table, then

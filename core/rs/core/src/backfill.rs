@@ -225,16 +225,24 @@ fn fill_column(
             ))
             .collect::<Vec<_>>()
             .join(" AND "),
-        dflt_value_condition = if dflt_value.is_some() {
-            format!("AND t1.\"{}\" IS NOT ?", crate::util::escape_ident(&non_pk_col.name))
-        } else {
-            String::from("")
+        dflt_value_condition = match &dflt_value {
+            Some(d) if d == "NULL" => {
+                // Default is NULL — skip rows where the column value IS NULL.
+                // Use `IS NOT NULL` since binding the string "NULL" would not match actual NULLs.
+                format!("AND t1.\"{}\" IS NOT NULL", crate::util::escape_ident(&non_pk_col.name))
+            }
+            Some(_) => {
+                format!("AND t1.\"{}\" IS NOT ?", crate::util::escape_ident(&non_pk_col.name))
+            }
+            None => String::from(""),
         },
     );
     let read_stmt = db.prepare_v2(&sql)?;
     read_stmt.bind_text(1, &non_pk_col.name, Destructor::STATIC)?;
     if let Some(ref dflt) = dflt_value {
-        read_stmt.bind_text(2, dflt, Destructor::STATIC)?;
+        if dflt != "NULL" {
+            read_stmt.bind_text(2, dflt, Destructor::STATIC)?;
+        }
     }
 
     // TODO: rm clone?

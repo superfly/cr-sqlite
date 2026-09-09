@@ -294,7 +294,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .create_function_v2(
             "crsql_update_site_id",
             2,
-            sqlite::UTF8 | sqlite::INNOCUOUS | sqlite::DETERMINISTIC,
+            sqlite::UTF8 | sqlite::INNOCUOUS,
             Some(ext_data as *mut c_void),
             Some(x_crsql_update_site_id),
             None,
@@ -497,7 +497,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .create_function_v2(
             "crsql_set_ts",
             1,
-            sqlite::UTF8 | sqlite::DETERMINISTIC,
+            sqlite::UTF8,
             Some(ext_data as *mut c_void),
             Some(x_crsql_set_ts),
             None,
@@ -946,7 +946,7 @@ unsafe extern "C" fn x_crsql_as_crr(
 
     let db = ctx.db_handle();
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
-    let mut err_msg = null_mut();
+    let mut err_msg: *mut c_char = null_mut();
     let rc = db.exec_safe("SAVEPOINT as_crr");
     if rc.is_err() {
         ctx.result_error("failed to start as_crr savepoint");

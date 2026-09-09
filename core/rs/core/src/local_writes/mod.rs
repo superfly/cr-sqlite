@@ -46,8 +46,10 @@ where
         ));
     }
 
-    // Apply default-ts when configured; V2 paths still error if ts stays 0.
-    let _ = unsafe { crate::config::ensure_timestamp(ext_data) };
+    // Enforce timestamp: either per-transaction (crsql_set_ts) or default-ts must be set.
+    if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
+        return Err("timestamp not set — call crsql_set_ts() first or set default-ts".to_string());
+    }
 
     let mut table_infos =
         unsafe { ManuallyDrop::new(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>)) };
