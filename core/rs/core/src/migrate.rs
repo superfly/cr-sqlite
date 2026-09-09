@@ -211,8 +211,9 @@ unsafe fn incremental_maintenance(
             }
             Err(e) => {
                 crate::debug::debug_log(&format!("migration: FAILED for {}: {:?}", tbl_info.tbl_name, e));
-                // Don't abort the entire migration — skip this table and continue with others
-                // The error will be retried on the next maintenance call
+                // Propagate the error so the caller knows migration is stuck.
+                // Returning non-zero remaining would hide the real error.
+                return Err(e);
             }
         }
     }

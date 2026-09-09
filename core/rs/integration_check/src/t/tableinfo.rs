@@ -405,4 +405,38 @@ pub fn run_suite() {
     test_create_clock_table_from_table_info();
     test_leak_condition();
     test_site_id_initialization();
+    test_integer_pk_case_insensitive();
+}
+
+/// H5 regression: SQLite treats INTEGER PRIMARY KEY as a rowid alias
+/// case-insensitively. Our code must match — `integer PRIMARY KEY`
+/// (lowercase) must be classified as a rowid-keyed table.
+fn test_integer_pk_case_insensitive() {
+    let db = crate::opendb().expect("Opened DB");
+    let raw_db = db.db.db;
+    // lowercase
+    db.db.exec_safe("CREATE TABLE lower_int (id integer PRIMARY KEY NOT NULL, a)")
+        .expect("created lower_int");
+    // mixed case
+    db.db.exec_safe("CREATE TABLE mixed_int (id Integer PRIMARY KEY NOT NULL, a)")
+        .expect("created mixed_int");
+    // uppercase (control)
+    db.db.exec_safe("CREATE TABLE upper_int (id INTEGER PRIMARY KEY NOT NULL, a)")
+        .expect("created upper_int");
+
+    let err = make_err_ptr();
+    // pull_table_info should classify all three as having an integer PK
+    // (rowid alias), regardless of case.
+    for tbl in &["lower_int", "mixed_int", "upper_int"] {
+        let ti = test_exports::tableinfo::pull_table_info(raw_db, tbl, err);
+        assert!(ti.is_ok(), "pull_table_info failed for {}: {:?}", tbl, ti.err());
+        let ti = ti.unwrap();
+        assert!(ti.has_integer_pk,
+            "table {} should have has_integer_pk=true (case-insensitive INTEGER), got col_type={:?}",
+            tbl, ti.pks[0].col_type);
+        assert!(!ti.rowid_alias.is_empty(),
+            "table {} should have a non-empty rowid_alias", tbl);
+    }
+    drop_err_ptr(err);
+    libc_print::libc_println!("=== test_integer_pk_case_insensitive PASS ===");
 }

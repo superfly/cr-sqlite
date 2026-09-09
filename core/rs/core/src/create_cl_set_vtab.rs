@@ -87,6 +87,14 @@ fn create_clset_storage(
         return Err(ResultCode::MISUSE);
     }
 
+    // Reject table_def containing semicolons to prevent multi-statement injection
+    // via sqlite3_exec. The column definitions should be a single CREATE TABLE
+    // body without embedded SQL statements.
+    if table_def.contains(';') {
+        err.set("CLSet table definition must not contain semicolons");
+        return Err(ResultCode::MISUSE);
+    }
+
     db.exec_safe(&format!(
         "CREATE TABLE \"{db_name}\".\"{table_name}\" ({table_def})",
         db_name = crate::util::escape_ident(args.database_name),

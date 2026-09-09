@@ -34,12 +34,12 @@ static int changesConnect(sqlite3 *db, void *pAux, int argc,
     return rc;
   }
   pNew = sqlite3_malloc(sizeof(*pNew));
-  *ppVtab = (sqlite3_vtab *)pNew;
   if (pNew == 0) {
     *pzErr = sqlite3_mprintf("Out of memory");
     return SQLITE_NOMEM;
   }
   memset(pNew, 0, sizeof(*pNew));
+  *ppVtab = (sqlite3_vtab *)pNew;
   pNew->db = db;
   pNew->pExtData = (crsql_ExtData *)pAux;
 
@@ -48,6 +48,7 @@ static int changesConnect(sqlite3 *db, void *pAux, int argc,
   if (rc != SQLITE_OK) {
     *pzErr = sqlite3_mprintf("Could not update table infos");
     sqlite3_free(pNew);
+    *ppVtab = 0;
     return rc;
   }
 
@@ -109,7 +110,9 @@ static int changesCrsrFinalize(crsql_Changes_cursor *crsr) {
  * We, of course, do not de-allocated the `pTab` reference
  * given `pTab` must persist for the life of the connection.
  *
- * `pChangesStmt` and `pRowStmt` must be finalized.
+ * `pChangesStmt` must be finalized.
+ * `pRowStmt` is cache-borrowed from TableInfo and must NOT be finalized —
+ * only reset/clear_bindings is needed (the cache owns the lifetime).
  *
  * `colVrsns` does not need to be freed as it comes from
  * `pChangesStmt` thus finalizing `pChangesStmt` will

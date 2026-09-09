@@ -192,7 +192,7 @@ extern "C" fn column(
                 let col_value = &cols[(*crsr).crsr];
                 match col_value {
                     ColumnValue::Blob(b) => {
-                        ctx.result_blob_static(b);
+                        ctx.result_blob_transient(b);
                     }
                     ColumnValue::Float(f) => {
                         ctx.result_double(*f);
@@ -204,7 +204,7 @@ extern "C" fn column(
                         ctx.result_null();
                     }
                     ColumnValue::Text(t) => {
-                        ctx.result_text_static(t);
+                        ctx.result_text_transient(t);
                     }
                 }
                 ResultCode::OK as c_int
