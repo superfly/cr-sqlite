@@ -6,7 +6,7 @@ use sqlite::Connection;
 use core::ffi::c_char;
 
 use sqlite::{sqlite3, ResultCode};
-use sqlite_nostd as sqlite;
+use sqlite_nostd::{self as sqlite, StrRef};
 
 use crate::tableinfo::TableInfo;
 
@@ -15,6 +15,10 @@ pub fn create_triggers(
     table_info: &TableInfo,
     err: *mut *mut c_char,
 ) -> Result<ResultCode, ResultCode> {
+    if table_info.pks.is_empty() {
+        err.set("table has no primary key columns");
+        return Err(ResultCode::ERROR);
+    }
     create_insert_trigger(db, table_info, err)?;
     create_update_trigger(db, table_info, err)?;
     create_delete_trigger(db, table_info, err)

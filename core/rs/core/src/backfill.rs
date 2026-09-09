@@ -108,8 +108,8 @@ fn create_clock_rows_from_stmt(
     // to determine if rows should resurrect on a future insertion event provided by a peer.
     let sql = format!(
         "INSERT OR IGNORE INTO \"{table}__crsql_clock\"
-          (key, col_name, col_version, db_version, seq) VALUES
-          (?, ?, 1, {dbversion_getter}, crsql_increment_and_get_seq())",
+          (key, col_name, col_version, db_version, seq, ts) VALUES
+          (?, ?, 1, {dbversion_getter}, crsql_increment_and_get_seq(), crsql_get_ts())",
         table = crate::util::escape_ident(table),
         dbversion_getter = if is_commit_alter {
             "crsql_db_version()"

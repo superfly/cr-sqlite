@@ -1993,18 +1993,14 @@ fn v2_skip_hash_flag_works() -> Result<(), ResultCode> {
         assert_eq!(stmt.column_int(0), 1, "skip_hash INTEGER PK should produce changes");
     }
 
-    // Composite PK + skip_hash flag (design: silently ignored, not an error)
+    // Composite PK + skip_hash flag (now an error — skip_hash requires single PK)
     {
         let db = crate::opendb()?;
         db.db.exec_safe("CREATE TABLE t6 (a TEXT NOT NULL, b TEXT NOT NULL, v TEXT, PRIMARY KEY(a,b))")?;
         db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
-        db.db.exec_safe("SELECT crsql_as_crr('t6', 'skip_hash')")?;
-        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
-        db.db.exec_safe("INSERT INTO t6 VALUES ('x', 'y', 'val')")?;
-
-        let stmt = db.db.prepare_v2("SELECT count(*) FROM crsql_changes WHERE \"table\" = 't6'")?;
-        stmt.step()?;
-        assert_eq!(stmt.column_int(0), 1, "composite PK with skip_hash flag should still work (ignored)");
+        let rc = db.db.exec_safe("SELECT crsql_as_crr('t6', 'skip_hash')");
+        assert!(rc.is_err(), "skip_hash on composite PK should error");
+        libc_println!("  composite PK + skip_hash: correctly rejected");
     }
 
     libc_println!("=== v2_skip_hash_flag_works PASS ===");

@@ -281,6 +281,9 @@ pub fn create_clock_table(
     table_info: &TableInfo,
     _err: *mut *mut c_char,
 ) -> Result<ResultCode, ResultCode> {
+    if table_info.pks.is_empty() {
+        return Err(ResultCode::ERROR);
+    }
     let pk_list = crate::util::as_identifier_list(&table_info.pks, None)?;
     let table_name = &table_info.tbl_name;
 

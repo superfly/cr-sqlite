@@ -54,7 +54,7 @@ fn test_ensure_table_infos_are_up_to_date() {
     .expect("made foo clock");
 
     let ext_data = unsafe { test_exports::c::crsql_newExtData(raw_db) };
-    let rc = unsafe { test_exports::c::crsql_initSiteIdExt(raw_db, ext_data, make_site()) };
+    let rc = unsafe { test_exports::c::crsql_initSiteIdExt(raw_db, ext_data, make_site() as *mut core::ffi::c_uchar) };
     assert_eq!(rc, 0);
     test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err);
 

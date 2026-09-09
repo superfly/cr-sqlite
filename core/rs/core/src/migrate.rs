@@ -148,7 +148,7 @@ unsafe fn incremental_maintenance(
                             let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
                             let start_key = progress.unwrap_or(0);
                             let count_sql = format!(
-                                "SELECT count(*) FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key}\0",
+                                "SELECT count(*) FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key}",
                                 escaped = escaped,
                                 start_key = start_key,
                             );
@@ -472,7 +472,7 @@ unsafe fn migrate_v1_to_v2_chunk(
     // One-time count of remaining rows to migrate (cached in crsql_master).
     let total_key = format!("migration_v1_to_v2_remaining_{}", tbl_info.tbl_name);
     let count_sql = format!(
-        "SELECT count(*) FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key}\0",
+        "SELECT count(*) FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {start_key}",
         escaped = escaped,
         start_key = start_key,
     );
@@ -702,7 +702,7 @@ unsafe fn migrate_v1_to_v2_chunk(
 
         // Step 5: Get max key from chunk to update cursor.
         // Chunk is guaranteed non-empty (checked above via changes64()).
-        let max_key_sql = "SELECT max(__crsql_key) FROM temp.migration_chunk\0";
+        let max_key_sql = "SELECT max(__crsql_key) FROM temp.migration_chunk";
         let max_key_stmt = db.prepare_v2(&max_key_sql)?;
         max_key_stmt.step()?;
         let last_key = max_key_stmt.column_int64(0);
@@ -739,7 +739,7 @@ unsafe fn migrate_v1_to_v2_chunk(
                 // Clear cached total first so get_or_count actually runs the count query.
                 crate::util::clear_master_key(db, &total_key)?;
                 let verify_sql = format!(
-                    "SELECT count(*) FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {last_key}\0",
+                    "SELECT count(*) FROM \"{escaped}__crsql_pks\" WHERE __crsql_key > {last_key}",
                     escaped = escaped,
                     last_key = crate::util::get_master_value(db, &progress_key)?.unwrap_or(0),
                 );

@@ -46,26 +46,24 @@ pub struct PlanConstraint {
 pub struct ChangesIdxHeader {
     pub magic: [u8; 11],         // "Rust magic\0"
     pub num_constraints: u8,
-    pub num_order_by: u8,
-    pub has_order_by: u8,        // 1 if user provided ORDER BY, 0 if default
+    pub num_order_by: u8,        // 0 = no user ORDER BY (use default)
 }
 
 /// Read the constraints from a ChangesIdxHeader pointer.
-/// Returns (constraints, order_by_cols, order_by_descs, has_order_by).
+/// Returns (constraints, order_by_cols, order_by_descs).
 pub unsafe fn read_idx_plan(
     ptr: *const c_char,
 ) -> (
     Vec<PlanConstraint>,
     Vec<crate::c::CrsqlChangesColumn>,
     Vec<bool>,
-    bool,
 ) {
     if ptr.is_null() {
-        return (vec![], vec![], vec![], false);
+        return (vec![], vec![], vec![]);
     }
     let header = &*(ptr as *const ChangesIdxHeader);
     if header.magic != IDX_MAGIC {
-        return (vec![], vec![], vec![], false);
+        return (vec![], vec![], vec![]);
     }
     let nc = header.num_constraints as usize;
     let no = header.num_order_by as usize;
@@ -88,7 +86,7 @@ pub unsafe fn read_idx_plan(
         Vec::new()
     };
 
-    (constraints, order_by, order_by_descs, header.has_order_by != 0)
+    (constraints, order_by, order_by_descs)
 }
 
 /// Allocate a ChangesIdxHeader + trailing arrays with sqlite3_malloc.
@@ -97,7 +95,6 @@ pub fn alloc_idx_plan(
     constraints: &[PlanConstraint],
     order_by_cols: &[crate::c::CrsqlChangesColumn],
     order_by_descs: &[bool],
-    has_order_by: bool,
 ) -> *mut c_char {
     let header_size = core::mem::size_of::<ChangesIdxHeader>();
     let constraint_size = constraints.len() * core::mem::size_of::<PlanConstraint>();
@@ -115,7 +112,6 @@ pub fn alloc_idx_plan(
         (*header).magic = IDX_MAGIC;
         (*header).num_constraints = constraints.len() as u8;
         (*header).num_order_by = order_by_cols.len() as u8;
-        (*header).has_order_by = if has_order_by { 1 } else { 0 };
 
         let c_ptr = ptr.add(header_size) as *mut PlanConstraint;
         for (i, c) in constraints.iter().enumerate() {
@@ -244,7 +240,6 @@ fn changes_best_index(
     let order_bys = sqlite::args!((*index_info).nOrderBy, (*index_info).aOrderBy);
     let mut order_by_consumed = true;
     let mut order_by_cols: Vec<CrsqlChangesColumn> = Vec::new();
-    let has_order_by = !order_bys.is_empty();
     for order_by in order_bys {
         let desc = order_by.desc != 0;
         let col = CrsqlChangesColumn::from_i32(order_by.iColumn);
@@ -261,11 +256,8 @@ fn changes_best_index(
         }
     }
 
-    // If no user ORDER BY, default to db_vrsn, seq ASC
-    if !has_order_by {
-        order_by_cols.push(CrsqlChangesColumn::DbVrsn);
-        order_by_cols.push(CrsqlChangesColumn::Seq);
-    }
+    // No default ORDER BY columns here — empty order_by_cols signals
+    // the read path to use its default (db_vrsn ASC, seq ASC).
 
     // TODO: update your order by py test to explain query plans to ensure correct indices are selected
     // both constraints are present. Also to check that order by is consumed.
@@ -290,7 +282,7 @@ fn changes_best_index(
         }
     }
 
-    let ptr = alloc_idx_plan(&plan_constraints, &order_by_cols, &order_by_descs, has_order_by);
+    let ptr = alloc_idx_plan(&plan_constraints, &order_by_cols, &order_by_descs);
     unsafe {
         (*index_info).idxNum = idx_num;
         (*index_info).orderByConsumed = if order_by_consumed { 1 } else { 0 };

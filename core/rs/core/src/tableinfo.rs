@@ -972,7 +972,7 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
     let schema_changed =
         unsafe { crsql_fetchPragmaSchemaVersion(db, ext_data, TABLE_INFO_SCHEMA_VERSION) };
 
-    if schema_changed < 0 {
+    if schema_changed != 0 && schema_changed != 1 {
         return ResultCode::ERROR as c_int;
     }
 
