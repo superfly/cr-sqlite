@@ -1108,7 +1108,7 @@ unsafe fn v2_lookup_key_and_cl(
     let mut stmt = v2.lookup_row_state();
     if tbl_info.skip_hash {
         // We enforce that in skip_hash mode, there is only one PK column
-        let pk_val = &unpacked_pks[0];
+        let pk_val = unpacked_pks.first().ok_or(ResultCode::ERROR)?;
         crate::pack_columns::bind_slot(1, pk_val, stmt.stmt)?;
         crate::pack_columns::bind_slot(2, pk_val, stmt.stmt)?;
     } else {
@@ -1223,7 +1223,7 @@ pub unsafe fn v1_to_v2_hydrate_row(
             ins.bind_int64(2, db_version)?;
             ins.bind_int64(3, seq)?;
             if tbl_info.skip_hash {
-                crate::pack_columns::bind_slot(4, &unpacked_pks[0], ins.stmt)?;
+                crate::pack_columns::bind_slot(4, unpacked_pks.first().ok_or(ResultCode::ERROR)?, ins.stmt)?;
             } else {
                 ins.bind_blob(4, hashed_pk, sqlite::Destructor::STATIC)?;
             }
@@ -1468,7 +1468,7 @@ unsafe fn v2_merge_insert_tombstone(
         stmt.bind_int64(2, insert_db_vrsn)?;
         stmt.bind_int64(3, insert_seq)?;
         if tbl_info.skip_hash {
-            crate::pack_columns::bind_slot(4, &unpacked_pks[0], stmt.stmt)?;
+            crate::pack_columns::bind_slot(4, unpacked_pks.first().ok_or(ResultCode::ERROR)?, stmt.stmt)?;
         } else {
             stmt.bind_blob(4, hashed_pk, sqlite::Destructor::STATIC)?;
         }
@@ -1685,7 +1685,7 @@ unsafe fn v2_nuke_tombstone(
     {
         let mut stmt = v2.tomb_delete();
         if tbl_info.skip_hash {
-            crate::pack_columns::bind_slot(1, &unpacked_pks[0], stmt.stmt)?;
+            crate::pack_columns::bind_slot(1, unpacked_pks.first().ok_or(ResultCode::ERROR)?, stmt.stmt)?;
         } else {
             stmt.bind_blob(1, hashed_pk, sqlite::Destructor::STATIC)?;
         }
@@ -1809,7 +1809,7 @@ unsafe fn v2_to_v1_mirror_metadata(
             ins.bind_int64(2, v2_cl)?;
             ins.bind_int64(3, ts_fallback)?;
             if tbl_info.skip_hash {
-                crate::pack_columns::bind_slot(4, &pks[0], ins.stmt)?;
+                crate::pack_columns::bind_slot(4, pks.first().ok_or(ResultCode::ERROR)?, ins.stmt)?;
             } else {
                 ins.bind_blob(4, hashed_pk, sqlite::Destructor::STATIC)?;
             }

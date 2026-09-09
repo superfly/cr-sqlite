@@ -487,7 +487,7 @@ fn is_migration_complete(db: *mut sqlite_nostd::sqlite3) -> Result<bool, ResultC
 
 /// Clear all pending migration markers. Called when aborting migration (2->1 rollback).
 fn clear_migration_markers(db: *mut sqlite_nostd::sqlite3) -> Result<(), ResultCode> {
-    let sql = "DELETE FROM crsql_master WHERE key LIKE 'migration_v1_to_v2_migration_%'\0";
+    let sql = "DELETE FROM crsql_master WHERE key LIKE 'migration_v1_to_v2_migration_%'";
     db.exec_safe(sql)?;
     Ok(())
 }

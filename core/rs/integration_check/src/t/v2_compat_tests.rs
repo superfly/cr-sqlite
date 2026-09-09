@@ -2380,6 +2380,632 @@ fn v2_hash_tombstone_rejected_in_v1_wire_mode() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// Test C1: V1 mirror per-column clock entries must have correct site_id and ts.
+/// The v1_clock_copy SQL must not swap site_id and ts columns.
+/// This test syncs an insert from a source to a dual-write destination and
+/// checks that per-column V1 clock rows (col_name != '-1') have:
+///   - site_id = source site ordinal (small integer, not the timestamp)
+///   - ts = the timestamp string (e.g. '1700000000', not the site ordinal)
+fn v2_mirror_v1_clock_copy_site_id_ts_not_swapped() -> Result<(), ResultCode> {
+    libc_println!("=== v2_mirror_v1_clock_copy_site_id_ts_not_swapped START ===");
+
+    let db_src = crate::opendb()?;
+    let db_dst = crate::opendb()?;
+
+    // Source: V2-only, V2 wire
+    db_src.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    db_src.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+    db_src.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+    db_src.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+    db_src.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db_src.db.exec_safe("SELECT crsql_as_crr('t')")?;
+    db_src.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db_src.db.exec_safe("INSERT INTO t VALUES (1, 'hello')")?;
+
+    // Destination: dual-write, V2 wire reception
+    db_dst.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
+    db_dst.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+    db_dst.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+    db_dst.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+    db_dst.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db_dst.db.exec_safe("SELECT crsql_as_crr('t')")?;
+    migrate_to_v2(&db_dst.db)?;
+
+    // Sync insert from source to destination — triggers v2_to_v1_mirror_metadata
+    sync_v2_wire(&db_src.db, &db_dst.db, 0)?;
+
+    // Full V1↔V2 clock comparison: join V1 per-column clock entries to their
+    // V2 counterparts and compare ALL columns (col_version, db_version, seq,
+    // site_id, ts). This catches any column swap in v1_clock_copy, not just
+    // site_id/ts (C1). The join maps:
+    //   V1.key → v2_pks.__crsql_key
+    //   V1.col_name → v2_col_map.col_name → col_id
+    //   V2 cell_key = (v2_pks.__crsql_key << col_id_bits) | col_id
+    let col_id_bits = {
+        let s = db_dst.db.prepare_v2("SELECT value FROM crsql_master WHERE key = 'crsql_col_id_bits'")?;
+        s.step()?;
+        s.column_int64(0)
+    };
+    let cmp_sql = alloc::format!(
+        "SELECT \
+            v1.col_version, v1.db_version, v1.seq, v1.site_id, v1.ts, \
+            v2.col_version, v2.db_version, v2.seq, v2.site_id, v2.ts, \
+            v1.col_name \
+         FROM t__crsql_clock v1 \
+         JOIN t__crsql_v2_pks v2p ON v1.key = v2p.__crsql_key \
+         JOIN t__crsql_v2_col_map v2m ON v1.col_name = v2m.col_name \
+         JOIN t__crsql_v2_clock v2 ON v2.cell_key = (v2p.__crsql_key << {bits}) | v2m.col_id \
+         WHERE v1.col_name != '-1'",
+        bits = col_id_bits
+    );
+    let stmt = db_dst.db.prepare_v2(&cmp_sql)?;
+    let mut found_per_col = false;
+    let mut mismatches = 0;
+    while stmt.step()? == ResultCode::ROW {
+        found_per_col = true;
+        let v1_cv = stmt.column_int64(0);
+        let v1_dv = stmt.column_int64(1);
+        let v1_seq = stmt.column_int64(2);
+        let v1_site = stmt.column_int64(3);
+        let v1_ts = stmt.column_text(4)?.to_string();
+        let v2_cv = stmt.column_int64(5);
+        let v2_dv = stmt.column_int64(6);
+        let v2_seq = stmt.column_int64(7);
+        let v2_site = stmt.column_int64(8);
+        let v2_ts = stmt.column_int64(9);
+        let col_name = stmt.column_text(10)?.to_string();
+
+        // V1 ts is TEXT, V2 ts is INTEGER.
+        let v1_ts_int: i64 = v1_ts.parse().unwrap_or(-1);
+
+        if v1_cv != v2_cv || v1_dv != v2_dv || v1_seq != v2_seq
+            || v1_site != v2_site || v1_ts_int != v2_ts
+        {
+            mismatches += 1;
+            libc_println!(
+                "  C1 MISMATCH col_name={}: \
+                 cv({}/{}) dv({}/{}) seq({}/{}) site({}/{}) ts({}/{})",
+                col_name,
+                v1_cv, v2_cv, v1_dv, v2_dv, v1_seq, v2_seq,
+                v1_site, v2_site, v1_ts, v2_ts,
+            );
+        }
+    }
+    assert!(found_per_col, "C1: should have per-column V1 clock entries after mirror");
+    assert_eq!(
+        mismatches, 0,
+        "C1 BUG: V1 mirror clock entries must match V2 source for all columns \
+         (col_version, db_version, seq, site_id, ts) — found {} mismatches",
+        mismatches
+    );
+
+    libc_println!("=== v2_mirror_v1_clock_copy_site_id_ts_not_swapped PASS ===");
+    Ok(())
+}
+
+/// Test C2: V1 mirror dead sentinel (hash mode) must have correct db_version/seq/site_id.
+/// The v1_sentinel_insert_dead SQL for hash mode must not swap these columns.
+/// This test syncs a delete from a source to a dual-write destination and checks
+/// that the V1 dead sentinel row (col_name = '-1') has:
+///   - db_version = V2 tombstone db_version (> 0)
+///   - site_id = source site ordinal
+///   - seq = V2 tombstone seq (typically 0)
+fn v2_mirror_v1_dead_sentinel_hash_mode_fields_correct() -> Result<(), ResultCode> {
+    libc_println!("=== v2_mirror_v1_dead_sentinel_hash_mode_fields_correct START ===");
+
+    let db_src = crate::opendb()?;
+    let db_dst = crate::opendb()?;
+
+    // Source: V2-only, V2 wire. Use TEXT PK (hash mode, not skip_hash).
+    db_src.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    db_src.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+    db_src.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+    db_src.db.exec_safe("CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, v TEXT)")?;
+    db_src.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db_src.db.exec_safe("SELECT crsql_as_crr('t')")?;
+    db_src.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db_src.db.exec_safe("INSERT INTO t VALUES ('x', 'hello')")?;
+
+    // Destination: dual-write, V2 wire reception
+    db_dst.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
+    db_dst.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+    db_dst.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+    db_dst.db.exec_safe("CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, v TEXT)")?;
+    db_dst.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db_dst.db.exec_safe("SELECT crsql_as_crr('t')")?;
+    migrate_to_v2(&db_dst.db)?;
+
+    // Sync the INSERT first so the destination has the row and PK mapping.
+    sync_v2_wire(&db_src.db, &db_dst.db, 0)?;
+
+    // Now delete on the source and sync the delete separately.
+    db_src.db.exec_safe("SELECT crsql_set_ts('1800000000')")?;
+    db_src.db.exec_safe("DELETE FROM t WHERE id = 'x'")?;
+
+    // Sync delete from source to destination — triggers v2_to_v1_mirror_metadata with dead sentinel
+    sync_v2_wire(&db_src.db, &db_dst.db, 2)?;
+
+    // Full V1 dead sentinel ↔ V2 tombstone comparison: join the V1 sentinel row
+    // (col_name='-1') to the V2 tombstone by hashed_pk and compare ALL columns
+    // (col_version/cl, db_version, seq, site_id, ts). This catches any column
+    // swap in v1_sentinel_insert_dead, not just the specific C2 swap.
+    let cmp_sql = alloc::format!(
+        "SELECT \
+            v1.col_version, v1.db_version, v1.seq, v1.site_id, v1.ts, \
+            v2.cl, v2.db_version, v2.seq, v2.site_id, v2.ts \
+         FROM t__crsql_clock v1 \
+         JOIN t__crsql_v2_tombstones v2 ON 1=1 \
+         WHERE v1.col_name = '-1'"
+    );
+    let stmt = db_dst.db.prepare_v2(&cmp_sql)?;
+    let mut found_sentinel = false;
+    let mut mismatches = 0;
+    while stmt.step()? == ResultCode::ROW {
+        found_sentinel = true;
+        let v1_cl = stmt.column_int64(0);
+        let v1_dv = stmt.column_int64(1);
+        let v1_seq = stmt.column_int64(2);
+        let v1_site = stmt.column_int64(3);
+        let v1_ts = stmt.column_text(4)?.to_string();
+        let v2_cl = stmt.column_int64(5);
+        let v2_dv = stmt.column_int64(6);
+        let v2_seq = stmt.column_int64(7);
+        let v2_site = stmt.column_int64(8);
+        let v2_ts = stmt.column_int64(9);
+
+        let v1_ts_int: i64 = v1_ts.parse().unwrap_or(-1);
+
+        if v1_cl != v2_cl || v1_dv != v2_dv || v1_seq != v2_seq
+            || v1_site != v2_site || v1_ts_int != v2_ts
+        {
+            mismatches += 1;
+            libc_println!(
+                "  C2 MISMATCH: cl({}/{}) dv({}/{}) seq({}/{}) site({}/{}) ts({}/{})",
+                v1_cl, v2_cl, v1_dv, v2_dv, v1_seq, v2_seq,
+                v1_site, v2_site, v1_ts, v2_ts,
+            );
+        }
+    }
+    assert!(found_sentinel, "C2: should have a dead sentinel in V1 clock after delete mirror");
+    assert_eq!(
+        mismatches, 0,
+        "C2 BUG: V1 dead sentinel must match V2 tombstone for all columns \
+         (cl, db_version, seq, site_id, ts) — found {} mismatches",
+        mismatches
+    );
+
+    libc_println!("=== v2_mirror_v1_dead_sentinel_hash_mode_fields_correct PASS ===");
+    Ok(())
+}
+
+/// Test C3: skip_hash table receiving a V2 hash tombstone (cid='-2') in dual-write
+/// mode must not panic. In normal sync, skip_hash tables emit cid='-1' tombstones,
+/// but a malformed peer could send cid='-2'. The post_v2_merge function calls
+/// v2_lookup_key_and_cl which indexes unpacked_pks[0] without a bounds check.
+/// For skip_hash + V2 hash tombstone, unpacked_pks is None (empty vec), causing a panic.
+fn v2_skip_hash_hash_tombstone_dual_write_no_panic() -> Result<(), ResultCode> {
+    libc_println!("=== v2_skip_hash_hash_tombstone_dual_write_no_panic START ===");
+
+    let db = crate::opendb()?;
+
+    // Destination: dual-write (V2&V1), V2 wire reception, skip_hash table
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+    db.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+    db.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('t', 'skip_hash')")?;
+    migrate_to_v2(&db.db)?;
+
+    // Get the local site_id (to use as the "remote" site_id in the crafted insert)
+    let siteid = {
+        let stmt = db.db.prepare_v2("SELECT crsql_site_id()")?;
+        stmt.step()?;
+        stmt.column_blob(0)?.to_vec()
+    };
+
+    // Craft a V2 hash tombstone (cid='-2') insert for the skip_hash table.
+    // In normal sync, skip_hash tables emit cid='-1', but a malformed peer
+    // could send cid='-2'. This must not panic.
+    let fake_hashed_pk = vec![0u8; 10];
+
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    let stmt = db.db.prepare_v2(
+        "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )?;
+    stmt.bind_text(1, "t", Destructor::STATIC)?;
+    stmt.bind_blob(2, &fake_hashed_pk, Destructor::STATIC)?;
+    stmt.bind_text(3, "-2", Destructor::STATIC)?;
+    stmt.bind_text(4, "", Destructor::STATIC)?;
+    stmt.bind_int64(5, 1)?;
+    stmt.bind_int64(6, 1)?;
+    stmt.bind_blob(7, &siteid, Destructor::STATIC)?;
+    stmt.bind_int64(8, 2)?;
+    stmt.bind_int64(9, 0)?;
+    stmt.bind_int64(10, 1700000000)?;
+
+    // This must not panic. It should either succeed or return an error gracefully.
+    let rc = stmt.step();
+    let _ = db.db.exec_safe("ROLLBACK");
+
+    match rc {
+        Ok(ResultCode::OK) | Ok(ResultCode::DONE) => {}
+        Ok(ResultCode::ERROR) => {}
+        Ok(other) => {
+            libc_println!("  merge returned {:?} (acceptable)", other);
+        }
+        Err(e) => {
+            libc_println!("  merge returned Err({:?}) (acceptable)", e);
+        }
+    }
+
+    libc_println!("=== v2_skip_hash_hash_tombstone_dual_write_no_panic PASS ===");
+    Ok(())
+}
+
+/// Test C4: crsql_incremental_maintenance with chunk_size <= 0 must not drop non-empty tables.
+/// With chunk_size=0, LIMIT 0 deletes nothing, but the code incorrectly treats
+/// "nothing deleted" as "all empty" and drops the tables.
+fn v2_maintenance_chunk_size_zero_no_drop() -> Result<(), ResultCode> {
+    libc_println!("=== v2_maintenance_chunk_size_zero_no_drop START ===");
+
+    let db = crate::opendb()?;
+
+    // Start in dual-write mode with data
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
+    db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (1, 'a')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (2, 'b')")?;
+    db.db.exec_safe("COMMIT")?;
+
+    // Transition to V2-only — queues V1 cleanup tasks
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    db.db.exec_safe("COMMIT")?;
+
+    // Verify V1 clock table has data
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_clock")?;
+        stmt.step()?;
+        let count = stmt.column_int64(0);
+        assert!(count > 0, "V1 clock should have entries before cleanup");
+    }
+
+    // Call maintenance with chunk_size=0 — must NOT drop the non-empty V1 tables
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    {
+        let stmt = db.db.prepare_v2("SELECT crsql_incremental_maintenance(0)")?;
+        stmt.step()?;
+        let rc = stmt.column_int(0);
+        // Should return an error (-1) or a positive remaining count, not 0 (complete).
+        // Returning 0 with chunk_size=0 would mean it dropped the tables.
+        assert!(
+            rc < 0 || rc > 0,
+            "C4 BUG: crsql_incremental_maintenance(0) returned {} — \
+             chunk_size=0 must not declare cleanup complete (tables would be dropped)",
+            rc
+        );
+    }
+    db.db.exec_safe("COMMIT")?;
+
+    // V1 tables must still exist with data
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM sqlite_master WHERE name='foo__crsql_clock'")?;
+        stmt.step()?;
+        assert_eq!(
+            stmt.column_int(0), 1,
+            "C4 BUG: V1 clock table was dropped by maintenance(0) despite being non-empty"
+        );
+    }
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_clock")?;
+        stmt.step()?;
+        let count = stmt.column_int64(0);
+        assert!(count > 0, "C4 BUG: V1 clock table data was lost after maintenance(0)");
+    }
+
+    libc_println!("=== v2_maintenance_chunk_size_zero_no_drop PASS ===");
+    Ok(())
+}
+
+/// Test C5: After 2→1 rollback (metadata-write-version 2→1), incremental maintenance
+/// must not recreate V2 tables that were dropped by cleanup.
+/// The migration loop sees schema_version=V2AndV1 (stale cache), has_v2=false
+/// (post-cleanup), and calls create_v2_tables — recreating dropped tables.
+fn v2_rollback_to_v1_no_recreate_v2_tables() -> Result<(), ResultCode> {
+    libc_println!("=== v2_rollback_to_v1_no_recreate_v2_tables START ===");
+
+    let db = crate::opendb()?;
+
+    // Start in dual-write mode with data
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
+    db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (1, 'a')")?;
+    db.db.exec_safe("COMMIT")?;
+
+    // Verify V2 tables exist
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM sqlite_master WHERE name='foo__crsql_v2_clock'")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 1, "V2 clock table should exist in dual-write mode");
+    }
+
+    // Rollback to V1-only (metadata-write-version 2→1)
+    // This queues V2 cleanup tasks and clears migration markers.
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 1)")?;
+    db.db.exec_safe("COMMIT")?;
+
+    // Run incremental maintenance to process V2 cleanup tasks.
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    for _ in 0..10 {
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        let stmt = db.db.prepare_v2("SELECT crsql_incremental_maintenance(1000)")?;
+        stmt.step()?;
+        if stmt.column_int(0) <= 0 {
+            break;
+        }
+    }
+    db.db.exec_safe("COMMIT")?;
+
+    // V2 tables must NOT exist after rollback + cleanup.
+    // The migration loop must not recreate them.
+    {
+        let stmt = db.db.prepare_v2(
+            "SELECT count(*) FROM sqlite_master WHERE name LIKE 'foo__crsql_v2_%'"
+        )?;
+        stmt.step()?;
+        let count = stmt.column_int(0);
+        assert_eq!(
+            count, 0,
+            "C5 BUG: V2 tables were recreated by maintenance after 2→1 rollback (found {} V2 tables)",
+            count
+        );
+    }
+
+    // V1 tables should still exist (we rolled back to V1-only)
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM sqlite_master WHERE name='foo__crsql_clock'")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int(0), 1, "V1 clock table should still exist after rollback to V1");
+    }
+
+    libc_println!("=== v2_rollback_to_v1_no_recreate_v2_tables PASS ===");
+    Ok(())
+}
+
+/// Helper: full V1↔V2 clock comparison for a table.
+/// Joins V1 per-column clock entries to V2 clock via v2_pks + v2_col_map
+/// and compares all 5 data columns. Returns (total_compared, mismatches).
+fn compare_v1_v2_clocks(
+    db: &dyn Connection,
+    tbl: &str,
+) -> Result<(usize, usize), ResultCode> {
+    let escaped = tbl;
+    let col_id_bits = {
+        let s = db.prepare_v2("SELECT value FROM crsql_master WHERE key = 'crsql_col_id_bits'")?;
+        s.step()?;
+        s.column_int64(0)
+    };
+    let cmp_sql = alloc::format!(
+        "SELECT \
+            v1.col_version, v1.db_version, v1.seq, v1.site_id, v1.ts, \
+            v2.col_version, v2.db_version, v2.seq, v2.site_id, v2.ts, \
+            v1.col_name \
+         FROM \"{escaped}__crsql_clock\" v1 \
+         JOIN \"{escaped}__crsql_v2_pks\" v2p ON v1.key = v2p.__crsql_key \
+         JOIN \"{escaped}__crsql_v2_col_map\" v2m ON v1.col_name = v2m.col_name \
+         JOIN \"{escaped}__crsql_v2_clock\" v2 ON v2.cell_key = (v2p.__crsql_key << {bits}) | v2m.col_id \
+         WHERE v1.col_name != '-1'",
+        escaped = escaped, bits = col_id_bits
+    );
+    let stmt = db.prepare_v2(&cmp_sql)?;
+    let mut total = 0;
+    let mut mismatches = 0;
+    while stmt.step()? == ResultCode::ROW {
+        total += 1;
+        let v1_cv = stmt.column_int64(0);
+        let v1_dv = stmt.column_int64(1);
+        let v1_seq = stmt.column_int64(2);
+        let v1_site = stmt.column_int64(3);
+        let v1_ts = stmt.column_text(4)?.to_string();
+        let v2_cv = stmt.column_int64(5);
+        let v2_dv = stmt.column_int64(6);
+        let v2_seq = stmt.column_int64(7);
+        let v2_site = stmt.column_int64(8);
+        let v2_ts = stmt.column_int64(9);
+        let col_name = stmt.column_text(10)?.to_string();
+
+        let v1_ts_int: i64 = v1_ts.parse().unwrap_or(-1);
+
+        if v1_cv != v2_cv || v1_dv != v2_dv || v1_seq != v2_seq
+            || v1_site != v2_site || v1_ts_int != v2_ts
+        {
+            mismatches += 1;
+            libc_println!(
+                "  CLOCK MISMATCH col_name={}: \
+                 cv({}/{}) dv({}/{}) seq({}/{}) site({}/{}) ts({}/{})",
+                col_name,
+                v1_cv, v2_cv, v1_dv, v2_dv, v1_seq, v2_seq,
+                v1_site, v2_site, v1_ts, v2_ts,
+            );
+        }
+    }
+    Ok((total, mismatches))
+}
+
+/// Test: On-demand hydration — V1 rows exist, enable dual-write mode, NEVER call
+/// incremental migration, then perform a local write on an existing row.
+/// The local write trigger writes to V1 tables. The V2 feed read must hydrate
+/// the row from V1 so the feed can emit V2 wire format.
+fn v2_on_demand_hydration_local_write_and_remote_merge() -> Result<(), ResultCode> {
+    libc_println!("=== v2_on_demand_hydration_local_write_and_remote_merge START ===");
+
+    let db = crate::opendb()?;
+
+    // Step 1: Create a V1 CRR and insert rows (V1-only mode)
+    db.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, v TEXT, w TEXT)")?;
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('t')")?;
+    db.db.exec_safe("INSERT INTO t VALUES (1, 'a', 'x')")?;
+    db.db.exec_safe("INSERT INTO t VALUES (2, 'b', 'y')")?;
+    db.db.exec_safe("COMMIT")?;
+
+    // Verify V1 clock entries exist
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM t__crsql_clock")?;
+        stmt.step()?;
+        assert!(stmt.column_int64(0) > 0, "V1 clock should have entries");
+    }
+
+    // Step 2: Enable dual-write mode but DO NOT call incremental_maintenance.
+    // V2 tables are created by crsql_as_crr in dual-write mode, but existing
+    // V1 rows are NOT migrated to V2. They must be hydrated on-demand.
+    // Note: metadata-use-version and sync-log-version cannot be set to 2 until
+    // migration is complete. We stay on V1 wire — hydration still happens
+    // for V1 wire merges in dual-write mode.
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
+    // use-version and sync-log-version remain 1 (V1 wire) — that's the point:
+    // hydration must work even without completing migration.
+
+    // Verify V2 tables exist but have no data (no migration was run)
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM t__crsql_v2_pks")?;
+        stmt.step()?;
+        let count = stmt.column_int64(0);
+        libc_println!("  V2 pks count after config: {}", count);
+        assert_eq!(count, 0, "V2 pks should be empty (no migration run)");
+    }
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM t__crsql_v2_clock")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int64(0), 0, "V2 clock should be empty (no migration run)");
+    }
+
+    // Step 3: Local write on an existing row (id=1).
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1800000000')")?;
+    db.db.exec_safe("UPDATE t SET v = 'a2' WHERE id = 1")?;
+    db.db.exec_safe("COMMIT")?;
+
+    // V1 clock should have the update.
+    {
+        let stmt = db.db.prepare_v2(
+            "SELECT count(*) FROM t__crsql_clock WHERE col_name = 'v' AND col_version > 1"
+        )?;
+        stmt.step()?;
+        assert!(stmt.column_int64(0) > 0, "V1 clock should have the update for col 'v'");
+    }
+
+    // Step 4: Sync from a V1 wire source to this destination. The merge path
+    // must hydrate row id=1 from V1 → V2 before merging.
+    let db_src = crate::opendb()?;
+    db_src.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, v TEXT, w TEXT)")?;
+    db_src.db.exec_safe("BEGIN")?;
+    db_src.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db_src.db.exec_safe("SELECT crsql_as_crr('t')")?;
+    db_src.db.exec_safe("INSERT INTO t VALUES (3, 'c', 'z')")?;
+    db_src.db.exec_safe("COMMIT")?;
+
+    // Sync from src to dst (V1 wire) — this triggers hydration for existing rows
+    sync_left_to_right(&db_src.db, &db.db, 0)?;
+
+    // After the merge, V2 should have been hydrated for row id=1 (the existing row).
+    {
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM t__crsql_v2_pks")?;
+        stmt.step()?;
+        assert!(stmt.column_int64(0) > 0, "V2 pks should have entries after merge (hydration)");
+    }
+
+    libc_println!("=== v2_on_demand_hydration_local_write_and_remote_merge PASS ===");
+    Ok(())
+}
+
+/// Test: On-demand hydration — V1 rows exist, enable dual-write mode, NEVER call
+/// incremental migration, then accept a remote update for an existing row.
+/// The V2 merge path must hydrate the row from V1 before merging so the CL
+/// comparison is correct. After merge, V1↔V2 clocks must be consistent.
+fn v2_on_demand_hydration_clock_comparison() -> Result<(), ResultCode> {
+    libc_println!("=== v2_on_demand_hydration_clock_comparison START ===");
+
+    let db_src = crate::opendb()?;
+    let db_dst = crate::opendb()?;
+
+    // Source: V1-only (V1 wire emission). The destination is dual-write with V1 wire.
+    db_src.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, v TEXT, w TEXT)")?;
+    db_src.db.exec_safe("BEGIN")?;
+    db_src.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db_src.db.exec_safe("SELECT crsql_as_crr('t')")?;
+    db_src.db.exec_safe("INSERT INTO t VALUES (1, 'a', 'x')")?;
+    db_src.db.exec_safe("COMMIT")?;
+
+    // Destination: V1-only initially, insert the same row independently
+    db_dst.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, v TEXT, w TEXT)")?;
+    db_dst.db.exec_safe("BEGIN")?;
+    db_dst.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db_dst.db.exec_safe("SELECT crsql_as_crr('t')")?;
+    db_dst.db.exec_safe("INSERT INTO t VALUES (1, 'a', 'x')")?;
+    db_dst.db.exec_safe("COMMIT")?;
+
+    // Now enable dual-write on destination but DO NOT migrate.
+    // use-version and sync-log-version stay at 1 (V1 wire) — hydration must
+    // work even without completing migration.
+    db_dst.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
+
+    // V2 should be empty (no migration)
+    {
+        let stmt = db_dst.db.prepare_v2("SELECT count(*) FROM t__crsql_v2_pks")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_int64(0), 0, "V2 pks should be empty before sync");
+    }
+
+    // Source updates the row and syncs to destination via V1 wire.
+    // The V2 merge path must hydrate row id=1 from V1 before merging.
+    db_src.db.exec_safe("SELECT crsql_set_ts('1800000000')")?;
+    db_src.db.exec_safe("UPDATE t SET v = 'a2', w = 'x2' WHERE id = 1")?;
+    sync_left_to_right(&db_src.db, &db_dst.db, 0)?;
+
+    // The merge should have hydrated row id=1 from V1 → V2, then merged the update.
+    {
+        let stmt = db_dst.db.prepare_v2("SELECT count(*) FROM t__crsql_v2_pks")?;
+        stmt.step()?;
+        assert!(stmt.column_int64(0) > 0, "V2 pks should have entries after merge (hydration)");
+    }
+
+    // The base table should reflect the merged update.
+    {
+        let stmt = db_dst.db.prepare_v2("SELECT v, w FROM t WHERE id = 1")?;
+        stmt.step()?;
+        assert_eq!(stmt.column_text(0)?.to_string(), "a2", "base table should have merged value");
+        assert_eq!(stmt.column_text(1)?.to_string(), "x2", "base table should have merged value");
+    }
+
+    // Full V1↔V2 clock comparison: after hydration + merge + mirror, V1 and V2
+    // clock entries must be consistent for all columns.
+    let (total, mismatches) = compare_v1_v2_clocks(&db_dst.db, "t")?;
+    assert!(total > 0, "should have per-column V1 clock entries to compare");
+    assert_eq!(
+        mismatches, 0,
+        "V1↔V2 clock mismatch after on-demand hydration + merge: {} mismatches out of {} entries",
+        mismatches, total
+    );
+
+    libc_println!("=== v2_on_demand_hydration_clock_comparison PASS ===");
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), ResultCode> {
     v2_basic_insert_sync()?;
     v2_update_sync()?;
@@ -2414,5 +3040,12 @@ pub fn run_suite() -> Result<(), ResultCode> {
     v2_cleanup_v1_tables_after_2_to_3_transition()?;
     v2_merge_rejects_rowid_overflow()?;
     v2_hash_tombstone_rejected_in_v1_wire_mode()?;
+    v2_mirror_v1_clock_copy_site_id_ts_not_swapped()?;
+    v2_mirror_v1_dead_sentinel_hash_mode_fields_correct()?;
+    v2_skip_hash_hash_tombstone_dual_write_no_panic()?;
+    v2_maintenance_chunk_size_zero_no_drop()?;
+    v2_rollback_to_v1_no_recreate_v2_tables()?;
+    v2_on_demand_hydration_local_write_and_remote_merge()?;
+    v2_on_demand_hydration_clock_comparison()?;
     Ok(())
 }
