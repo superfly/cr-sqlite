@@ -140,7 +140,7 @@ fn num_bytes_needed_i32(val: i32) -> u8 {
         return 3;
     } else if val & 0x0000FF00 != 0 {
         return 2;
-    } else if val * 0x000000FF != 0 {
+    } else if val & 0x000000FF != 0 {
         return 1;
     } else {
         return 0;

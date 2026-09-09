@@ -132,7 +132,7 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
 
   sqlite3_finalize(pStmt);
   int pv = crsql_fetchPragmaDataVersion(db, pExtData);
-  if (pv == -1 || rc != SQLITE_OK) {
+  if ((pv != 0 && pv != 1) || rc != SQLITE_OK) {
     crsql_freeExtData(pExtData);
     return 0;
   }
@@ -147,11 +147,17 @@ int crsql_initSiteIdExt(sqlite3 *db, crsql_ExtData *pExtData, unsigned char *sit
   int rc = sqlite3_prepare_v3(
       db, "INSERT INTO crsql_site_id (site_id) VALUES (?) RETURNING ordinal",
       -1, SQLITE_PREPARE_PERSISTENT, &(pExtData->pSetSiteIdOrdinalStmt), 0);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
 
   pExtData->pSelectSiteIdOrdinalStmt = 0;
-  rc += sqlite3_prepare_v3(
+  rc = sqlite3_prepare_v3(
       db, "SELECT ordinal FROM crsql_site_id WHERE site_id = ?", -1,
       SQLITE_PREPARE_PERSISTENT, &(pExtData->pSelectSiteIdOrdinalStmt), 0);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
 
   return rc;
 }
@@ -251,17 +257,22 @@ int crsql_fetchPragmaSchemaVersion(sqlite3 *db, crsql_ExtData *pExtData,
 
     return 0;
   } else {
-    sqlite3_reset(pExtData->pPragmaSchemaVersionStmt);
+    int finalizeRc = sqlite3_reset(pExtData->pPragmaSchemaVersionStmt);
+    if (rc == SQLITE_DONE) {
+      return finalizeRc;
+    }
+    return rc;
   }
-
-  return -1;
 }
 
 int crsql_fetchPragmaDataVersion(sqlite3 *db, crsql_ExtData *pExtData) {
   int rc = sqlite3_step(pExtData->pPragmaDataVersionStmt);
   if (rc != SQLITE_ROW) {
-    sqlite3_reset(pExtData->pPragmaDataVersionStmt);
-    return -1;
+    int finalizeRc = sqlite3_reset(pExtData->pPragmaDataVersionStmt);
+    if (rc == SQLITE_DONE) {
+      return finalizeRc;
+    }
+    return rc;
   }
 
   int version = sqlite3_column_int(pExtData->pPragmaDataVersionStmt, 0);

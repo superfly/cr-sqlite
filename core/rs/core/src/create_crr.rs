@@ -83,15 +83,18 @@ fn create_crr_inner(
     // when upgrading stuff to CRRs
     let mut table_info = pull_table_info(db, table, err)?;
 
-    let metadata_write_version = get_metadata_write_version(db);
+    let metadata_write_version = get_metadata_write_version(db, err)?;
 
     // Resolve use_rowid: as_crr arg takes precedence, then schema directive, then auto.
     // Some(true)  = force rowid-key mode (caller guarantees rowids < MAX_ROWID_KEY)
     // Some(false) = force non-rowid-key mode
     // None        = auto-detect (default for INTEGER PK is non-rowid)
-    let use_rowid_resolved = use_rowid.or_else(|| {
-        crate::schema_directive::read_use_rowid_directive_opt(db, table).unwrap_or(None)
-    });
+    let use_rowid_directive = crate::schema_directive::read_use_rowid_directive_opt(db, table)
+        .map_err(|e| {
+            err.set(&format!("directive read error: {}", e));
+            e
+        })?;
+    let use_rowid_resolved = use_rowid.or(use_rowid_directive);
 
     // Override key_is_rowid based on the resolved use_rowid preference.
     // This only matters on first registration — subsequent pull_table_info calls
@@ -137,8 +140,16 @@ fn create_crr_inner(
             // Recompute skip_hash_pk_col — it was empty because pull_table_info
             // ran before the flag override.
             table_info.skip_hash_pk_col = crate::util::escape_ident(&table_info.pks[0].name);
+        } else {
+            // Composite PK: skip_hash is not supported — return an error
+            // rather than silently ignoring the flag.
+            err.set(&format!(
+                "skip_hash is only supported on tables with a single primary key column. \
+                Table '{table}' has {} primary key columns.",
+                table_info.pks.len()
+            ));
+            return Err(ResultCode::ERROR);
         }
-        // Composite PK: silently ignore — skip_hash stays false.
     }
 
     // Persist skip_hash preference so migration path and subsequent pull_table_info
@@ -149,7 +160,11 @@ fn create_crr_inner(
     // Only persist if there was an explicit directive or flag (not just auto-qualified).
     // For auto-qualified tables, the auto rule will re-apply on reload.
     // For explicitly enabled/disabled tables, we need to persist.
-    let directive = crate::schema_directive::read_skip_hash_directive_opt(db, table).unwrap_or(None);
+    let directive = crate::schema_directive::read_skip_hash_directive_opt(db, table)
+        .map_err(|e| {
+            err.set(&format!("directive read error: {}", e));
+            e
+        })?;
     if directive.is_some() || skip_hash_flag {
         unsafe { crate::util::set_master_value(db, &format!("skip_hash_{}", table), skip_hash_val as i64) }?;
     }
@@ -265,9 +280,17 @@ fn validate_rowid_range(
 
 /// Read the persisted metadata-write-version config from crsql_master.
 /// Returns METADATA_WRITE_VERSION_DEFAULT (1) if not set or table doesn't exist.
-fn get_metadata_write_version(db: *mut sqlite::sqlite3) -> core::ffi::c_int {
+/// Propagates errors from the underlying read instead of silently defaulting.
+fn get_metadata_write_version(
+    db: *mut sqlite::sqlite3,
+    err: *mut *mut c_char,
+) -> Result<core::ffi::c_int, ResultCode> {
     match unsafe { crate::util::get_master_value(db, "config.metadata-write-version") } {
-        Ok(Some(v)) => v as core::ffi::c_int,
-        _ => config::METADATA_WRITE_VERSION_DEFAULT,
+        Ok(Some(v)) => Ok(v as core::ffi::c_int),
+        Ok(None) => Ok(config::METADATA_WRITE_VERSION_DEFAULT),
+        Err(e) => {
+            err.set(&format!("metadata write version read error: {}", e));
+            Err(e)
+        }
     }
 }

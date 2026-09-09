@@ -132,7 +132,7 @@ extern "C" {
     pub fn crsql_initSiteIdExt(
         db: *mut sqlite::sqlite3,
         pExtData: *mut crsql_ExtData,
-        siteIdBuffer: *mut c_char,
+        siteIdBuffer: *mut ::core::ffi::c_uchar,
     ) -> c_int;
     pub fn crsql_freeExtData(pExtData: *mut crsql_ExtData);
     pub fn crsql_finalize(pExtData: *mut crsql_ExtData);

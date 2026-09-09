@@ -147,7 +147,6 @@ fn rebuild_outer_idx_str(
     other_clauses: &[&PlanConstraint],
     order_by_cols: &[CrsqlChangesColumn],
     order_by_descs: &[bool],
-    has_order_by: bool,
 ) -> String {
     let mut str = String::new();
 
@@ -163,7 +162,7 @@ fn rebuild_outer_idx_str(
     }
 
     // ORDER BY: replace seq with _seq_order for packed mode
-    if has_order_by && !order_by_cols.is_empty() {
+    if !order_by_cols.is_empty() {
         str.push_str(" ORDER BY ");
         let cols: Vec<String> = order_by_cols
             .iter()
@@ -687,7 +686,7 @@ pub fn changes_union_query(
     let has_cval = query_has_cval(metadata_use_version);
 
     // Read the binary plan from idx_str (allocated by changes_best_index).
-    let (constraints, order_by_col_ids, order_by_descs, has_order_by) =
+    let (constraints, order_by_col_ids, order_by_descs) =
         unsafe { read_idx_plan(idx_str) };
 
     // Reject LIKE/MATCH/GLOB/REGEXP on all crsql_changes columns. These ops
@@ -745,7 +744,6 @@ pub fn changes_union_query(
             &other_constraints,
             &order_by_col_ids,
             &order_by_descs,
-            has_order_by,
         );
         (pushed, outer)
     } else {
@@ -761,7 +759,7 @@ pub fn changes_union_query(
             outer.push_str("WHERE ");
             outer.push_str(&clauses.join(" AND "));
         }
-        if has_order_by && !order_by_col_ids.is_empty() {
+        if !order_by_col_ids.is_empty() {
             outer.push_str(" ORDER BY ");
             let cols: Vec<String> = order_by_col_ids
                 .iter()

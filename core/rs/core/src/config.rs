@@ -585,9 +585,23 @@ fn is_cleanup_complete(db: *mut sqlite_nostd::sqlite3) -> Result<bool, ResultCod
 /// Check if the database has no existing CRR tables.
 /// Used to determine if a direct 1->3 (V2-only) transition is safe.
 fn has_no_crr_tables(db: *mut sqlite_nostd::sqlite3) -> Result<bool, ResultCode> {
-    let sql = "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE '%__crsql_itrig'\0";
-    let stmt = db.prepare_v2(sql)?;
-    stmt.step()?;
-    let count = stmt.column_int64(0);
-    Ok(count == 0)
+    // Check for all three CRR trigger types. A table is a CRR if any of the
+    // insert, update, or delete triggers exist — partial trigger state should
+    // not be treated as "no CRR tables."
+    let trigger_suffixes = ["__crsql_itrig", "__crsql_utrig", "__crsql_dtrig"];
+    for suffix in &trigger_suffixes {
+        let sql = "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE ?\0";
+        let stmt = db.prepare_v2(sql)?;
+        stmt.bind_text(
+            1,
+            &format!("%{}", suffix),
+            sqlite::Destructor::TRANSIENT,
+        )?;
+        stmt.step()?;
+        let count = stmt.column_int64(0);
+        if count > 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }

@@ -64,6 +64,8 @@ static int changesConnect(sqlite3 *db, void *pAux, int argc,
 static int changesDisconnect(sqlite3_vtab *pVtab) {
   crsql_Changes_vtab *p = (crsql_Changes_vtab *)pVtab;
   // ext data is free by other registered extensions
+  sqlite3_free(p->base.zErrMsg);
+  p->base.zErrMsg = 0;
   sqlite3_free(p);
   return SQLITE_OK;
 }

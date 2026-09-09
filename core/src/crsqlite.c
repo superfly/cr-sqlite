@@ -62,6 +62,10 @@ __declspec(dllexport)
   // methods are not isntalled when we start calling rust
   crsql_ExtData *pExtData = sqlite3_crsqlrustbundle_init(db, pzErrMsg, pApi);
   if (pExtData == 0) {
+    if (pzErrMsg != 0 && *pzErrMsg == 0) {
+      *pzErrMsg = sqlite3_mprintf(
+          "crsqlrustbundle_init failed to initialize extension data");
+    }
     return SQLITE_ERROR;
   }
 

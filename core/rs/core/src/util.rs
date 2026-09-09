@@ -136,7 +136,12 @@ pub fn as_identifier_list(
 }
 
 pub fn escape_ident(ident: &str) -> String {
-    return ident.replace("\"", "\"\"");
+    // NUL bytes would truncate the identifier when passed to SQLite as a C string,
+    // enabling identifier injection. Reject them.
+    if ident.contains('\0') {
+        return String::new();
+    }
+    ident.replace("\"", "\"\"")
 }
 
 pub fn escape_ident_as_value(ident: &str) -> String {

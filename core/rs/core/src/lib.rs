@@ -182,6 +182,14 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         return null_mut();
     }
 
+    let set_err_msg = |msg: &str| {
+        if !err_msg.is_null() {
+            if let Ok(cstring) = alloc::ffi::CString::new(msg) {
+                unsafe { *err_msg = cstring.into_raw(); }
+            }
+        }
+    };
+
     let rc = db
         .create_function_v2(
             "crsql_set_debug",
@@ -195,6 +203,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(sqlite::ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_set_debug function");
         return null_mut();
     }
 
@@ -211,6 +220,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(sqlite::ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_pack_columns function");
         return null_mut();
     }
 
@@ -227,31 +237,37 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(sqlite::ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_as_table function");
         return null_mut();
     }
 
     let rc = unpack_columns_vtab::create_module(db).unwrap_or(sqlite::ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create unpack_columns virtual table module");
         return null_mut();
     }
 
     let rc = create_cl_set_vtab::create_module(db).unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create cl_set virtual table module");
         return null_mut();
     }
 
     let rc = crate::bootstrap::crsql_init_peer_tracking_table(db);
     if rc != ResultCode::OK as c_int {
+        set_err_msg("cr-sqlite: failed to initialize peer tracking table");
         return null_mut();
     }
 
     let rc = crate::bootstrap::crsql_init_db_versions_table(db);
     if rc != ResultCode::OK as c_int {
+        set_err_msg("cr-sqlite: failed to initialize db versions table");
         return null_mut();
     }
 
     let sync_bit_ptr = sqlite::malloc(mem::size_of::<c_int>()) as *mut c_int;
     if sync_bit_ptr.is_null() {
+        set_err_msg("cr-sqlite: out of memory allocating sync bit");
         return null_mut();
     }
     unsafe {
@@ -272,11 +288,13 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(sqlite::ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_internal_sync_bit function");
         return null_mut();
     }
 
     let rc = crate::bootstrap::crsql_maybe_update_db(db, err_msg);
     if rc != ResultCode::OK as c_int {
+        set_err_msg("cr-sqlite: failed to update database schema");
         return null_mut();
     }
 
@@ -284,6 +302,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     // pointer to be available for the crsql_update_site_id function.
     let ext_data = unsafe { crsql_newExtData(db) };
     if ext_data.is_null() {
+        set_err_msg("cr-sqlite: failed to allocate extension data");
         return null_mut();
     }
 
@@ -303,6 +322,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_update_site_id function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -314,20 +334,23 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     // automatically.
 
     let site_id_buffer =
-        sqlite::malloc((consts::SITE_ID_LEN as usize) * mem::size_of::<*const c_char>());
+        sqlite::malloc(consts::SITE_ID_LEN as usize);
     if site_id_buffer.is_null() {
+        set_err_msg("cr-sqlite: out of memory allocating site id buffer");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
     let rc = crate::bootstrap::crsql_init_site_id(db, site_id_buffer);
     if rc != ResultCode::OK as c_int {
+        set_err_msg("cr-sqlite: failed to initialize site id");
         sqlite::free(site_id_buffer as *mut c_void);
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
-    let rc = unsafe { crsql_initSiteIdExt(db, ext_data, site_id_buffer as *mut c_char) };
+    let rc = unsafe { crsql_initSiteIdExt(db, ext_data, site_id_buffer as *mut core::ffi::c_uchar) };
     if rc != ResultCode::OK as c_int {
+        set_err_msg("cr-sqlite: failed to initialize site id extension data");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -336,6 +359,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         // crsql_initSiteIdExt transferred ownership of site_id_buffer to
         // ext_data->siteId, so crsql_freeExtData will free it. Do NOT
         // separately free site_id_buffer here (would double-free).
+        set_err_msg("cr-sqlite: failed to create site id triggers");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -353,6 +377,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_site_id function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -370,6 +395,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_db_version function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -387,6 +413,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_next_db_version function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -404,6 +431,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_peek_next_db_version function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -421,6 +449,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_sha function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -438,6 +467,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_version function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -455,6 +485,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_increment_and_get_seq function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -472,6 +503,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_get_seq function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -489,6 +521,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_as_crr function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -506,6 +539,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_set_ts function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -523,6 +557,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_change_wins function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -538,6 +573,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         None,
         None,
     ) {
+        set_err_msg("cr-sqlite: failed to create crsql_cache_site_ordinal function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -553,6 +589,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         None,
         None,
     ) {
+        set_err_msg("cr-sqlite: failed to create crsql_cache_pk_cl function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -568,6 +605,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         None,
         None,
     ) {
+        set_err_msg("cr-sqlite: failed to create crsql_cache_db_version function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -585,6 +623,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_set_db_version function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -602,6 +641,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_get_ts function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -619,6 +659,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_begin_alter function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -636,6 +677,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_commit_alter function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -653,6 +695,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_finalize function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -670,6 +713,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_after_update function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -687,6 +731,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_after_insert function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -704,6 +749,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_after_delete function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -721,6 +767,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_rows_impacted function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -738,6 +785,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(sqlite::ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_config_set function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -755,6 +803,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(sqlite::ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_config_get function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -773,6 +822,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_hash_pk function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -790,6 +840,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_pack_agg function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -807,6 +858,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_pack_varint_agg function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -825,6 +877,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_incremental_maintenance function");
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -1379,11 +1432,19 @@ unsafe extern "C" fn x_crsql_db_version(
 ) {
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
     let db = ctx.db_handle();
-    let mut err_msg = null_mut();
+    let mut err_msg: *mut c_char = null_mut();
     let rc = crsql_fill_db_version_if_needed(db, ext_data, &mut err_msg as *mut _);
     if rc != ResultCode::OK as c_int {
-        // TODO: pass err_msg!
-        ctx.result_error("failed to fill db version");
+        let error_str = if !err_msg.is_null() {
+            let s = unsafe { CStr::from_ptr(err_msg) }.to_string_lossy();
+            unsafe {
+                drop(alloc::ffi::CString::from_raw(err_msg));
+            }
+            s
+        } else {
+            Cow::Borrowed("failed to fill db version")
+        };
+        ctx.result_error(&format!("failed to fill db version: {}", error_str));
         return;
     }
     sqlite::result_int64(ctx, (*ext_data).dbVersion);
@@ -1406,12 +1467,20 @@ unsafe extern "C" fn x_crsql_next_db_version(
 ) {
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
     let db = ctx.db_handle();
-    let mut err_msg = null_mut();
+    let mut err_msg: *mut c_char = null_mut();
 
     let ret = crsql_next_db_version(db, ext_data, &mut err_msg as *mut _);
     if ret < 0 {
-        // TODO: use err_msg!
-        ctx.result_error("Unable to determine the next db version");
+        let error_str = if !err_msg.is_null() {
+            let s = unsafe { CStr::from_ptr(err_msg) }.to_string_lossy();
+            unsafe {
+                drop(alloc::ffi::CString::from_raw(err_msg));
+            }
+            s
+        } else {
+            Cow::Borrowed("Unable to determine the next db version")
+        };
+        ctx.result_error(&format!("Unable to determine the next db version: {}", error_str));
         return;
     }
 
@@ -1465,12 +1534,20 @@ unsafe extern "C" fn x_crsql_peek_next_db_version(
 ) {
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
     let db = ctx.db_handle();
-    let mut err_msg = null_mut();
+    let mut err_msg: *mut c_char = null_mut();
 
     let ret = crsql_peek_next_db_version(db, ext_data, &mut err_msg as *mut _);
     if ret < 0 {
-        // TODO: use err_msg!
-        ctx.result_error("Unable to determine the next db version");
+        let error_str = if !err_msg.is_null() {
+            let s = unsafe { CStr::from_ptr(err_msg) }.to_string_lossy();
+            unsafe {
+                drop(alloc::ffi::CString::from_raw(err_msg));
+            }
+            s
+        } else {
+            Cow::Borrowed("Unable to determine the next db version")
+        };
+        ctx.result_error(&format!("Unable to determine the next db version: {}", error_str));
         return;
     }
 

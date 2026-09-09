@@ -203,7 +203,7 @@ def test_merging_on_defaults():
     # db1 into db2
     # db2 should still win w. no db version change since no write happened
     site_id = get_site_id(db2)
-    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 1, 1, site_id, 1, 0, '0')])
+    assert (changes == [('foo', b'\x01\t\x01', 'b', 2, 1, 1, site_id, 1, 0, '1700000000')])
 
     # test merging from thing without records (db1) to thing with records (db2)
 

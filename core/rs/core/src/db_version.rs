@@ -123,7 +123,7 @@ pub fn fill_db_version_if_needed(
 ) -> Result<ResultCode, String> {
     unsafe {
         let rc = crsql_fetchPragmaDataVersion(db, ext_data);
-        if rc == -1 {
+        if rc != 0 && rc != 1 {
             return Err("failed to fetch PRAGMA data_version".to_string());
         }
         if (*ext_data).dbVersion != -1 && rc == 0 {
