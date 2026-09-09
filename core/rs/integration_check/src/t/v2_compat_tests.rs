@@ -3006,6 +3006,86 @@ fn v2_on_demand_hydration_clock_comparison() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// Test H5: Backfill must assign one db_version per row, not per cell.
+/// When a table with existing data is registered as a CRR, backfill writes
+/// clock entries for each non-PK column. All cells of the same row must
+/// share the same db_version so the row can be synced as one atomic change.
+fn v2_backfill_db_version_per_row_not_per_cell() -> Result<(), ResultCode> {
+    libc_println!("=== v2_backfill_db_version_per_row_not_per_cell START ===");
+
+    let db = crate::opendb()?;
+
+    // Create a table with multiple non-PK columns and insert data BEFORE
+    // registering as CRR — this triggers backfill.
+    db.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, a TEXT, b TEXT, c TEXT)")?;
+    db.db.exec_safe("INSERT INTO t VALUES (1, 'a1', 'b1', 'c1')")?;
+    db.db.exec_safe("INSERT INTO t VALUES (2, 'a2', 'b2', 'c2')")?;
+
+    // Register as CRR — triggers backfill of existing rows.
+    // Use V2 mode so backfill_v2 runs.
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('t')")?;
+    db.db.exec_safe("COMMIT")?;
+
+    // Check that all cells of row id=1 share the same db_version.
+    // cell_key = (key << col_id_bits) | col_id, so we group by key.
+    let col_id_bits = {
+        let s = db.db.prepare_v2("SELECT value FROM crsql_master WHERE key = 'crsql_col_id_bits'")?;
+        s.step()?;
+        s.column_int64(0)
+    };
+    let sql = alloc::format!(
+        "SELECT \
+            (cell_key >> {bits}) AS row_key, \
+            db_version, \
+            count(*) AS cell_count \
+         FROM t__crsql_v2_clock \
+         GROUP BY row_key, db_version \
+         ORDER BY row_key, db_version",
+        bits = col_id_bits
+    );
+    let stmt = db.db.prepare_v2(&sql)?;
+
+    // Collect (row_key, db_version, cell_count) tuples.
+    let mut rows: Vec<(i64, i64, i64)> = Vec::new();
+    while stmt.step()? == ResultCode::ROW {
+        rows.push((
+            stmt.column_int64(0),
+            stmt.column_int64(1),
+            stmt.column_int64(2),
+        ));
+    }
+
+    // We expect 2 rows (id=1, id=2), each with 3 cells (a, b, c).
+    // If backfill assigns db_version per cell, each row would have 3
+    // distinct db_version groups with cell_count=1 each.
+    // If per row, each row has 1 db_version group with cell_count=3.
+    let mut per_row_groups = 0;
+    let mut per_cell_groups = 0;
+    for (row_key, _db_version, cell_count) in &rows {
+        if *cell_count == 3 {
+            per_row_groups += 1;
+        } else if *cell_count == 1 {
+            per_cell_groups += 1;
+        }
+    }
+
+    libc_println!("  clock groups: {:?}", rows);
+
+    assert_eq!(
+        per_row_groups, 2,
+        "H5: expected 2 row groups (one per row) with 3 cells each, \
+         but found {} per-row groups and {} per-cell groups. \
+         Backfill is assigning db_version per cell instead of per row.",
+        per_row_groups, per_cell_groups
+    );
+
+    libc_println!("=== v2_backfill_db_version_per_row_not_per_cell PASS ===");
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), ResultCode> {
     v2_basic_insert_sync()?;
     v2_update_sync()?;
@@ -3047,5 +3127,6 @@ pub fn run_suite() -> Result<(), ResultCode> {
     v2_rollback_to_v1_no_recreate_v2_tables()?;
     v2_on_demand_hydration_local_write_and_remote_merge()?;
     v2_on_demand_hydration_clock_comparison()?;
+    v2_backfill_db_version_per_row_not_per_cell()?;
     Ok(())
 }

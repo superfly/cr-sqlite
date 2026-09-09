@@ -93,6 +93,10 @@ pub struct TableInfo {
     /// Empty for V1 tables or when v2_col_map doesn't exist yet.
     pub col_map: Vec<(i64, String)>,
 
+    /// True when the table is declared WITHOUT ROWID.
+    /// Used to guard key_is_rowid — WITHOUT ROWID tables have no rowid.
+    pub is_without_rowid: bool,
+
     // Lookaside --
     // insert returning?
     // select?
@@ -1182,7 +1186,7 @@ pub fn pull_table_info(
     let mut key_is_rowid = false;
 
     // Detect V2 metadata tables
-    let has_v2 = crate::bootstrap_v2::has_v2_tables(db, table).unwrap_or(false);
+    let has_v2 = crate::bootstrap_v2::has_v2_tables(db, table)?;
 
     // Load col_map from v2_col_map for V2 tables (used by feed query CASE expression)
     let col_map: Vec<(i64, String)> = if has_v2 {
@@ -1288,7 +1292,11 @@ pub fn pull_table_info(
     .map(|v| v == 1);
 
     if let Some(force_rowid) = persisted_use_rowid {
-        key_is_rowid = force_rowid;
+        // Guard: WITHOUT ROWID tables have no stable rowid, even with INTEGER PK.
+        // The rowid is an alias for the PK in a regular table, but WITHOUT ROWID
+        // tables don't have a rowid at all — using key_is_rowid would generate
+        // invalid SQL like NEW."" or fail to map OLD.pk to __crsql_key.
+        key_is_rowid = force_rowid && !is_without_rowid;
     } else {
         // Auto-detect: only use rowid-key mode for INTEGER PRIMARY KEY tables.
         // INTEGER PK is a rowid alias — the rowid IS the PK value, so it's stable.
@@ -1326,6 +1334,7 @@ pub fn pull_table_info(
         skip_hash,
         skip_hash_pk_col,
         col_map,
+        is_without_rowid,
         set_winner_clock_stmt: RefCell::new(None),
         local_cl_stmt: RefCell::new(None),
         col_version_stmt: RefCell::new(None),

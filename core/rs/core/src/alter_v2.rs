@@ -68,7 +68,13 @@ unsafe fn compact_post_alter_v2(
         crate::backfill_v2::backfill_table_v2(db, tbl_name_str, &tbl_info.pks, &tbl_info.non_pks, tbl_info.key_is_rowid, &tbl_info.rowid_alias, tbl_info.skip_hash, false)?;
     } else {
         // Sync col_map with current schema
-        sync_col_map_v2(db, &escaped, tbl_info)?
+        sync_col_map_v2(db, &escaped, tbl_info)?;
+        // Force a full table info re-pull on the next ensure call.
+        // sync_col_map_v2 mutates v2_col_map data (not a schema change), so
+        // crsql_ensure_table_infos_are_up_to_date would not re-pull. Resetting
+        // the pragma version to 0 ensures the next call detects a "change"
+        // and re-pulls all table infos, including the updated col_map.
+        unsafe { (*ext_data).pragmaSchemaVersionForTableInfos = 0; }
     }
 
     Ok(ResultCode::OK)

@@ -44,7 +44,7 @@ pub fn create_crr(
     // because corrosion only calls crsql_as_crr once per table (during schema apply),
     // never re-calling it on an existing CRR.
     if !is_commit_alter {
-        let has_v2 = crate::bootstrap_v2::has_v2_tables(db, table).unwrap_or(false);
+        let has_v2 = crate::bootstrap_v2::has_v2_tables(db, table)?;
         if !has_v2 {
             unsafe { crate::util::clear_crr_mode_flags(db, table); }
         } else {
@@ -84,14 +84,22 @@ pub fn create_crr(
     // will infer from the persisted flag.
     match use_rowid_resolved {
         Some(true) => {
-            // Force rowid-key mode. Only allowed for INTEGER PRIMARY KEY tables —
-            // implicit rowids (tables without INTEGER PK) are unstable and can be
-            // renumbered by VACUUM, making them unsafe as persistent keys.
+            // Force rowid-key mode. Only allowed for INTEGER PRIMARY KEY tables
+            // that are not WITHOUT ROWID — implicit rowids (tables without
+            // INTEGER PK) are unstable and can be renumbered by VACUUM, and
+            // WITHOUT ROWID tables have no rowid at all.
             if !table_info.has_integer_pk {
                 err.set(&format!(
                     "use_rowid=1 is only allowed on INTEGER PRIMARY KEY tables. \
                     Table '{table}' does not have an INTEGER PRIMARY KEY — \
                     its implicit rowid is unstable under VACUUM and cannot be used as a persistent key."
+                ));
+                return Err(ResultCode::ERROR);
+            }
+            if table_info.is_without_rowid {
+                err.set(&format!(
+                    "use_rowid=1 is not allowed on WITHOUT ROWID tables. \
+                    Table '{table}' is WITHOUT ROWID — it has no stable rowid to use as a key."
                 ));
                 return Err(ResultCode::ERROR);
             }

@@ -398,7 +398,8 @@ unsafe fn cleanup_tables_chunk(
             Ok(remaining)
         }
         Err(e) => {
-            db.exec_safe("ROLLBACK")?;
+            db.exec_safe("ROLLBACK TO SAVEPOINT cleanup_chunk")?;
+            db.exec_safe("RELEASE cleanup_chunk")?;
             Err(e)
         }
     }

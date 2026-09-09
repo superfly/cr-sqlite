@@ -481,7 +481,7 @@ unsafe fn post_v2_merge(
 ) -> Result<(), ResultCode> {
     // Update db_version tracking
     if !insert_site_id.is_empty() {
-        let _ = insert_db_version(ext_data, insert_site_id, insert_db_vrsn);
+        insert_db_version(ext_data, insert_site_id, insert_db_vrsn)?;
     }
     // Dual-write: copy V2 metadata to V1 metadata tables
     let mwv = unsafe { (*ext_data).metadataWriteVersion };
@@ -489,7 +489,7 @@ unsafe fn post_v2_merge(
         let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
         let (v2_key_opt, v2_cl) =
             v2_lookup_key_and_cl(db, &escaped, tbl_info, hashed_pk, unpacked_pks.unwrap_or(&Vec::new()), ext_data).unwrap_or((None, 0));
-        let _ = v2_to_v1_mirror_metadata(
+        v2_to_v1_mirror_metadata(
             db,
             ext_data,
             tbl_info,
@@ -497,7 +497,7 @@ unsafe fn post_v2_merge(
             hashed_pk,
             v2_key_opt,
             v2_cl,
-        );
+        )?;
     }
     Ok(())
 }
@@ -632,7 +632,7 @@ unsafe fn merge_insert(
             insert_site_id,
             insert_cl,
             insert_seq_raw,
-            insert_ts_raw,
+            insert_ts,
             rowid,
             tbl_info_index,
             errmsg,
@@ -756,6 +756,8 @@ unsafe fn merge_insert(
             insert_ts,
             sentinel_col_vrsn,
             sentinel_seq,
+            rowid,
+            tbl_info_index,
         )
     };
 
@@ -1406,8 +1408,8 @@ unsafe fn v2_merge_insert_tombstone(
     insert_cl: sqlite::int64,
     insert_seq: sqlite::int64,
     insert_ts: sqlite::int64,
-    _rowid: *mut sqlite::int64,
-    _tbl_info_index: usize,
+    rowid: *mut sqlite::int64,
+    tbl_info_index: usize,
     errmsg: *mut *mut c_char,
 ) -> Result<ResultCode, ResultCode> {
     let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
@@ -1433,6 +1435,9 @@ unsafe fn v2_merge_insert_tombstone(
     if insert_cl < local_cl {
         return Ok(ResultCode::OK);
     }
+
+    // Track whether any statement actually modified data.
+    let mut impacted = false;
 
     // V2 hash tombstone for a completely unknown row (no v2_pks, no v2_tombstones):
     // we can't emit this delete in V1 wire format because we have no PK values for
@@ -1478,6 +1483,10 @@ unsafe fn v2_merge_insert_tombstone(
             stmt.bind_blob(7, insert_site_id, sqlite::Destructor::STATIC)?;
         }
         stmt.step()?;
+        let ch = db.changes64();
+        if ch > 0 {
+            impacted = true;
+        }
     }
 
     // If the row was alive, nuke its local state (clocks, v2_pks, base table row).
@@ -1509,6 +1518,18 @@ unsafe fn v2_merge_insert_tombstone(
 
         // Nuke clocks, v2_pks, and base table row
         v2_nuke_local_row(db, ext_data, &escaped, local_key, &local_pks, tbl_info)?;
+        let ch = db.changes64();
+        if ch > 0 {
+            impacted = true;
+        }
+    }
+
+    // Set *rowid for impactful merges (see v2_packed_merge for rationale).
+    if impacted {
+        (*ext_data).rowsImpacted += 1;
+        if !rowid.is_null() {
+            *rowid = slab_rowid(tbl_info_index as i32, 1);
+        }
     }
 
     Ok(ResultCode::OK)
@@ -1555,6 +1576,8 @@ unsafe fn v2_packed_merge(
     ts: i64,
     sentinel_col_vrsn: Option<i64>,
     sentinel_seq: Option<i64>,
+    rowid: *mut sqlite::int64,
+    tbl_info_index: usize,
 ) -> Result<ResultCode, ResultCode> {
     // ts check is done at the top of merge_insert
     let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
@@ -1568,8 +1591,12 @@ unsafe fn v2_packed_merge(
         db_vrsn, site_ordinal,
     )? {
         Some(result) => result,
-        None => return Ok(ResultCode::OK), // stale CL
+        None => return Ok(ResultCode::OK), // stale CL — no-op, *rowid stays 0
     };
+
+    // Track whether any upsert actually modified data.
+    // We use changes() after each statement to detect if rows were impacted.
+    let mut impacted = false;
 
     // Apply each column change.
     // The upsert in v2_apply_value_change_colval handles conflict resolution:
@@ -1581,6 +1608,10 @@ unsafe fn v2_packed_merge(
             &unpacked_vals[i], col_vrsns[i], db_vrsn, site_id, seqs[i], ts,
             unpacked_pks, col_id_bits,
         )?;
+        let ch = db.changes64();
+        if ch > 0 {
+            impacted = true;
+        }
     }
 
     // PK-only tables: create/merge sentinel clock entry at col_id=0.
@@ -1615,6 +1646,23 @@ unsafe fn v2_packed_merge(
             stmt.bind_blob(7, site_id, sqlite::Destructor::STATIC)?;
         }
         stmt.step()?;
+        let ch = db.changes64();
+        if ch > 0 {
+            impacted = true;
+        }
+    }
+
+    // Set *rowid for impactful merges so callers (e.g., corrosion's sync path
+    // using RETURNING last_insert_rowid()) can distinguish impactful merges
+    // from no-ops. *rowid == 0 means no-op, non-zero means impactful.
+    if impacted {
+        (*ext_data).rowsImpacted += 1;
+        if !rowid.is_null() {
+            // Use a synthetic non-zero rowid encoded with the table index.
+            // The actual value doesn't matter as long as it's non-zero for
+            // impactful merges and zero for no-ops.
+            *rowid = slab_rowid(tbl_info_index as i32, 1);
+        }
     }
 
     Ok(ResultCode::OK)
