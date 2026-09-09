@@ -149,7 +149,8 @@ pub fn backfill_table_v2(
 
     if let Err(e) = result {
         if !no_tx {
-            db.exec_safe("ROLLBACK")?;
+            db.exec_safe("ROLLBACK TO SAVEPOINT backfill_v2")?;
+            db.exec_safe("RELEASE backfill_v2")?;
         }
         return Err(e);
     }
