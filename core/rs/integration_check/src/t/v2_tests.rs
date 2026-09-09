@@ -1688,6 +1688,67 @@ fn test_dual_write_wire_convergence() -> Result<(), ResultCode> {
 
         let has_src_site = sites.iter().any(|s| s.as_slice() == src_site_id.as_slice());
         assert!(has_src_site, "{}: V1 clock should contain source site_id (remote sync), not just local", label);
+
+        // Full V1↔V2 clock comparison: join V1 per-column clock entries to their
+        // V2 counterparts and compare ALL columns (col_version, db_version, seq,
+        // site_id, ts). This catches any column swap in v1_clock_copy, not just
+        // site_id/ts (C1). The join maps:
+        //   V1.key → v2_pks.__crsql_key
+        //   V1.col_name → v2_col_map.col_name → col_id
+        //   V2 cell_key = (v2_pks.__crsql_key << col_id_bits) | col_id
+        let col_id_bits = {
+            let s = db.prepare_v2("SELECT value FROM crsql_master WHERE key = 'crsql_col_id_bits'")?;
+            s.step()?;
+            s.column_int64(0)
+        };
+        let cmp_sql = alloc::format!(
+            "SELECT \
+                v1.col_version, v1.db_version, v1.seq, v1.site_id, v1.ts, \
+                v2.col_version, v2.db_version, v2.seq, v2.site_id, v2.ts, \
+                v1.col_name \
+             FROM prod__crsql_clock v1 \
+             JOIN prod__crsql_v2_pks v2p ON v1.key = v2p.__crsql_key \
+             JOIN prod__crsql_v2_col_map v2m ON v1.col_name = v2m.col_name \
+             JOIN prod__crsql_v2_clock v2 ON v2.cell_key = (v2p.__crsql_key << {bits}) | v2m.col_id \
+             WHERE v1.col_name != '-1'",
+            bits = col_id_bits
+        );
+        let cmp_stmt = db.prepare_v2(&cmp_sql)?;
+        let mut mismatches = 0;
+        while cmp_stmt.step()? == ResultCode::ROW {
+            let v1_cv = cmp_stmt.column_int64(0);
+            let v1_dv = cmp_stmt.column_int64(1);
+            let v1_seq = cmp_stmt.column_int64(2);
+            let v1_site = cmp_stmt.column_int64(3);
+            let v1_ts = cmp_stmt.column_text(4)?.to_string();
+            let v2_cv = cmp_stmt.column_int64(5);
+            let v2_dv = cmp_stmt.column_int64(6);
+            let v2_seq = cmp_stmt.column_int64(7);
+            let v2_site = cmp_stmt.column_int64(8);
+            let v2_ts = cmp_stmt.column_int64(9);
+            let col_name = cmp_stmt.column_text(10)?.to_string();
+
+            // V1 ts is TEXT, V2 ts is INTEGER. Compare as integers.
+            let v1_ts_int: i64 = v1_ts.parse().unwrap_or(-1);
+
+            if v1_cv != v2_cv || v1_dv != v2_dv || v1_seq != v2_seq
+                || v1_site != v2_site || v1_ts_int != v2_ts
+            {
+                mismatches += 1;
+                libc_println!(
+                    "  {} MIRROR MISMATCH col_name={}: \
+                     cv({}/{}) dv({}/{}) seq({}/{}) site({}/{}) ts({}/{})",
+                    label, col_name,
+                    v1_cv, v2_cv, v1_dv, v2_dv, v1_seq, v2_seq,
+                    v1_site, v2_site, v1_ts, v2_ts,
+                );
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "{}: V1 mirror clock entries must match V2 source for all columns (col_version, db_version, seq, site_id, ts)",
+            label
+        );
     }
 
     // --- Verify V2 tombstones are clean on both destinations ---

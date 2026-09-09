@@ -429,7 +429,7 @@ impl V2Stmts {
             } else {
                 Some(db.prepare_v3(&format!(
                     "INSERT INTO \"{escaped}__crsql_clock\" (key, col_name, col_version, db_version, seq, site_id, ts) \
-                    SELECT ?, '-1', ?, site_id, db_version, seq, \
+                    SELECT ?, '-1', ?, db_version, seq, site_id, \
                     CASE WHEN ts > 0 THEN ts ELSE ? END \
                     FROM (SELECT site_id, db_version, seq, ts FROM \"{escaped}{}\" WHERE hashed_pk = ?) LIMIT 1",
                     consts::V2_TOMBSTONES_SUFFIX,
@@ -442,7 +442,8 @@ impl V2Stmts {
             Some(db.prepare_v3(&format!(
                 "INSERT INTO \"{escaped}__crsql_clock\" (key, col_name, col_version, db_version, seq, site_id, ts) \
                  SELECT ?, m.col_name, c.col_version, c.db_version, c.seq, \
-                 CASE WHEN c.ts > 0 THEN c.ts ELSE ? END, c.site_id \
+                 c.site_id, \
+                 CASE WHEN c.ts > 0 THEN c.ts ELSE ? END \
                  FROM \"{escaped}{}\" c \
                  JOIN \"{escaped}{}\" m ON (c.cell_key & ?) = m.col_id \
                  WHERE c.cell_key >= ? AND c.cell_key <= ?",

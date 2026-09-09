@@ -67,6 +67,13 @@ unsafe fn incremental_maintenance(
     chunk_size: c_int,
     ext_data: *mut crsql_ExtData,
 ) -> Result<c_int, ResultCode> {
+    // chunk_size <= 0 is invalid: LIMIT 0 deletes nothing but the cleanup loop
+    // treats "nothing deleted" as "all empty" and drops non-empty tables.
+    if chunk_size <= 0 {
+        crate::debug::debug_log("incremental_maintenance: chunk_size must be > 0");
+        return Err(ResultCode::ERROR);
+    }
+
     // V2 clock tables require a non-zero ts. Error early if not set.
     if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
         crate::debug::debug_log("incremental_maintenance: timestamp not set — call crsql_set_ts() first or set default-ts");
@@ -161,10 +168,26 @@ unsafe fn incremental_maintenance(
             continue;
         }
 
+        // Skip migration entirely when metadata-write-version is V1-only.
+        // After a 2→1 rollback, V2 tables are dropped by cleanup tasks above,
+        // and we must not recreate them. The migration loop is only relevant
+        // when the node is in dual-write (2) or V2-only (3) mode.
+        let mwv = unsafe { (*ext_data).metadataWriteVersion };
+        if mwv == crate::config::METADATA_VERSION_V1 {
+            continue;
+        }
+
+        // Check if a migration was actually queued for this table.
+        // After a rollback, migration markers are cleared — don't create V2
+        // tables if no migration is pending.
+        let progress_key = format!("migration_v1_to_v2_migration_{}", tbl_info.tbl_name);
+        let progress = crate::util::get_master_value(db, &progress_key)?;
+        let migration_queued = progress.is_some();
+
         // Check if V2 tables already exist
         let has_v2 = crate::bootstrap_v2::has_v2_tables(db, &tbl_info.tbl_name)?;
-        crate::debug::debug_log(&format!("migration: {} has_v2={}", tbl_info.tbl_name, has_v2));
-        if !has_v2 {
+        crate::debug::debug_log(&format!("migration: {} has_v2={} queued={}", tbl_info.tbl_name, has_v2, migration_queued));
+        if !has_v2 && migration_queued {
             // First call for this table: create V2 tables
             match crate::bootstrap_v2::create_v2_tables(db, tbl_info) {
                 Ok(_) => crate::debug::debug_log(&format!("migration: created v2 tables for {}", tbl_info.tbl_name)),
@@ -173,6 +196,10 @@ unsafe fn incremental_maintenance(
                     return Err(e);
                 }
             }
+        } else if !has_v2 && !migration_queued {
+            // No V2 tables and no migration queued — skip (e.g., after 2→1 rollback
+            // where cleanup dropped V2 tables and markers were cleared).
+            continue;
         }
 
         // Migrate a chunk of rows from V1 to V2, using remaining budget
