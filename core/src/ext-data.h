@@ -47,7 +47,11 @@ struct crsql_ExtData {
   sqlite3_stmt *pSelectClockTablesStmt;
 
   int mergeEqualValues;
+  int metadataWriteVersion;
+  int metadataUseVersion;
+  int syncLogVersion;
   unsigned long long timestamp;
+  unsigned long long defaultTimestamp;
   void *ordinalMap;
 };
 

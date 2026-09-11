@@ -70,7 +70,7 @@ fn create_impl(
     let schema = vtab_args.database_name;
     let table = base_name_from_virtual_name(vtab_args.table_name);
 
-    create_crr(db, schema, table, false, true, err)
+    create_crr(db, schema, table, false, true, None, false, err)
 }
 
 fn create_clset_storage(
@@ -84,6 +84,14 @@ fn create_clset_storage(
     let table_def = args.arguments.join(",");
     if !args.table_name.ends_with("_schema") {
         err.set("CLSet virtual table names must end with `_schema`");
+        return Err(ResultCode::MISUSE);
+    }
+
+    // Reject table_def containing semicolons to prevent multi-statement injection
+    // via sqlite3_exec. The column definitions should be a single CREATE TABLE
+    // body without embedded SQL statements.
+    if table_def.contains(';') {
+        err.set("CLSet table definition must not contain semicolons");
         return Err(ResultCode::MISUSE);
     }
 

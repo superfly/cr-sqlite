@@ -32,9 +32,14 @@ unsafe fn compact_post_alter(
     ext_data: *mut crsql_ExtData,
     errmsg: *mut *mut c_char,
 ) -> Result<ResultCode, ResultCode> {
+    if tbl_name.is_null() {
+        return Err(ResultCode::MISUSE);
+    }
     let tbl_name_str = CStr::from_ptr(tbl_name).to_str()?;
     fill_db_version_if_needed(db, ext_data).or_else(|msg| {
-        errmsg.set(&msg);
+        if !errmsg.is_null() {
+            errmsg.set(&msg);
+        }
         Err(ResultCode::ERROR)
     })?;
     let current_db_version = (*ext_data).dbVersion;
@@ -140,10 +145,6 @@ unsafe fn compact_post_alter(
         db.exec_safe(&sql)?;
     }
 
-    let stmt = db.prepare_v2(
-        "INSERT OR REPLACE INTO crsql_master (key, value) VALUES ('pre_compact_dbversion', ?)",
-    )?;
-    stmt.bind_int64(1, current_db_version)?;
-    stmt.step()?;
+    crate::util::set_master_value(db, "pre_compact_dbversion", current_db_version)?;
     Ok(ResultCode::OK)
 }

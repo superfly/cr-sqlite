@@ -8,6 +8,7 @@ import random
 def make_simple_schema():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
     return c
@@ -17,6 +18,7 @@ def test_insert_site_id():
     # is in lookaside
     # is an ordinal in actual table
     a = make_simple_schema()
+    a.execute("SELECT crsql_set_ts('1700000000')")
     a.execute(
         "INSERT INTO crsql_changes VALUES ('foo', x'010901', 'b', 1, 1, 1, x'1dc8d6bb7f8941088327d9439a7927a4', 1, 0, '0')")
     a.commit()
@@ -38,6 +40,7 @@ def test_insert_site_id():
 
 def test_site_id_filter():
     a = make_simple_schema()
+    a.execute("SELECT crsql_set_ts('1700000000')")
     a.execute(
         "INSERT INTO crsql_changes VALUES ('foo', x'010901', 'b', 1, 1, 1, x'1dc8d6bb7f8941088327d9439a7927a4', 1, 0, '0')")
     a.commit()
@@ -52,6 +55,7 @@ def test_local_changes_have_local_site():
     a.execute("INSERT INTO foo VALUES (3,2)")
     a.execute("INSERT INTO foo VALUES (4,2)")
     a.commit()
+    a.execute("SELECT crsql_set_ts('1700000000')")
     a.execute(
         "INSERT INTO crsql_changes VALUES ('foo', x'010901', 'b', 1, 1, 1, x'1dc8d6bb7f8941088327d9439a7927a4', 1, 0, '0')")
     a.commit()
@@ -65,7 +69,7 @@ def test_local_changes_have_local_site():
 
 def test_site_id_ordinals_do_not_move_on_merge():
     a = make_simple_schema()
-
+    a.execute("SELECT crsql_set_ts('1700000000')")
     a.execute(
         "INSERT INTO crsql_changes VALUES ('foo', x'010901', 'b', 1, 1, 1, x'1dc8d6bb7f8941088327d9439a7927a4', 1, 0, '0')")
     a.commit()
@@ -74,6 +78,7 @@ def test_site_id_ordinals_do_not_move_on_merge():
     assert (x == [("X'1DC8D6BB7F8941088327D9439A7927A4'",)])
 
     # insert again with the same site id
+    a.execute("SELECT crsql_set_ts('1700000000')")
     a.execute(
         "INSERT INTO crsql_changes VALUES ('foo', x'010902', 'b', 1, 1, 1, x'1dc8d6bb7f8941088327d9439a7927a4', 1, 0, '0')")
     a.commit()
@@ -84,10 +89,12 @@ def test_site_id_ordinals_do_not_move_on_merge():
                   ("X'1DC8D6BB7F8941088327D9439A7927A4'",)])
 
     # insert a new site id
+    a.execute("SELECT crsql_set_ts('1700000000')")
     a.execute(
         "INSERT INTO crsql_changes VALUES ('foo', x'010903', 'b', 1, 1, 1, x'2dc8d6bb7f8941088327d9439a7927a4', 1, 0, '0')")
     a.commit()
     # insert again with that new site id
+    a.execute("SELECT crsql_set_ts('1700000000')")
     a.execute(
         "INSERT INTO crsql_changes VALUES ('foo', x'010904', 'b', 1, 1, 1, x'2dc8d6bb7f8941088327d9439a7927a4', 1, 0, '0')")
     a.commit()

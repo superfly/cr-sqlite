@@ -10,6 +10,7 @@ fn new_empty_table() -> Result<(), ResultCode> {
     // Just testing that we can execute these statements without error
     db.db
         .exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, name);")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
     db.db.exec_safe("SELECT * FROM foo__crsql_clock;")?;
     Ok(())
@@ -21,9 +22,11 @@ fn new_nonempty_table(apply_twice: bool) -> Result<(), ResultCode> {
         .exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, name);")?;
     db.db
         .exec_safe("INSERT INTO foo VALUES (1, 'one'), (2, 'two');")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
     let stmt = db.db.prepare_v2("SELECT * FROM foo__crsql_clock;")?;
     if apply_twice {
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
         db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
     }
 
@@ -65,8 +68,10 @@ fn reapplied_empty_table() -> Result<(), ResultCode> {
     // Just testing that we can execute these statements without error
     db.db
         .exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, name);")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
     db.db.exec_safe("SELECT * FROM foo__crsql_clock;")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
     db.db.exec_safe("SELECT * FROM foo__crsql_clock;")?;
     Ok(())

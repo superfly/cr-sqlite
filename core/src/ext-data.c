@@ -18,6 +18,10 @@ void crsql_drop_last_db_versions_map(crsql_ExtData *pExtData);
 // The initialization here is incomplete! We need to call crsql_initSiteIdExt after this.
 crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   crsql_ExtData *pExtData = sqlite3_malloc(sizeof *pExtData);
+  if (pExtData == 0) {
+    return 0;
+  }
+  memset(pExtData, 0, sizeof *pExtData);
 
   pExtData->siteId = 0;
   pExtData->pPragmaSchemaVersionStmt = 0;
@@ -91,6 +95,10 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
 
   // set defaults!
   pExtData->mergeEqualValues = 0;
+  pExtData->metadataWriteVersion = 1;  // V1
+  pExtData->metadataUseVersion = 1;   // V1
+  pExtData->syncLogVersion = 1;      // V1
+  pExtData->defaultTimestamp = 0;    // off: require crsql_set_ts()
 
   while (sqlite3_step(pStmt) == SQLITE_ROW) {
     const unsigned char *name = sqlite3_column_text(pStmt, 0);
@@ -105,6 +113,18 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
         crsql_freeExtData(pExtData);
         return 0;
       }
+    } else if (strcmp("metadata-write-version", (char *)name) == 0) {
+      if (colType == SQLITE_INTEGER) {
+        pExtData->metadataWriteVersion = sqlite3_column_int(pStmt, 1);
+      }
+    } else if (strcmp("metadata-use-version", (char *)name) == 0) {
+      if (colType == SQLITE_INTEGER) {
+        pExtData->metadataUseVersion = sqlite3_column_int(pStmt, 1);
+      }
+    } else if (strcmp("sync-log-version", (char *)name) == 0) {
+      if (colType == SQLITE_INTEGER) {
+        pExtData->syncLogVersion = sqlite3_column_int(pStmt, 1);
+      }
     } else {
       // unhandled config setting
     }
@@ -112,7 +132,7 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
 
   sqlite3_finalize(pStmt);
   int pv = crsql_fetchPragmaDataVersion(db, pExtData);
-  if (pv == -1 || rc != SQLITE_OK) {
+  if ((pv != 0 && pv != 1) || rc != SQLITE_OK) {
     crsql_freeExtData(pExtData);
     return 0;
   }
@@ -127,16 +147,25 @@ int crsql_initSiteIdExt(sqlite3 *db, crsql_ExtData *pExtData, unsigned char *sit
   int rc = sqlite3_prepare_v3(
       db, "INSERT INTO crsql_site_id (site_id) VALUES (?) RETURNING ordinal",
       -1, SQLITE_PREPARE_PERSISTENT, &(pExtData->pSetSiteIdOrdinalStmt), 0);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
 
   pExtData->pSelectSiteIdOrdinalStmt = 0;
-  rc += sqlite3_prepare_v3(
+  rc = sqlite3_prepare_v3(
       db, "SELECT ordinal FROM crsql_site_id WHERE site_id = ?", -1,
       SQLITE_PREPARE_PERSISTENT, &(pExtData->pSelectSiteIdOrdinalStmt), 0);
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
 
   return rc;
 }
 
 void crsql_freeExtData(crsql_ExtData *pExtData) {
+  if (pExtData == 0) {
+    return;
+  }
   // printf("free ext\n");
   if (pExtData->siteId != 0) {
     sqlite3_free(pExtData->siteId);
@@ -176,6 +205,9 @@ void crsql_freeExtData(crsql_ExtData *pExtData) {
 // see https://sqlite.org/forum/forumpost/c94f943821
 // `freeExtData` is called after finalization when the extension unloads
 void crsql_finalize(crsql_ExtData *pExtData) {
+  if (pExtData == 0) {
+    return;
+  }
   // printf("crsql_finalize\n");
   sqlite3_finalize(pExtData->pDbVersionStmt);
   sqlite3_finalize(pExtData->pSetDbVersionStmt);
@@ -225,17 +257,22 @@ int crsql_fetchPragmaSchemaVersion(sqlite3 *db, crsql_ExtData *pExtData,
 
     return 0;
   } else {
-    sqlite3_reset(pExtData->pPragmaSchemaVersionStmt);
+    int finalizeRc = sqlite3_reset(pExtData->pPragmaSchemaVersionStmt);
+    if (rc == SQLITE_DONE) {
+      return finalizeRc;
+    }
+    return rc;
   }
-
-  return -1;
 }
 
 int crsql_fetchPragmaDataVersion(sqlite3 *db, crsql_ExtData *pExtData) {
   int rc = sqlite3_step(pExtData->pPragmaDataVersionStmt);
   if (rc != SQLITE_ROW) {
-    sqlite3_reset(pExtData->pPragmaDataVersionStmt);
-    return -1;
+    int finalizeRc = sqlite3_reset(pExtData->pPragmaDataVersionStmt);
+    if (rc == SQLITE_DONE) {
+      return finalizeRc;
+    }
+    return rc;
   }
 
   int version = sqlite3_column_int(pExtData->pPragmaDataVersionStmt, 0);

@@ -6,6 +6,7 @@ import time
 def test_commit_alter_perf():
   c = connect(":memory:")
   c.execute("CREATE TABLE issue (id INTEGER PRIMARY KEY NOT NULL, title TEXT, owner TEXT, status INTEGER, priority INTEGER)")
+  c.execute("SELECT crsql_set_ts('1700000000')")
   c.execute("SELECT crsql_as_crr('issue')")
   c.commit()
 
@@ -17,14 +18,18 @@ def test_commit_alter_perf():
   print(f"insert time: {end_time - start_time}")
 
   start_time = time.time()
+  c.execute("SELECT crsql_set_ts('1700000000')")
   c.execute("SELECT crsql_begin_alter('issue')")
+  c.execute("SELECT crsql_set_ts('1700000000')")
   c.execute("SELECT crsql_commit_alter('issue')")
   end_time = time.time()
   print(f"no alter alter time: {end_time - start_time}")
 
   start_time = time.time()
+  c.execute("SELECT crsql_set_ts('1700000000')")
   c.execute("SELECT crsql_begin_alter('issue')")
   c.execute("ALTER TABLE issue ADD COLUMN description TEXT")
+  c.execute("SELECT crsql_set_ts('1700000000')")
   c.execute("SELECT crsql_commit_alter('issue')")
   end_time = time.time()
   print(f"alter add col time: {end_time - start_time}")

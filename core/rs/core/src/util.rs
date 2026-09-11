@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use core::str::Utf8Error;
 use sqlite::{sqlite3, ColumnType, Connection, ResultCode};
 use sqlite_nostd as sqlite;
+use sqlite_nostd::Destructor;
 
 pub fn get_dflt_value(
     db: *mut sqlite3,
@@ -39,7 +40,19 @@ pub fn get_dflt_value(
         return Ok(None);
     }
 
-    return Ok(Some(String::from(stmt.column_text(0)?)));
+    let raw = String::from(stmt.column_text(0)?);
+    // pragma_table_info returns string defaults with surrounding quotes
+    // (e.g., "'2018-01-01'" for DEFAULT '2018-01-01'). Strip them so the
+    // value matches what IS stored in the column for comparison purposes.
+    let stripped = if raw.len() >= 2
+        && ((raw.starts_with('\'') && raw.ends_with('\''))
+            || (raw.starts_with('"') && raw.ends_with('"')))
+    {
+        raw[1..raw.len() - 1].to_string()
+    } else {
+        raw
+    };
+    Ok(Some(stripped))
 }
 
 pub fn get_db_version_union_query(tbl_names: &[String]) -> String {
@@ -66,8 +79,16 @@ pub fn slab_rowid(idx: i32, rowid: sqlite::int64) -> sqlite::int64 {
         return -1;
     }
 
-    let modulo = rowid % crate::consts::ROWID_SLAB_SIZE;
-    return (idx as i64) * crate::consts::ROWID_SLAB_SIZE + modulo;
+    // Use Euclidean remainder to ensure non-negative modulo even for negative rowids.
+    let modulo = rowid.rem_euclid(crate::consts::ROWID_SLAB_SIZE);
+    // Use checked arithmetic to detect overflow rather than wrapping silently.
+    match (idx as i64).checked_mul(crate::consts::ROWID_SLAB_SIZE) {
+        Some(product) => match product.checked_add(modulo) {
+            Some(result) => result,
+            None => -1,
+        },
+        None => -1,
+    }
 }
 
 pub fn where_list(columns: &Vec<ColumnInfo>, prefix: Option<&str>) -> Result<String, Utf8Error> {
@@ -115,7 +136,12 @@ pub fn as_identifier_list(
 }
 
 pub fn escape_ident(ident: &str) -> String {
-    return ident.replace("\"", "\"\"");
+    // NUL bytes would truncate the identifier when passed to SQLite as a C string,
+    // enabling identifier injection. Reject them.
+    if ident.contains('\0') {
+        return String::new();
+    }
+    ident.replace("\"", "\"\"")
 }
 
 pub fn escape_ident_as_value(ident: &str) -> String {
@@ -132,6 +158,86 @@ impl Countable for *mut sqlite::sqlite3 {
         stmt.step()?;
         Ok(stmt.column_int(0))
     }
+}
+
+/// Get an integer value from crsql_master by exact key.
+/// Returns None if the key does not exist.
+pub unsafe fn get_master_value(db: *mut sqlite3, key: &str) -> Result<Option<i64>, ResultCode> {
+    let sql = "SELECT value FROM crsql_master WHERE key = ?";
+    let stmt = db.prepare_v2(sql)?;
+    stmt.bind_text(1, key, Destructor::STATIC)?;
+    if stmt.step()? == ResultCode::ROW {
+        return Ok(Some(stmt.column_int64(0)));
+    }
+    Ok(None)
+}
+
+/// Get a cached count from crsql_master, or run a count query and cache it.
+/// Used by migration/cleanup to avoid expensive `count(*)` on every chunk.
+/// The count SQL should count only remaining rows (e.g. with a WHERE clause).
+pub unsafe fn get_or_count(
+    db: *mut sqlite3,
+    cache_key: &str,
+    count_sql: &str,
+) -> Result<i64, ResultCode> {
+    match get_master_value(db, cache_key)? {
+        Some(v) => Ok(v),
+        None => {
+            let stmt = db.prepare_v2(count_sql)?;
+            stmt.step()?;
+            let total = stmt.column_int64(0);
+            set_master_value(db, cache_key, total)?;
+            Ok(total)
+        }
+    }
+}
+
+/// Set an integer value in crsql_master by exact key (insert or replace).
+pub unsafe fn set_master_value(db: *mut sqlite3, key: &str, value: i64) -> Result<(), ResultCode> {
+    let sql = "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, ?)";
+    let stmt = db.prepare_v2(sql)?;
+    stmt.bind_text(1, key, Destructor::STATIC)?;
+    stmt.bind_int64(2, value)?;
+    stmt.step()?;
+    Ok(())
+}
+
+/// Delete a key from crsql_master by exact key.
+pub unsafe fn clear_master_key(db: *mut sqlite3, key: &str) -> Result<(), ResultCode> {
+    let sql = "DELETE FROM crsql_master WHERE key = ?";
+    let stmt = db.prepare_v2(sql)?;
+    stmt.bind_text(1, key, Destructor::STATIC)?;
+    stmt.step()?;
+    Ok(())
+}
+
+/// Clear all crsql_master mode flags for a table (use_rowid, skip_hash, v2_pks).
+pub unsafe fn clear_crr_mode_flags(db: *mut sqlite3, table: &str) {
+    let _ = clear_master_key(db, &format!("use_rowid_{}", table));
+    let _ = clear_master_key(db, &format!("skip_hash_{}", table));
+    let _ = clear_master_key(db, &format!("v2_pks_{}", table));
+}
+
+/// Get a text value from crsql_master by exact key.
+/// Returns None if the key does not exist.
+pub unsafe fn get_master_text_value(db: *mut sqlite3, key: &str) -> Result<Option<alloc::string::String>, ResultCode> {
+    let sql = "SELECT value FROM crsql_master WHERE key = ?";
+    let stmt = db.prepare_v2(sql)?;
+    stmt.bind_text(1, key, Destructor::STATIC)?;
+    if stmt.step()? == ResultCode::ROW {
+        return Ok(Some(stmt.column_text(0)?.to_string()));
+    }
+    Ok(None)
+}
+
+/// Set a text value in crsql_master by exact key (insert or replace).
+pub unsafe fn set_master_text_value(db: *mut sqlite3, key: &str, value: &str) -> Result<(), ResultCode> {
+    let sql = "INSERT OR REPLACE INTO crsql_master (key, value) VALUES (?, ?)";
+    let stmt = db.prepare_v2(sql)?;
+    stmt.bind_text(1, key, Destructor::TRANSIENT)?;
+    stmt.bind_text(2, value, Destructor::TRANSIENT)?;
+    stmt.step()?;
+    Ok(())
 }
 
 #[cfg(test)]

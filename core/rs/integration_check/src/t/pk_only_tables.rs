@@ -18,6 +18,9 @@ fn sync_left_to_right(l: &dyn Connection, r: &dyn Connection, since: sqlite::int
         .bind_blob(2, siteid, Destructor::STATIC)
         .expect("bound site id");
 
+    r.exec_safe("BEGIN").expect("begin");
+    r.exec_safe("SELECT crsql_set_ts('1700000000')").expect("set ts");
+
     while stmt_l.step().expect("pulled change set") == ResultCode::ROW {
         let stmt_r = r
             .prepare_v2("INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
@@ -29,6 +32,7 @@ fn sync_left_to_right(l: &dyn Connection, r: &dyn Connection, since: sqlite::int
         }
         stmt_r.step().expect("inserted change");
     }
+    r.exec_safe("COMMIT").expect("commit");
 }
 
 // fn print_changes(
@@ -72,6 +76,8 @@ fn sync_left_to_right(l: &dyn Connection, r: &dyn Connection, since: sqlite::int
 fn setup_schema(db: &ManagedConnection) {
     db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL);")
         .expect("created foo");
+    db.exec_safe("SELECT crsql_set_ts('1700000000')")
+        .expect("set ts");
     db.exec_safe("SELECT crsql_as_crr('foo');")
         .expect("converted to crr");
 }
@@ -90,6 +96,8 @@ fn insert_pkonly_row() {
     fn setup_schema(db: &ManagedConnection) {
         db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL);")
             .expect("created foo");
+        db.exec_safe("SELECT crsql_set_ts('1700000000')")
+            .expect("set ts");
         db.exec_safe("SELECT crsql_as_crr('foo');")
             .expect("upgraded to crr");
     }
@@ -132,6 +140,8 @@ fn modify_pkonly_row() -> Result<(), ResultCode> {
     fn setup_schema(db: &ManagedConnection) {
         db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL);")
             .expect("create foo");
+        db.exec_safe("SELECT crsql_set_ts('1700000000')")
+            .expect("set ts");
         db.exec_safe("SELECT crsql_as_crr('foo');")
             .expect("upgrade foo");
     }
@@ -178,6 +188,7 @@ fn junction_table() -> Result<(), ResultCode> {
 
     fn setup_schema(db: &ManagedConnection) -> Result<ResultCode, ResultCode> {
         db.exec_safe("CREATE TABLE jx (id1 NOT NULL, id2 NOT NULL, PRIMARY KEY(id1, id2));")?;
+        db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
         db.exec_safe("SELECT crsql_as_crr('jx');")
     }
 
@@ -234,6 +245,7 @@ fn discord_report_1() -> Result<(), ResultCode> {
     let db_a = crate::opendb()?;
     db_a.db
         .exec_safe("CREATE TABLE IF NOT EXISTS data (id NUMBER PRIMARY KEY NOT NULL);")?;
+    db_a.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db_a.db.exec_safe("SELECT crsql_as_crr('data')")?;
     db_a.db
         .exec_safe("INSERT INTO data VALUES (42) ON CONFLICT DO NOTHING;")?;

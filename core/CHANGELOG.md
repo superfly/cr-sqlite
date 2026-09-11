@@ -1,5 +1,53 @@
 # @vlcn.io/crsqlite
 
+## 0.18.0
+
+### Breaking Changes
+
+- Removed `crsql_automigrate` function. Schema management should be handled externally by the application or migration framework. Corrosion handles schema migrations externally and uses `crsql_as_crr()` to register new tables and `crsql_begin_alter()` / `crsql_commit_alter()` to reconcile cr-sqlite metadata tables after schema changes.
+- `crsql_set_ts()` is now mandatory before any write operation (crsql_as_crr, crsql_begin_alter/commit_alter, crsql_incremental_maintenance, INSERT/UPDATE/DELETE on CRR tables, INSERT INTO crsql_changes). Operations will fail with an error if the timestamp is not set.
+- Requires SQLite 3.44.0 or later.
+- **`INSERT OR REPLACE` now fires both DELETE and INSERT triggers.** cr-sqlite enables `PRAGMA recursive_triggers = ON` at initialization. Previously (recursive_triggers off by default), `INSERT OR REPLACE` on an existing row only fired the INSERT trigger, leaving stale metadata and not emitting delete sentinels for replication. Now the DELETE trigger fires first (moving the row to tombstones, CL→even, emitting a delete sentinel), then the INSERT trigger fires (resurrecting the row, CL→odd, creating fresh clock entries). This ensures metadata consistency and correct replication. Applications using `INSERT OR REPLACE` will see delete sentinels (`cid = -1`) in `crsql_changes` for replaced rows. Use `INSERT ... ON CONFLICT DO UPDATE` for true upsert behavior that does not create delete sentinels. `INSERT OR REPLACE` can be used as a forced update/recreation mode when you need to replace a row globally across all nodes.
+
+### New Features
+
+- **V2 metadata format**: New compact metadata tables (`__crsql_v2_pks`, `__crsql_v2_clock`, `__crsql_v2_col_map`, `__crsql_v2_tombstones`, `__crsql_v2_tombstone_pks`) with packed integer `cell_key` primary keys. Replaces V1's `__crsql_clock` + `__crsql_pks` schema. Opt-in via `crsql_config_set('metadata-write-version', 2)`. Note: the V2 schema may receive breaking changes during the 0.18.x series. V1 support will be removed in 0.19.0.
+- **V2 wire format**: Coalesces all column changes per row per db_version into a single `crsql_changes` row with packed `cid` and `cval` fields. Opt-in via `crsql_config_set('sync-log-version', 2)`.
+- **Hashed primary keys**: V2 hashes PK values with `xxh3_128` (truncated to 10 bytes) to limit tombstone size. Tombstones moved to a dedicated `v2_tombstones` table, reducing clock table bloat.
+- **Incremental V1→V2 migration**: `crsql_incremental_maintenance(batch_size)` migrates tables in batches without long lock times. Supports dual-write mode (V1+V2) and rollback to V1 while in dual-write.
+- **Simplified PK change detection**: PK column info is now stored in `crsql_master` at table creation time and compared via a canonical signature (rowid-key flag + sorted PK column names + types). Eliminates complex schema introspection queries.
+
+### Improvements
+
+- Simplified `sync_col_map_v2`: linear col_id assignment, removed dead sentinel-creation code, removed unused parameters.
+- Fixed teardown: removed dead per-PK-column trigger drop loop (only one `{table}__crsql_utrig` trigger is ever created per table).
+
+## 0.17.0
+
+### Breaking Changes
+
+- Forked from upstream cr-sqlite v0.15.0. Databases created with cr-sqlite < 0.17.0 are not supported and must be migrated.
+- `crsql_next_db_version()` no longer accepts a `merging_version` argument. The db_version is committed to storage immediately when computed.
+- Clock table schema changed: `ts TEXT NOT NULL DEFAULT '0'` column added to all `__crsql_clock` tables. `PRIMARY KEY (key, col_name)` with `WITHOUT ROWID, STRICT`.
+- db_version index changed from `(db_version)` to `(site_id, db_version)`.
+- Removed `crsql_tracked_peers` built-in peer tracking. Applications are now responsible for gap detection, seq tracking, and buffering.
+
+### New Features
+
+- **Per-site DB version tracking**: New `crsql_db_versions` table tracks the latest `db_version` seen from each site. New functions `crsql_peek_next_db_version()` and `crsql_set_db_version(site_id, db_version)`.
+- **Timestamps**: Every change record now carries a `ts` column (NTP64 timestamp string). Set per-transaction via `crsql_set_ts()`, read via `crsql_get_ts()`. Enables time-based retention policies.
+- **In-memory caching**: Site ordinal cache, causal length cache (max 1500 entries per TableInfo), and last db_versions map — all transaction-scoped with proper commit/rollback lifecycle.
+- **Debug logging**: `crsql_set_debug(1)` enables libc_print-based debug output.
+- **ASAN support**: `make asan` target with proper Rust sanitizer flags.
+
+### Improvements
+
+- **Optimized local write path**: Insert uses UPDATE-then-INSERT fallback with combo-insert fast path. Update uses `peek_next_db_version()` to skip version increment when nothing changed. Delete returns new causal length via `RETURNING`. PK change moves clock rows via `UPDATE OR REPLACE` preserving col_version.
+- **Merge write path**: `set_winner_clock` takes `insert_ts` parameter. `zero_clocks_on_resurrect` no longer sets db_version during resurrect. Unified merge path for sentinel-only, resurrect, and normal cases.
+- **Config lifetime fix**: `crsql_config_set` properly manages statement lifetime to prevent use-after-free.
+- **`crsql_changes` schema**: Added `ts` column (column index 9).
+- **`crsql_version()`**: Re-enabled (was commented out upstream).
+
 ## 0.16.3
 
 ### Patch Changes

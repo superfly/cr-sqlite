@@ -39,6 +39,7 @@ void crsqlIsCrrTestSuite();
 void rowsImpactedTestSuite();
 void crsqlChangesVtabRowidTestSuite();
 void crsqlSandboxSuite();
+void crsql_insertOrReplaceTestSuite();
 void crsql_integration_check();
 
 int main(int argc, char *argv[]) {
@@ -57,6 +58,7 @@ int main(int argc, char *argv[]) {
   SUITE("rows_impacted") rowsImpactedTestSuite();
   SUITE("rowid") crsqlChangesVtabRowidTestSuite();
   SUITE("sandbox") crsqlSandboxSuite();
+  SUITE("insert_or_replace") crsql_insertOrReplaceTestSuite();
   SUITE("rust_integration") crsql_integration_check();
 
   sqlite3_shutdown();

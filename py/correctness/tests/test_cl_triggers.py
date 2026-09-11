@@ -22,6 +22,7 @@ def create_db(db_file=None):
         db_file = ":memory:"
     c = connect(db_file)
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
     return c
@@ -33,6 +34,7 @@ def sync_left_to_right(l, r, since):
     changes = l.execute(
         "SELECT * FROM crsql_changes WHERE db_version > ?", (since,))
     for change in changes:
+        r.execute("SELECT crsql_set_ts('1700000000')")
         r.execute(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
     r.commit()
@@ -43,6 +45,7 @@ def test_upsert_non_existing():
     c = connect(":memory:")
     c.execute(
         "CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL NOT NULL, b TEXT) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -63,6 +66,7 @@ def test_upsert_non_existing():
 def test_insert_delete_insert_delete():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -85,6 +89,7 @@ def test_insert_delete_insert_delete():
 def test_upsert_previously_existing():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -118,22 +123,22 @@ def test_upsert_previously_existing():
 def test_upsert_currently_existing():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
     c.execute("INSERT INTO foo VALUES (1, 2)")
     c.commit()
-    # A replace acts as an insert.
-    # A `do update` acts as an update.
-    # So we test both ways of upserting.
+    # INSERT OR REPLACE fires DELETE then INSERT (recursive_triggers ON).
+    # The DELETE creates a sentinel (cl=2), the INSERT resurrects (cl=3).
+    # In V1, the insert's update_create_record bumps the sentinel row to cl=3
+    # as well (same key), so both sentinel and column change are at cl=3.
     c.execute("INSERT OR REPLACE INTO foo VALUES (1, 3)")
     c.commit()
 
     changes = c.execute(
         "SELECT pk, cid, cl FROM crsql_changes").fetchall()
-    # Causal length bumps up to the next odd number given we are requesting to re-insert an existing row.
-    # Nope ^^ -- we're keeping it stable given the optimization to infer causal length records.
-    assert (changes == [(b'\x01\t\x01', 'b', 1)])
+    assert (changes == [(b'\x01\t\x01', '-1', 3), (b'\x01\t\x01', 'b', 3)])
 
     c.execute(
         "INSERT INTO foo VALUES (1, 4) ON CONFLICT DO UPDATE set b = b")
@@ -141,14 +146,15 @@ def test_upsert_currently_existing():
 
     changes = c.execute(
         "SELECT pk, cid, cl FROM crsql_changes").fetchall()
-    # Causal length remains stable given we asked to update, rather than re-insert, on conflict
-    assert (changes == [(b'\x01\t\x01', 'b', 1)])
+    # ON CONFLICT DO UPDATE is a true upsert — no delete, CL stays at 3.
+    assert (changes == [(b'\x01\t\x01', '-1', 3), (b'\x01\t\x01', 'b', 3)])
 
 
 # Run of the mill update against a row that exists
 def test_update_existing():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -173,6 +179,7 @@ def test_update_existing():
 def test_insert_existing():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -193,6 +200,7 @@ def test_insert_existing():
 def test_insert_or_ignore_existing():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -212,6 +220,7 @@ def test_insert_or_ignore_existing():
 def test_delete_existing():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -228,6 +237,7 @@ def test_delete_existing():
 def test_delete_previously_deleted():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -350,12 +360,13 @@ def test_change_primary_key_to_currently_existing():
         "SELECT pk, cid, cl FROM crsql_changes").fetchall()
     changes2 = c2.execute(
         "SELECT pk, cid, cl FROM crsql_changes").fetchall()
-    # pk 2 is alive as we `update or replaced` to it
-    # and it is alive at version 3 given it iassert (changes2 == changes)s a re-insertion of the currently existing row
+    # pk 2 is alive as we `update or replaced` to it.
+    # With recursive_triggers ON, UPDATE OR REPLACE fires DELETE then INSERT
+    # on pk=2, so pk=2 goes through delete (cl=2) → resurrect (cl=3).
     # pk 1 is dead (cl of 2) given we mutated / updated away from it. E.g.,
     # set a = 2 where a = 1
-    assert (changes == [(b'\x01\t\x01', '-1', 2), (b'\x01\t\x02', '-1', 1),
-                        (b'\x01\t\x02', 'b', 1)])
+    assert (changes == [(b'\x01\t\x01', '-1', 2), (b'\x01\t\x02', '-1', 3),
+                        (b'\x01\t\x02', 'b', 3)])
     # TODO: The change from second node is missing the sentinel row for the
     # existing row because we skip inserts if cl hasn't changed and we assume
     # an existing row has a cl of 1.
@@ -416,6 +427,7 @@ def test_change_primary_key_from_another_db():
 def test_change_primary_key_away_from_thing_with_large_length():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -439,6 +451,7 @@ def test_change_primary_key_away_from_thing_with_large_length():
 def test_insert_previously_existing():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
