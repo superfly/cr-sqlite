@@ -422,17 +422,26 @@ fn build_col_val_case(table_info: &TableInfo) -> Result<String, ResultCode> {
     }
 }
 
-/// V2 packed feed query (V2 wire format): coalesces clock rows that share
+/// V2 feed query (V2 wire format). Reads from V2 clock tables and produces
+/// either packed or scalar rows depending on `scalar_mode`.
+///
+/// **Packed mode** (`scalar_mode = false`): coalesces clock rows that share
 /// (row_key, db_version, site_id) into a single packed event.
 /// - cid = GROUP_CONCAT(col_name, char(0))  (text — column names are strings)
 /// - col_vrsn = crsql_pack_varint_agg(col_version)  (binary varint array)
 /// - seq = crsql_pack_varint_agg(c.seq)  (binary varint array)
 /// - cval = crsql_pack_agg(col_val)  (column values fetched from main table via CASE)
 /// Sentinels and tombstones are always single events (no packing).
+///
+/// **Scalar mode** (`scalar_mode = true`): skips internal GROUP BY and packing,
+/// returning one row per clock entry with scalar cid, val, col_version, seq.
+/// Used when sqlite3_vtab_distinct() detects GROUP BY/DISTINCT in the outer query,
+/// so aggregates like MAX(seq) operate on scalar values instead of packed BLOBs.
 fn crsql_changes_query_for_table_v2_v2wire(
     table_info: &TableInfo,
     pushed: &[PushedConstraint],
     need_seq_order: bool,
+    scalar_mode: bool,
 ) -> Result<String, ResultCode> {
     if table_info.pks.is_empty() {
         return Err(ResultCode::ABORT);
@@ -455,38 +464,75 @@ fn crsql_changes_query_for_table_v2_v2wire(
     } else {
         format!("WHERE {}", cell_pushed_where)
     };
-    // _seq_order = MIN(c.seq) gives a scalar for outer ORDER BY.
-    let seq_order_col = if need_seq_order { ", MIN(c.seq) as _seq_order" } else { "" };
 
-    // Part 1: Packed cell changes — GROUP BY (key expression, db_version, site_id)
-    // No subquery needed with SQLite 3.44+ — ORDER BY inside aggregates ensures alignment.
-    // GROUP BY must use the full expression, not the column alias, for SQLite 3.44 compatibility.
+    // Column expressions differ between packed and scalar modes.
+    // Packed: aggregate functions with ORDER BY cm.col_id; Scalar: plain column refs.
+    let (cid_expr, col_vrsn_expr, seq_expr, cval_expr, seq_order_expr) = if scalar_mode {
+        let seq_order = if need_seq_order { ", c.seq as _seq_order" } else { "" };
+        (
+            "cm.col_name",
+            "c.col_version",
+            "c.seq",
+            col_val_case.as_str(),
+            seq_order,
+        )
+    } else {
+        let seq_order = if need_seq_order { ", MIN(c.seq) as _seq_order" } else { "" };
+        (
+            "cast(group_concat(cm.col_name, char(0) ORDER BY cm.col_id) as blob)",
+            "crsql_pack_varint_agg(c.col_version ORDER BY cm.col_id)",
+            "crsql_pack_varint_agg(c.seq ORDER BY cm.col_id)",
+            // cval is wrapped in crsql_pack_agg in the format string below.
+            col_val_case.as_str(),
+            seq_order,
+        )
+    };
+
+    // In packed mode, cval is wrapped in crsql_pack_agg(... ORDER BY cm.col_id).
+    // In scalar mode, cval is the raw CASE expression (no packing).
+    let cval_full_expr = if scalar_mode {
+        cval_expr.to_string()
+    } else {
+        format!("crsql_pack_agg(({}) ORDER BY cm.col_id)", cval_expr)
+    };
+
+    // Part 1: Cell changes
+    // Packed mode: GROUP BY (key expression, db_version, site_id) — ORDER BY inside
+    //   aggregates ensures alignment (SQLite 3.44+).
+    // Scalar mode: no GROUP BY, no packing — one row per clock entry.
     let cell_changes = format!(
         "SELECT
           '{table_name_val}' as tbl,
           crsql_pack_columns({pk_expr}) as pks,
-          cast(group_concat(cm.col_name, char(0) ORDER BY cm.col_id) as blob) as cid,
-          crsql_pack_varint_agg(c.col_version ORDER BY cm.col_id) as col_vrsn,
+          {cid_expr} as cid,
+          {col_vrsn_expr} as col_vrsn,
           c.db_version as db_vrsn,
           site_tbl.site_id as site_id,
           c.cell_key >> {col_id_bits} as key,
-          crsql_pack_varint_agg(c.seq ORDER BY cm.col_id) as seq,
+          {seq_expr} as seq,
           pk_tbl.cl as cl,
           c.ts as ts,
-          crsql_pack_agg(({col_val_case}) ORDER BY cm.col_id) as cval{seq_order_col}
+          {cval_full_expr} as cval{seq_order_expr}
         FROM \"{escaped}{clock_suffix}\" AS c
         JOIN \"{escaped}{pks_suffix}\" AS pk_tbl ON (c.cell_key >> {col_id_bits}) = pk_tbl.__crsql_key
         {main_join}
         JOIN \"{escaped}{col_map_suffix}\" AS cm ON (c.cell_key & {col_id_mask}) = cm.col_id
         LEFT JOIN crsql_site_id AS site_tbl ON c.site_id = site_tbl.ordinal
-        {cell_where}
-        GROUP BY c.cell_key >> {col_id_bits}, c.db_version, site_tbl.site_id",
+        {cell_where}{group_by_clause}",
         table_name_val = table_name_val,
         pk_expr = pk_expr,
         main_join = main_join,
-        col_val_case = col_val_case,
-        seq_order_col = seq_order_col,
+        cid_expr = cid_expr,
+        col_vrsn_expr = col_vrsn_expr,
+        seq_expr = seq_expr,
+        cval_full_expr = cval_full_expr,
+        seq_order_expr = seq_order_expr,
         cell_where = cell_where,
+        group_by_clause = if !scalar_mode {
+            format!("\n        GROUP BY c.cell_key >> {}, c.db_version, site_tbl.site_id", col_id_bits)
+        } else {
+            String::new()
+        },
         escaped = escaped,
         clock_suffix = consts::V2_CLOCK_SUFFIX,
         pks_suffix = consts::V2_PKS_SUFFIX,
@@ -495,7 +541,8 @@ fn crsql_changes_query_for_table_v2_v2wire(
         col_id_mask = consts::CRSQL_COL_ID_MASK,
     );
 
-    // Part 2: Tombstone rows — V2 wire format
+    // Part 2: Tombstone rows — V2 wire format (identical in both modes;
+    // tombstones are always single events with scalar columns).
     // skip_hash tombstones use cid='-1' (DELETE_SENTINEL), hash tombstones use cid='-2'.
     // col_vrsn is always NULL in v2wire tombstone arms.
     let tomb_cid = if table_info.skip_hash {
@@ -634,6 +681,7 @@ fn query_for_table(
     sync_log_version: i32,
     pushed: &[PushedConstraint],
     need_seq_order: bool,
+    scalar_mode: bool,
 ) -> Result<String, ResultCode> {
     // If metadata-use-version is V1, always read from V1 tables (even if V2 tables exist)
     if metadata_use_version == consts::META_USE_V1 {
@@ -655,7 +703,7 @@ fn query_for_table(
                 return crsql_changes_query_for_table_v2_pkonly(table_info, pushed, need_seq_order);
             }
             if sync_log_version == consts::SYNC_LOG_V2 {
-                crsql_changes_query_for_table_v2_v2wire(table_info, pushed, need_seq_order)
+                crsql_changes_query_for_table_v2_v2wire(table_info, pushed, need_seq_order, scalar_mode)
             } else {
                 crsql_changes_query_for_table_v2_v1wire(table_info)
             }
@@ -676,6 +724,11 @@ pub fn query_has_cval(metadata_use_version: i32) -> bool {
     metadata_use_version == consts::META_USE_V2
 }
 
+// When sqlite3_vtab_distinct() returns 1 or 2 (GROUP BY/DISTINCT detected),
+// the vtab skips internal grouping/packing and returns scalar V1-style rows.
+// This allows aggregate metadata queries like MAX(seq) to work correctly
+// in V2 wire mode. For bare aggregates without GROUP BY, use GROUP BY true:
+//   SELECT MAX(seq) FROM crsql_changes GROUP BY true
 pub fn changes_union_query(
     table_infos: &[&TableInfo],
     idx_str: *const c_char,
@@ -686,8 +739,13 @@ pub fn changes_union_query(
     let has_cval = query_has_cval(metadata_use_version);
 
     // Read the binary plan from idx_str (allocated by changes_best_index).
-    let (constraints, order_by_col_ids, order_by_descs) =
+    let (constraints, order_by_col_ids, order_by_descs, flags) =
         unsafe { read_idx_plan(idx_str) };
+
+    // Scalar mode: GROUP BY/DISTINCT detected by xBestIndex via sqlite3_vtab_distinct.
+    // The vtab skips internal grouping/packing and returns scalar V1-style rows
+    // so aggregates like MAX(seq) work correctly on scalar values.
+    let scalar_mode = (flags & crate::changes_vtab::IDX_FLAG_SCALAR_MODE) != 0;
 
     // Reject LIKE/MATCH/GLOB/REGEXP on all crsql_changes columns. These ops
     // silently produce wrong results on packed BLOB outputs (cid, col_vrsn,
@@ -699,10 +757,12 @@ pub fn changes_union_query(
         }
     }
 
-    let is_v2_packed = metadata_use_version == consts::META_USE_V2
+    // V2 wire mode includes both packed (normal) and scalar (GROUP BY) variants.
+    // Both need pushed constraints and _seq_order for outer ORDER BY.
+    let is_v2_wire = metadata_use_version == consts::META_USE_V2
         && sync_log_version == consts::SYNC_LOG_V2;
 
-    // Columns that can be pushed into arms in V2-wire packed mode.
+    // Columns that can be pushed into arms in V2-wire mode.
     const PUSHABLE_COLS: &[CrsqlChangesColumn] = &[
         CrsqlChangesColumn::Tbl,
         CrsqlChangesColumn::Cid,
@@ -714,7 +774,7 @@ pub fn changes_union_query(
         CrsqlChangesColumn::Ts,
     ];
 
-    let (pushed, outer_idx_str) = if is_v2_packed {
+    let (pushed, outer_idx_str) = if is_v2_wire {
         // Partition constraints into pushable (go into arms) and other (stay
         // in outer WHERE). IS NULL / IS NOT NULL (param_idx == 0) stay in
         // outer WHERE since they have no parameter to bind inside arms.
@@ -777,8 +837,8 @@ pub fn changes_union_query(
         (vec![], outer)
     };
 
-    // In V2-wire packed mode we always need _seq_order for the outer ORDER BY.
-    let need_seq_order = is_v2_packed;
+    // In V2-wire mode we always need _seq_order for the outer ORDER BY.
+    let need_seq_order = is_v2_wire;
 
     for table_info in table_infos {
         let query_part = query_for_table(
@@ -787,6 +847,7 @@ pub fn changes_union_query(
             sync_log_version,
             &pushed,
             need_seq_order,
+            scalar_mode,
         )?;
         sub_queries.push(query_part);
     }

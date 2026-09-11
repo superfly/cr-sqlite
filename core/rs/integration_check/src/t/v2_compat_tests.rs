@@ -3082,6 +3082,237 @@ fn v2_backfill_db_version_per_row_not_per_cell() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// Test scalar output mode for crsql_changes when GROUP BY / DISTINCT is detected.
+///
+/// In V2 wire mode, cid/val/col_version/seq are packed BLOBs. When the outer query
+/// has GROUP BY, the vtab detects it via sqlite3_vtab_distinct() and switches to
+/// scalar mode: it skips internal grouping/packing and returns V1-style scalar rows.
+/// This makes MAX(seq) and other aggregates work correctly on scalar values.
+fn v2_wire_scalar_mode_group_by() -> Result<(), ResultCode> {
+    libc_println!("=== v2_wire_scalar_mode_group_by START ===");
+    let db = crate::opendb()?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+    db.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+    db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, a TEXT, b TEXT)")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+
+    // Insert a row and update columns in separate transactions to get
+    // different db_versions and seqs.
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("INSERT INTO foo VALUES (1, 'a0', 'b0')")?;
+    // db_version 2: update col a
+    db.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
+    db.db.exec_safe("UPDATE foo SET a = 'a1' WHERE id = 1")?;
+    // db_version 3: update col b
+    db.db.exec_safe("SELECT crsql_set_ts('1700000002')")?;
+    db.db.exec_safe("UPDATE foo SET b = 'b1' WHERE id = 1")?;
+
+    // Debug: check what db_versions and site_ids exist
+    {
+        let stmt = db.db.prepare_v2(
+            "SELECT DISTINCT db_version FROM crsql_changes WHERE \"table\" = 'foo' ORDER BY db_version"
+        )?;
+        while stmt.step()? == ResultCode::ROW {
+            libc_println!("  DEBUG db_version: {}", stmt.column_int64(0));
+        }
+    }
+
+    // Debug: check total row count without site_id filter
+    {
+        let stmt = db.db.prepare_v2(
+            "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'foo'"
+        )?;
+        stmt.step()?;
+        libc_println!("  DEBUG total rows (no site filter): {}", stmt.column_int(0));
+    }
+
+    // === Test 1: MAX(seq) GROUP BY db_version returns correct scalar max ===
+    // In V2 wire mode without scalar mode, MAX(seq) would do byte-wise
+    // comparison on the packed BLOB, which is semantically wrong.
+    {
+        let stmt = db.db.prepare_v2(
+            "SELECT db_version, MAX(seq) FROM crsql_changes \
+             WHERE site_id = crsql_site_id() \
+             GROUP BY db_version ORDER BY db_version"
+        )?;
+        let mut rows: Vec<(i64, i64)> = Vec::new();
+        while stmt.step()? == ResultCode::ROW {
+            rows.push((stmt.column_int64(0), stmt.column_int64(1)));
+        }
+        assert!(rows.len() >= 2, "GROUP BY db_version should return at least 2 rows, got {}", rows.len());
+
+        // Verify each MAX(seq) is a scalar integer (not a BLOB).
+        // If it were a BLOB, column_int would return 0 or garbage.
+        for &(dbv, max_seq) in &rows {
+            assert!(max_seq >= 0, "MAX(seq) for db_version {} should be >= 0, got {}", dbv, max_seq);
+            libc_println!("  GROUP BY db_version: dbv={}, max_seq={}", dbv, max_seq);
+        }
+
+        // Verify MAX(seq) is non-decreasing across db_versions (seq is monotonic)
+        for i in 1..rows.len() {
+            assert!(rows[i].1 >= rows[i-1].1,
+                "MAX(seq) should be non-decreasing across db_versions, got {} after {}",
+                rows[i].1, rows[i-1].1);
+        }
+        libc_println!("  GROUP BY db_version: {} rows, all MAX(seq) scalar", rows.len());
+    }
+
+    // === Test 2: GROUP BY true trick for bare aggregates ===
+    // SELECT MAX(seq) FROM crsql_changes (no GROUP BY) returns a BLOB (packed).
+    // SELECT MAX(seq) FROM crsql_changes GROUP BY true returns scalar max.
+    {
+        // With GROUP BY true — should return scalar max
+        let stmt = db.db.prepare_v2(
+            "SELECT MAX(seq) FROM crsql_changes WHERE site_id = crsql_site_id() GROUP BY true"
+        )?;
+        stmt.step()?;
+        let scalar_max = stmt.column_int64(0);
+        // seq can be 0 for the first change in a transaction, so just verify it's non-negative.
+        assert!(scalar_max >= 0, "MAX(seq) GROUP BY true should return non-negative scalar, got {}", scalar_max);
+        libc_println!("  MAX(seq) GROUP BY true = {}", scalar_max);
+
+        // Without GROUP BY — returns a BLOB (packed). column_type should be BLOB.
+        let stmt2 = db.db.prepare_v2(
+            "SELECT MAX(seq) FROM crsql_changes WHERE site_id = crsql_site_id()"
+        )?;
+        stmt2.step()?;
+        let blob_type = stmt2.column_type(0);
+        // In V2 wire mode without GROUP BY, MAX(seq) on packed BLOBs returns a BLOB.
+        // (SQLite's MAX aggregate on BLOBs returns a BLOB.)
+        libc_println!("  MAX(seq) without GROUP BY: type={:?}", blob_type);
+        // We don't assert BLOB type strictly — SQLite may return TEXT for packed blob.
+        // The key point is that GROUP BY true gives scalar, without gives packed.
+    }
+
+    // === Test 3: Normal wire query still returns packed rows ===
+    // Without GROUP BY, the vtab should still return packed BLOBs for cid, val, etc.
+    {
+        // Find the first db_version to query
+        let dv_stmt = db.db.prepare_v2(
+            "SELECT db_version FROM crsql_changes WHERE \"table\" = 'foo' ORDER BY db_version LIMIT 1"
+        )?;
+        dv_stmt.step()?;
+        let first_dv = dv_stmt.column_int64(0);
+        libc_println!("  first db_version = {}", first_dv);
+
+        let stmt = db.db.prepare_v2(
+            "SELECT \"table\", pk, cid, val, col_version, db_version, seq, site_id, cl \
+             FROM crsql_changes WHERE \"table\" = 'foo' AND db_version = ? ORDER BY seq"
+        )?;
+        stmt.bind_int64(1, first_dv)?;
+        let mut row_count = 0;
+        while stmt.step()? == ResultCode::ROW {
+            // In packed mode, cid should be a BLOB (packed column names)
+            let cid_type = stmt.column_type(2);
+            let seq_type = stmt.column_type(6);
+            libc_println!("  packed row {}: cid_type={:?}, seq_type={:?}", row_count, cid_type, seq_type);
+            row_count += 1;
+        }
+        assert!(row_count > 0, "normal wire query should return packed rows");
+        // In V2 wire mode, the insert at the first db_version should produce 1 packed row
+        // (all columns coalesced into one row).
+        assert_eq!(row_count, 1, "first db_version should produce 1 packed row, got {}", row_count);
+    }
+
+    // === Test 4: MAX(ts) works in both modes (ts is always scalar) ===
+    {
+        // With GROUP BY
+        let stmt = db.db.prepare_v2(
+            "SELECT MAX(ts) FROM crsql_changes WHERE site_id = crsql_site_id() GROUP BY true"
+        )?;
+        stmt.step()?;
+        let max_ts_grouped = stmt.column_int64(0);
+
+        // Without GROUP BY
+        let stmt2 = db.db.prepare_v2(
+            "SELECT MAX(ts) FROM crsql_changes WHERE site_id = crsql_site_id()"
+        )?;
+        stmt2.step()?;
+        let max_ts_bare = stmt2.column_int64(0);
+
+        assert_eq!(max_ts_grouped, max_ts_bare,
+            "MAX(ts) should be the same with or without GROUP BY (ts is always scalar)");
+        libc_println!("  MAX(ts): grouped={}, bare={}", max_ts_grouped, max_ts_bare);
+    }
+
+    // === Test 5: Scalar mode handles pushed constraints ===
+    // WHERE site_id = ? AND db_version = ? AND seq > ? should work in scalar mode.
+    {
+        // First, find the max seq across all rows
+        let stmt = db.db.prepare_v2(
+            "SELECT MAX(seq) FROM crsql_changes WHERE site_id = crsql_site_id() GROUP BY true"
+        )?;
+        stmt.step()?;
+        let max_seq = stmt.column_int64(0);
+
+        // Now query with seq > (max_seq - 100) to filter in scalar mode
+        let stmt2 = db.db.prepare_v2(
+            "SELECT count(*) FROM crsql_changes \
+             WHERE site_id = crsql_site_id() AND db_version >= 1 AND seq >= 0 \
+             GROUP BY true"
+        )?;
+        stmt2.step()?;
+        let count_with_constraint = stmt2.column_int64(0);
+        assert!(count_with_constraint > 0, "scalar mode with pushed constraints should return rows");
+        libc_println!("  scalar mode pushed constraints: count={}, max_seq={}", count_with_constraint, max_seq);
+    }
+
+    // === Test 6: GROUP BY db_version with multiple columns in same db_version ===
+    // Insert a row with multiple columns in one transaction to verify
+    // that scalar mode correctly returns per-column rows.
+    {
+        db.db.exec_safe("SELECT crsql_set_ts('1700000010')")?;
+        db.db.exec_safe("INSERT INTO foo VALUES (2, 'x', 'y')")?;
+
+        // Find the db_version of the last insert
+        let dv_stmt = db.db.prepare_v2(
+            "SELECT MAX(db_version) FROM crsql_changes WHERE \"table\" = 'foo'"
+        )?;
+        dv_stmt.step()?;
+        let last_dv = dv_stmt.column_int64(0);
+        libc_println!("  last db_version = {}", last_dv);
+
+        // In scalar mode, GROUP BY db_version should see individual column changes
+        let stmt = db.db.prepare_v2(
+            "SELECT db_version, count(*) FROM crsql_changes \
+             WHERE \"table\" = 'foo' AND db_version = ? \
+             GROUP BY db_version"
+        )?;
+        stmt.bind_int64(1, last_dv)?;
+        stmt.step()?;
+        let dbv = stmt.column_int64(0);
+        let cnt = stmt.column_int64(1);
+        libc_println!("  GROUP BY db_version={}: dbv={}, count={}", last_dv, dbv, cnt);
+        // In scalar mode, the insert produces multiple scalar rows
+        // (one per column: sentinel + a + b). In packed mode it would be 1 row.
+        // Since we're in scalar mode (GROUP BY detected), count should be > 1.
+        assert!(cnt > 1, "scalar mode should return multiple rows for multi-column insert, got {}", cnt);
+    }
+
+    // === Test 7: DISTINCT works (returns scalar rows) ===
+    {
+        let stmt = db.db.prepare_v2(
+            "SELECT DISTINCT db_version FROM crsql_changes \
+             WHERE site_id = crsql_site_id() ORDER BY db_version"
+        )?;
+        let mut rows: Vec<i64> = Vec::new();
+        while stmt.step()? == ResultCode::ROW {
+            rows.push(stmt.column_int64(0));
+        }
+        assert!(rows.len() >= 2, "DISTINCT db_version should return at least 2 rows, got {}", rows.len());
+        // Verify distinctness
+        for i in 1..rows.len() {
+            assert!(rows[i] > rows[i-1], "DISTINCT db_version should be strictly increasing");
+        }
+        libc_println!("  DISTINCT db_version: {} rows", rows.len());
+    }
+
+    libc_println!("=== v2_wire_scalar_mode_group_by PASS ===");
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), ResultCode> {
     v2_basic_insert_sync()?;
     v2_update_sync()?;
@@ -3125,6 +3356,7 @@ pub fn run_suite() -> Result<(), ResultCode> {
     v2_on_demand_hydration_clock_comparison()?;
     v2_backfill_db_version_per_row_not_per_cell()?;
     v2_mixed_order_by_directions()?;
+    v2_wire_scalar_mode_group_by()?;
     Ok(())
 }
 

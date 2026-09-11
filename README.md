@@ -191,6 +191,33 @@ The V1 wire format produces one `crsql_changes` row per column change. If a tran
 
 This speeds up processing of operations touching multiple columns at the same time, for example when inserting a new row into a table.
 
+### Aggregate Queries in V2 Wire Mode (GROUP BY / DISTINCT)
+
+In V2 wire mode, `cid`, `cval`, `col_vrsn`, and `seq` are packed BLOBs. This is efficient for replication but breaks aggregate metadata queries like:
+
+```sql
+SELECT db_version, MAX(seq), MAX(ts)
+FROM crsql_changes
+WHERE site_id = ? AND db_version BETWEEN ? AND ?
+GROUP BY db_version
+```
+
+`MAX(seq)` would do byte-wise comparison on the packed BLOB, which is semantically wrong.
+
+To fix this, the vtab automatically detects `GROUP BY` / `DISTINCT` in the outer query (via `sqlite3_vtab_distinct()`) and switches to **scalar mode**: it skips internal grouping/packing and returns V1-style scalar rows (one row per column change, with scalar `seq`, `cid`, `col_version`, `val`). This makes `MAX(seq)` and other aggregates work correctly on scalar values.
+
+**Bare aggregates without GROUP BY**: `SELECT MAX(seq) FROM crsql_changes` (no `GROUP BY`) still returns a packed BLOB because the vtab has no way to detect that a bare aggregate needs scalar values. Use the `GROUP BY true` to force scalar mode:
+
+```sql
+-- Returns correct scalar max seq in V2 wire mode:
+SELECT MAX(seq) FROM crsql_changes GROUP BY true
+
+-- Without GROUP BY, returns a packed BLOB (expected behavior):
+SELECT MAX(seq) FROM crsql_changes
+```
+
+`ts` is always scalar in both modes, so `MAX(ts)` works correctly with or without `GROUP BY`.
+
 ### Hashed Primary Keys
 
 V2 hashes PK values with `xxh3_128` (truncated to `PK_HASH_SIZE` bytes, currently 10) and stores them as blobs. This is primarily to limit the size of tombstone entries, which accumulate over time. V2 also moves tombstones to a dedicated `v2_tombstones` table (separate from the clock table), reducing clock table bloat from row deletions.
