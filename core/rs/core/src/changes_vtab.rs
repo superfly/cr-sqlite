@@ -24,6 +24,10 @@ use sqlite_nostd::ResultCode;
 /// it for C, but the full magic is visible in a debugger).
 pub const IDX_MAGIC: [u8; 11] = *b"Rust magic\0";
 
+/// Flag bit in ChangesIdxHeader.flags: scalar mode (GROUP BY/DISTINCT detected).
+/// When set, the vtab skips internal grouping/packing and returns scalar V1-style rows.
+pub const IDX_FLAG_SCALAR_MODE: u8 = 1;
+
 /// A single WHERE constraint, packed into 3 bytes.
 /// `col` is the constrained column (CrsqlChangesColumn, 1 byte via repr(u8)).
 /// `op_id` is a `SQLITE_INDEX_CONSTRAINT_*` value (2-71).
@@ -39,6 +43,7 @@ pub struct PlanConstraint {
 /// Variable-size header for the binary idxStr. Followed by:
 ///   [PlanConstraint; num_constraints]
 ///   [u8; num_order_by]  (column IDs for ORDER BY)
+///   [u8; num_order_by]  (per-column desc flags)
 ///
 /// Allocated with sqlite3_malloc, freed by SQLite via sqlite3_free.
 /// No heap pointers, no Drop — pure POD.
@@ -47,26 +52,29 @@ pub struct ChangesIdxHeader {
     pub magic: [u8; 11],         // "Rust magic\0"
     pub num_constraints: u8,
     pub num_order_by: u8,        // 0 = no user ORDER BY (use default)
+    pub flags: u8,               // bit 0: scalar mode (GROUP BY/DISTINCT detected)
 }
 
 /// Read the constraints from a ChangesIdxHeader pointer.
-/// Returns (constraints, order_by_cols, order_by_descs).
+/// Returns (constraints, order_by_cols, order_by_descs, flags).
 pub unsafe fn read_idx_plan(
     ptr: *const c_char,
 ) -> (
     Vec<PlanConstraint>,
     Vec<crate::c::CrsqlChangesColumn>,
     Vec<bool>,
+    u8,
 ) {
     if ptr.is_null() {
-        return (vec![], vec![], vec![]);
+        return (vec![], vec![], vec![], 0);
     }
     let header = &*(ptr as *const ChangesIdxHeader);
     if header.magic != IDX_MAGIC {
-        return (vec![], vec![], vec![]);
+        return (vec![], vec![], vec![], 0);
     }
     let nc = header.num_constraints as usize;
     let no = header.num_order_by as usize;
+    let flags = header.flags;
 
     let constraints_ptr = (ptr as *const u8).add(core::mem::size_of::<ChangesIdxHeader>())
         as *const PlanConstraint;
@@ -86,7 +94,7 @@ pub unsafe fn read_idx_plan(
         Vec::new()
     };
 
-    (constraints, order_by, order_by_descs)
+    (constraints, order_by, order_by_descs, flags)
 }
 
 /// Allocate a ChangesIdxHeader + trailing arrays with sqlite3_malloc.
@@ -95,6 +103,7 @@ pub fn alloc_idx_plan(
     constraints: &[PlanConstraint],
     order_by_cols: &[crate::c::CrsqlChangesColumn],
     order_by_descs: &[bool],
+    flags: u8,
 ) -> *mut c_char {
     let header_size = core::mem::size_of::<ChangesIdxHeader>();
     let constraint_size = constraints.len() * core::mem::size_of::<PlanConstraint>();
@@ -112,6 +121,7 @@ pub fn alloc_idx_plan(
         (*header).magic = IDX_MAGIC;
         (*header).num_constraints = constraints.len() as u8;
         (*header).num_order_by = order_by_cols.len() as u8;
+        (*header).flags = flags;
 
         let c_ptr = ptr.add(header_size) as *mut PlanConstraint;
         for (i, c) in constraints.iter().enumerate() {
@@ -144,6 +154,19 @@ use crate::consts;
 use crate::changes_vtab_read::changes_union_query;
 use crate::pack_columns::bind_package_to_stmt;
 use crate::pack_columns::unpack_columns;
+
+/// Read just the flags byte from a ChangesIdxHeader pointer.
+/// Returns 0 if the pointer is null or the magic doesn't match.
+pub unsafe fn read_idx_flags(ptr: *const c_char) -> u8 {
+    if ptr.is_null() {
+        return 0;
+    }
+    let header = &*(ptr as *const ChangesIdxHeader);
+    if header.magic != IDX_MAGIC {
+        return 0;
+    }
+    header.flags
+}
 
 fn changes_crsr_finalize(crsr: *mut crsql_Changes_cursor) -> c_int {
     // Assign pointers to null after freeing
@@ -192,6 +215,16 @@ fn changes_best_index(
     index_info: *mut sqlite::index_info,
 ) -> Result<ResultCode, ResultCode> {
     let mut idx_num: i32 = 0;
+
+    // Detect GROUP BY / DISTINCT via sqlite3_vtab_distinct().
+    // Returns 0 (none), 1 (GROUP BY), 2 (DISTINCT), 3 (DISTINCT ORDER BY).
+    // When 1 or 2, we switch to scalar mode: skip internal grouping/packing
+    // and return V1-style scalar rows so aggregates like MAX(seq) work correctly.
+    let distinct = sqlite::vtab_distinct(index_info);
+    let mut flags: u8 = 0;
+    if distinct == 1 || distinct == 2 {
+        flags |= IDX_FLAG_SCALAR_MODE;
+    }
 
     let mut plan_constraints: Vec<PlanConstraint> = Vec::new();
     let constraints = sqlite::args!((*index_info).nConstraint, (*index_info).aConstraint);
@@ -282,7 +315,7 @@ fn changes_best_index(
         }
     }
 
-    let ptr = alloc_idx_plan(&plan_constraints, &order_by_cols, &order_by_descs);
+    let ptr = alloc_idx_plan(&plan_constraints, &order_by_cols, &order_by_descs, flags);
     unsafe {
         (*index_info).idxNum = idx_num;
         (*index_info).orderByConsumed = if order_by_consumed { 1 } else { 0 };
@@ -532,12 +565,22 @@ unsafe fn changes_next(
     } else {
         let sync_log_version = (*(*(*cursor).pTab).pExtData).syncLogVersion;
         if sync_log_version == crate::consts::SYNC_LOG_V2 {
-            // Packed (v2 sync-log) row: all update rows are packed in V2 wire format.
-            // cval is already in the query result (ClockUnionColumn::Cval), no lazy fetch needed.
-            (*cursor).rowType = ChangeRowType::PackedUpdate as c_int;
-            return Ok(ResultCode::OK);
+            // Check scalar mode: if GROUP BY/DISTINCT was detected by xBestIndex,
+            // the query returned scalar rows (no packing), so use Update row type.
+            let flags = unsafe { read_idx_flags((*cursor).cached_idx_str) };
+            if (flags & IDX_FLAG_SCALAR_MODE) != 0 {
+                // Scalar mode: rows are V1-style scalar (no packing).
+                // cval is still inline in the query result (V2 metadata).
+                (*cursor).rowType = ChangeRowType::Update as c_int;
+            } else {
+                // Packed (v2 sync-log) row: all update rows are packed in V2 wire format.
+                // cval is already in the query result (ClockUnionColumn::Cval), no lazy fetch needed.
+                (*cursor).rowType = ChangeRowType::PackedUpdate as c_int;
+                return Ok(ResultCode::OK);
+            }
+        } else {
+            (*cursor).rowType = ChangeRowType::Update as c_int;
         }
-        (*cursor).rowType = ChangeRowType::Update as c_int;
     }
 
     // V2 metadata fetches cval inline in the query — no lazy fetch needed.
