@@ -2162,7 +2162,13 @@ fn test_default_ts_basic() -> Result<(), ResultCode> {
     // Insert without crsql_set_ts — should use default
     db.db.exec_safe("INSERT INTO foo VALUES (1, 'x')")?;
 
-    // Verify the clock table got the default ts
+    // Verify the clock table got the default ts.
+    // NOTE: This table uses `id PRIMARY KEY NOT NULL` (not INTEGER PRIMARY KEY),
+    // so it is a non-INTEGER PK table. However, it is still a rowid table (default
+    // in SQLite), and crsql uses the auto-assigned rowid as __crsql_key. Since the
+    // first insert gets rowid 1, `cell_key >> 12` (shifting by CRSQL_COL_ID_BITS=12)
+    // yields the rowid, which coincidentally matches the PK value 1. This assumption
+    // is fragile — it only holds because rowids are sequential and match the PK values.
     let stmt = db.db.prepare_v2(
         "SELECT ts FROM foo__crsql_v2_clock WHERE cell_key >> 12 = 1 LIMIT 1",
     )?;
@@ -2186,6 +2192,10 @@ fn test_default_ts_explicit_wins() -> Result<(), ResultCode> {
     db.db.exec_safe("SELECT crsql_set_ts('1800000000')")?;
     db.db.exec_safe("INSERT INTO foo VALUES (1, 'x')")?;
 
+    // NOTE: `cell_key >> 12` extracts the row key (shifting by CRSQL_COL_ID_BITS=12).
+    // This table is a non-INTEGER PK rowid table; crsql uses the auto-assigned rowid
+    // as __crsql_key. The first insert gets rowid 1, which matches PK value 1.
+    // This assumption is fragile — see comment in test_default_ts_basic.
     let stmt = db.db.prepare_v2(
         "SELECT ts FROM foo__crsql_v2_clock WHERE cell_key >> 12 = 1 LIMIT 1",
     )?;
@@ -2277,6 +2287,9 @@ fn test_default_ts_static_across_txns() -> Result<(), ResultCode> {
     db.db.exec_safe("INSERT INTO foo VALUES (1, 'x')")?;
     db.db.exec_safe("INSERT INTO foo VALUES (2, 'y')")?;
 
+    // NOTE: `cell_key >> 12` extracts the row key (shifting by CRSQL_COL_ID_BITS=12).
+    // This non-INTEGER PK rowid table uses auto-assigned rowids as __crsql_key.
+    // Rowids 1 and 2 match PK values 1 and 2 — fragile assumption, see test_default_ts_basic.
     let stmt = db.db.prepare_v2(
         "SELECT DISTINCT ts FROM foo__crsql_v2_clock WHERE cell_key >> 12 IN (1, 2)",
     )?;

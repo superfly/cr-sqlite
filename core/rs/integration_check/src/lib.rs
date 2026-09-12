@@ -23,6 +23,8 @@ pub extern "C" fn crsql_integration_check() {
     t::pack_columns::run_suite().expect("pack columns suite");
     println!("Running pk_only_tables");
     t::pk_only_tables::run_suite();
+    println!("Running pk_update");
+    t::pk_update::run_suite().expect("pk update suite");
     println!("Running sync_bit_honored");
     t::sync_bit_honored::run_suite().expect("sync bit honored suite");
     println!("Running tableinfo");

@@ -21,16 +21,18 @@ fn sync_left_to_right(l: &dyn Connection, r: &dyn Connection, since: sqlite::int
     r.exec_safe("BEGIN").expect("begin");
     r.exec_safe("SELECT crsql_set_ts('1700000000')").expect("set ts");
 
+    // Prepare the INSERT statement once and reuse it across all rows.
+    let stmt_r = r
+        .prepare_v2("INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .expect("prepared insert changes");
     while stmt_l.step().expect("pulled change set") == ResultCode::ROW {
-        let stmt_r = r
-            .prepare_v2("INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .expect("prepared insert changes");
         for x in 0..10 {
             stmt_r
                 .bind_value(x + 1, stmt_l.column_value(x).expect("got changeset value"))
                 .expect("bound value");
         }
         stmt_r.step().expect("inserted change");
+        stmt_r.reset().expect("reset stmt");
     }
     r.exec_safe("COMMIT").expect("commit");
 }
@@ -127,7 +129,7 @@ fn insert_pkonly_row() {
         .expect("prepared select foo");
     let result = stmt.step().expect("stepped");
     assert_eq!(result, ResultCode::ROW);
-    let id = stmt.column_int(0);
+    let id = stmt.column_int64(0);
     assert_eq!(id, 1);
     let result = stmt.step().expect("stepped");
     assert_eq!(result, ResultCode::DONE);
@@ -170,7 +172,7 @@ fn modify_pkonly_row() -> Result<(), ResultCode> {
         .expect("prepare select all from foo");
     let result = stmt.step().expect("step select all from foo");
     assert_eq!(result, ResultCode::ROW);
-    let id = stmt.column_int(0);
+    let id = stmt.column_int64(0);
     assert_eq!(id, 2);
     let result = stmt.step()?;
     assert_eq!(result, ResultCode::DONE);
@@ -257,6 +259,10 @@ fn discord_report_1() -> Result<(), ResultCode> {
     let table = stmt.column_text(0)?;
     assert_eq!(table, "data");
     let pk_val = stmt.column_blob(1)?;
+    // The PK blob is cr-sqlite's internal serialization of the integer PK 42.
+    // Format: [0x01, 0x09, 0x2A] where 0x2A = 42 (the PK value) and the leading
+    // bytes (0x01, 0x09) are the serialization header encoding the column type
+    // and value length.
     assert_eq!(pk_val, [0x01, 0x09, 0x2A]);
     let cid = stmt.column_text(2)?;
     assert_eq!(cid, "-1");

@@ -21,6 +21,7 @@ static void testInsertOrReplaceBasic() {
   rc = sqlite3_exec(db, "CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b TEXT);", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_as_crr('foo');", 0, 0, 0);
@@ -65,7 +66,7 @@ static void testInsertOrReplaceBasic() {
   // The final state should show cl=3 (delete cl=2 + resurrect cl=3)
   assert(found_insert);
 
-  crsql_close(db);
+  assert(crsql_close(db) == SQLITE_OK);
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
@@ -81,7 +82,10 @@ static void testInsertOrReplaceNoLingeringMetadata() {
   rc = sqlite3_exec(db, "CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b TEXT);", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('metadata-write-version', 2)", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_as_crr('foo');", 0, 0, 0);
   if (rc != SQLITE_OK) {
@@ -105,17 +109,17 @@ static void testInsertOrReplaceNoLingeringMetadata() {
 
   // Verify only one PK entry in v2_pks (no lingering duplicates)
   rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM foo__crsql_v2_pks;", -1, &pStmt, 0);
-  if (rc == SQLITE_OK && sqlite3_step(pStmt) == SQLITE_ROW) {
-    assert(sqlite3_column_int64(pStmt, 0) == 1);
-    sqlite3_finalize(pStmt);
-  }
+  assert(rc == SQLITE_OK);
+  assert(sqlite3_step(pStmt) == SQLITE_ROW);
+  assert(sqlite3_column_int64(pStmt, 0) == 1);
+  sqlite3_finalize(pStmt);
 
   // Verify no lingering tombstones (row should be alive, not dead)
   rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM foo__crsql_v2_tombstones;", -1, &pStmt, 0);
-  if (rc == SQLITE_OK && sqlite3_step(pStmt) == SQLITE_ROW) {
-    assert(sqlite3_column_int64(pStmt, 0) == 0);
-    sqlite3_finalize(pStmt);
-  }
+  assert(rc == SQLITE_OK);
+  assert(sqlite3_step(pStmt) == SQLITE_ROW);
+  assert(sqlite3_column_int64(pStmt, 0) == 0);
+  sqlite3_finalize(pStmt);
 
   // Verify the latest value is correct
   rc = sqlite3_prepare_v2(db, "SELECT b FROM foo WHERE a = 1;", -1, &pStmt, 0);
@@ -124,7 +128,7 @@ static void testInsertOrReplaceNoLingeringMetadata() {
   assert(strcmp("d", (const char *)sqlite3_column_text(pStmt, 0)) == 0);
   sqlite3_finalize(pStmt);
 
-  crsql_close(db);
+  assert(crsql_close(db) == SQLITE_OK);
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
@@ -140,6 +144,7 @@ static void testInsertOrReplaceNewRow() {
   rc = sqlite3_exec(db, "CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b TEXT);", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_as_crr('foo');", 0, 0, 0);
@@ -165,7 +170,7 @@ static void testInsertOrReplaceNewRow() {
   assert(sqlite3_column_int64(pStmt, 0) == 1);
   sqlite3_finalize(pStmt);
 
-  crsql_close(db);
+  assert(crsql_close(db) == SQLITE_OK);
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
@@ -180,6 +185,7 @@ static void testRecursiveTriggersEnabled() {
 
   // Load cr-sqlite — should enable recursive_triggers
   rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
@@ -189,7 +195,7 @@ static void testRecursiveTriggersEnabled() {
   assert(sqlite3_column_int64(pStmt, 0) == 1);
   sqlite3_finalize(pStmt);
 
-  crsql_close(db);
+  assert(crsql_close(db) == SQLITE_OK);
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 

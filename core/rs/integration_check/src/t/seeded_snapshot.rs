@@ -24,28 +24,40 @@ fn sync_left_to_right(
     let stmt_l = l.prepare_v2("SELECT * FROM crsql_changes WHERE db_version >= ?")?;
     stmt_l.bind_int64(1, since)?;
 
-    r.exec_safe("BEGIN")?;
-    r.exec_safe("SELECT crsql_set_ts('1700000000')")?;
-    while stmt_l.step()? == ResultCode::ROW {
-        let stmt_r = r
-            .prepare_v2("INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")?;
-        for x in 0..10 {
-            stmt_r.bind_value(x + 1, stmt_l.column_value(x)?)?;
-        }
-        match stmt_r.step() {
-            Ok(_) => {}
-            Err(e) => {
-                let msg = r
-                    .errmsg()
-                    .unwrap_or_else(|_| alloc::string::ToString::to_string("unknown"));
-                libc_println!("SYNC ERROR: {:?} - {}", e, msg);
-                let _ = r.exec_safe("ROLLBACK");
-                return Err(e);
+    // Wrap the transactional work so that every early-return path issues a
+    // ROLLBACK, preventing a transaction leak on error.
+    let result = (|| -> Result<(), ResultCode> {
+        r.exec_safe("BEGIN")?;
+        r.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+        // Prepare the insert statement once and reuse it across rows instead of
+        // re-preparing on every change row. Prepared inside the transaction so
+        // the statement sees the correct schema/state.
+        let stmt_r = r.prepare_v2("INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")?;
+        while stmt_l.step()? == ResultCode::ROW {
+            for x in 0..10 {
+                stmt_r.bind_value(x + 1, stmt_l.column_value(x)?)?;
             }
+            match stmt_r.step() {
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = r
+                        .errmsg()
+                        .unwrap_or_else(|_| alloc::string::ToString::to_string("unknown"));
+                    libc_println!("SYNC ERROR: {:?} - {}", e, msg);
+                    return Err(e);
+                }
+            }
+            let _ = stmt_r.reset();
+            let _ = stmt_r.clear_bindings();
         }
+        r.exec_safe("COMMIT")?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = r.exec_safe("ROLLBACK");
     }
-    r.exec_safe("COMMIT")?;
-    Ok(())
+    result
 }
 
 fn cleanup_files(paths: &[&str]) {
@@ -60,11 +72,18 @@ fn cleanup_files(paths: &[&str]) {
     }
 }
 
-fn copy_file(src: &str, dst: &str) {
+fn copy_file(src: &str, dst: &str) -> Result<(), ResultCode> {
+    // Shell out to the platform copy command. `cp` is Unix-only; on Windows use
+    // `cmd /c copy` (copy is a cmd builtin, so it must be invoked via cmd).
+    #[cfg(not(target_os = "windows"))]
     let cmd_cstr = alloc::format!("cp {} {}\0", src, dst);
-    unsafe {
-        system(cmd_cstr.as_ptr() as *const core::ffi::c_char);
+    #[cfg(target_os = "windows")]
+    let cmd_cstr = alloc::format!("cmd /c copy /b /y {} {}\0", src, dst);
+    let rc = unsafe { system(cmd_cstr.as_ptr() as *const core::ffi::c_char) };
+    if rc != 0 {
+        return Err(ResultCode::ERROR);
     }
+    Ok(())
 }
 
 /// Create a seed DB with data, migrate to V2, then clear clock entries.
@@ -195,7 +214,7 @@ fn seeded_no_spurious_changes() -> Result<(), ResultCode> {
 
     cleanup_files(&[seed_path, node_a_path]);
     create_seed_db(seed_path)?;
-    copy_file(seed_path, node_a_path);
+    copy_file(seed_path, node_a_path)?;
 
     let db_a = open_node(node_a_path)?;
 
@@ -228,8 +247,8 @@ fn seeded_update_propagates() -> Result<(), ResultCode> {
 
     cleanup_files(&[seed_path, node_a_path, node_b_path]);
     create_seed_db(seed_path)?;
-    copy_file(seed_path, node_a_path);
-    copy_file(seed_path, node_b_path);
+    copy_file(seed_path, node_a_path)?;
+    copy_file(seed_path, node_b_path)?;
 
     let db_a = open_node(node_a_path)?;
     let db_b = open_node(node_b_path)?;
@@ -268,9 +287,9 @@ fn seeded_new_insert_propagates() -> Result<(), ResultCode> {
 
     cleanup_files(&[seed_path, node_a_path, node_b_path, node_c_path]);
     create_seed_db(seed_path)?;
-    copy_file(seed_path, node_a_path);
-    copy_file(seed_path, node_b_path);
-    copy_file(seed_path, node_c_path);
+    copy_file(seed_path, node_a_path)?;
+    copy_file(seed_path, node_b_path)?;
+    copy_file(seed_path, node_c_path)?;
 
     let db_a = open_node(node_a_path)?;
     let db_b = open_node(node_b_path)?;
@@ -311,8 +330,8 @@ fn seeded_delete_propagates() -> Result<(), ResultCode> {
 
     cleanup_files(&[seed_path, node_a_path, node_b_path]);
     create_seed_db(seed_path)?;
-    copy_file(seed_path, node_a_path);
-    copy_file(seed_path, node_b_path);
+    copy_file(seed_path, node_a_path)?;
+    copy_file(seed_path, node_b_path)?;
 
     let db_a = open_node(node_a_path)?;
     let db_b = open_node(node_b_path)?;
@@ -349,9 +368,9 @@ fn seeded_pk_only_propagates() -> Result<(), ResultCode> {
 
     cleanup_files(&[seed_path, node_a_path, node_b_path, node_c_path]);
     create_seed_db(seed_path)?;
-    copy_file(seed_path, node_a_path);
-    copy_file(seed_path, node_b_path);
-    copy_file(seed_path, node_c_path);
+    copy_file(seed_path, node_a_path)?;
+    copy_file(seed_path, node_b_path)?;
+    copy_file(seed_path, node_c_path)?;
 
     let db_a = open_node(node_a_path)?;
     let db_b = open_node(node_b_path)?;
@@ -392,8 +411,8 @@ fn seeded_composite_pk_propagates() -> Result<(), ResultCode> {
 
     cleanup_files(&[seed_path, node_a_path, node_b_path]);
     create_seed_db(seed_path)?;
-    copy_file(seed_path, node_a_path);
-    copy_file(seed_path, node_b_path);
+    copy_file(seed_path, node_a_path)?;
+    copy_file(seed_path, node_b_path)?;
 
     let db_a = open_node(node_a_path)?;
     let db_b = open_node(node_b_path)?;
@@ -429,8 +448,8 @@ fn seeded_bidirectional_sync() -> Result<(), ResultCode> {
 
     cleanup_files(&[seed_path, node_a_path, node_b_path]);
     create_seed_db(seed_path)?;
-    copy_file(seed_path, node_a_path);
-    copy_file(seed_path, node_b_path);
+    copy_file(seed_path, node_a_path)?;
+    copy_file(seed_path, node_b_path)?;
 
     let db_a = open_node(node_a_path)?;
     let db_b = open_node(node_b_path)?;
@@ -486,8 +505,8 @@ fn seeded_delete_reinsert() -> Result<(), ResultCode> {
 
     cleanup_files(&[seed_path, node_a_path, node_b_path]);
     create_seed_db(seed_path)?;
-    copy_file(seed_path, node_a_path);
-    copy_file(seed_path, node_b_path);
+    copy_file(seed_path, node_a_path)?;
+    copy_file(seed_path, node_b_path)?;
 
     let db_a = open_node(node_a_path)?;
     let db_b = open_node(node_b_path)?;
@@ -524,8 +543,8 @@ fn seeded_conflict_resolution() -> Result<(), ResultCode> {
 
     cleanup_files(&[seed_path, node_a_path, node_b_path]);
     create_seed_db(seed_path)?;
-    copy_file(seed_path, node_a_path);
-    copy_file(seed_path, node_b_path);
+    copy_file(seed_path, node_a_path)?;
+    copy_file(seed_path, node_b_path)?;
 
     let db_a = open_node(node_a_path)?;
     let db_b = open_node(node_b_path)?;

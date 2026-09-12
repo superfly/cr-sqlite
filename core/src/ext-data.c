@@ -28,37 +28,61 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   int rc = sqlite3_prepare_v3(db, "PRAGMA schema_version", -1,
                               SQLITE_PREPARE_PERSISTENT,
                               &(pExtData->pPragmaSchemaVersionStmt), 0);
+  if (rc != SQLITE_OK) {
+    crsql_freeExtData(pExtData);
+    return 0;
+  }
   pExtData->pPragmaDataVersionStmt = 0;
-  rc += sqlite3_prepare_v3(db, "PRAGMA data_version", -1,
+  rc = sqlite3_prepare_v3(db, "PRAGMA data_version", -1,
                            SQLITE_PREPARE_PERSISTENT,
                            &(pExtData->pPragmaDataVersionStmt), 0);
+  if (rc != SQLITE_OK) {
+    crsql_freeExtData(pExtData);
+    return 0;
+  }
   pExtData->pSetSyncBitStmt = 0;
-  rc += sqlite3_prepare_v3(db, SET_SYNC_BIT, -1, SQLITE_PREPARE_PERSISTENT,
+  rc = sqlite3_prepare_v3(db, SET_SYNC_BIT, -1, SQLITE_PREPARE_PERSISTENT,
                            &(pExtData->pSetSyncBitStmt), 0);
+  if (rc != SQLITE_OK) {
+    crsql_freeExtData(pExtData);
+    return 0;
+  }
   pExtData->pClearSyncBitStmt = 0;
-  rc += sqlite3_prepare_v3(db, CLEAR_SYNC_BIT, -1, SQLITE_PREPARE_PERSISTENT,
+  rc = sqlite3_prepare_v3(db, CLEAR_SYNC_BIT, -1, SQLITE_PREPARE_PERSISTENT,
                            &(pExtData->pClearSyncBitStmt), 0);
+  if (rc != SQLITE_OK) {
+    crsql_freeExtData(pExtData);
+    return 0;
+  }
 
   pExtData->pSetSiteIdOrdinalStmt = 0;
 
   pExtData->pSelectSiteIdOrdinalStmt = 0;
 
   pExtData->pSelectClockTablesStmt = 0;
-  rc +=
-      sqlite3_prepare_v3(db, CLOCK_TABLES_SELECT, -1, SQLITE_PREPARE_PERSISTENT,
-                         &(pExtData->pSelectClockTablesStmt), 0);
+  rc = sqlite3_prepare_v3(db, CLOCK_TABLES_SELECT, -1,
+                          SQLITE_PREPARE_PERSISTENT,
+                          &(pExtData->pSelectClockTablesStmt), 0);
+  if (rc != SQLITE_OK) {
+    crsql_freeExtData(pExtData);
+    return 0;
+  }
 
   pExtData->dbVersion = -1;
   pExtData->pendingDbVersion = -1;
 
   pExtData->pSetDbVersionStmt = 0;
-  rc += sqlite3_prepare_v3(
+  rc = sqlite3_prepare_v3(
       db,
       "INSERT INTO crsql_db_versions (site_id, db_version) VALUES "
       "(?, ?)  ON "
       "CONFLICT (site_id) DO UPDATE SET db_version = excluded.db_version "
       "WHERE crsql_db_versions.db_version < excluded.db_version RETURNING db_version",
       -1, SQLITE_PREPARE_PERSISTENT, &(pExtData->pSetDbVersionStmt), 0);
+  if (rc != SQLITE_OK) {
+    crsql_freeExtData(pExtData);
+    return 0;
+  }
 
   // printf("instantiated pSetDbVersionStmt, rc: %d\n", rc);
 
@@ -67,10 +91,14 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   pExtData->pragmaDataVersion = -1;
   pExtData->pragmaSchemaVersionForTableInfos = -1;
   pExtData->pDbVersionStmt = 0;
-  rc += sqlite3_prepare_v3(
+  rc = sqlite3_prepare_v3(
       db,
       "SELECT db_version FROM crsql_db_versions WHERE site_id = ?",
       -1, SQLITE_PREPARE_PERSISTENT, &(pExtData->pDbVersionStmt), 0);
+  if (rc != SQLITE_OK) {
+    crsql_freeExtData(pExtData);
+    return 0;
+  }
   pExtData->tableInfos = 0;
   pExtData->lastDbVersions = 0;
   pExtData->ordinalMap = 0;
@@ -82,13 +110,13 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
 
   sqlite3_stmt *pStmt;
 
-
-  rc += sqlite3_prepare_v2(db,
+  rc = sqlite3_prepare_v2(db,
                            "SELECT ltrim(key, 'config.'), value FROM "
                            "crsql_master WHERE key LIKE 'config.%';",
                            -1, &pStmt, 0);
 
   if (rc != SQLITE_OK) {
+    sqlite3_finalize(pStmt);
     crsql_freeExtData(pExtData);
     return 0;
   }
@@ -110,6 +138,7 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
         pExtData->mergeEqualValues = value;
       } else {
         // broken setting...
+        sqlite3_finalize(pStmt);
         crsql_freeExtData(pExtData);
         return 0;
       }
@@ -132,7 +161,7 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
 
   sqlite3_finalize(pStmt);
   int pv = crsql_fetchPragmaDataVersion(db, pExtData);
-  if ((pv != 0 && pv != 1) || rc != SQLITE_OK) {
+  if (pv < 0 || rc != SQLITE_OK) {
     crsql_freeExtData(pExtData);
     return 0;
   }
@@ -265,14 +294,18 @@ int crsql_fetchPragmaSchemaVersion(sqlite3 *db, crsql_ExtData *pExtData,
   }
 }
 
+// Returns:
+//   0  - data version unchanged
+//   2  - data version changed
+//  -1  - error
 int crsql_fetchPragmaDataVersion(sqlite3 *db, crsql_ExtData *pExtData) {
   int rc = sqlite3_step(pExtData->pPragmaDataVersionStmt);
   if (rc != SQLITE_ROW) {
     int finalizeRc = sqlite3_reset(pExtData->pPragmaDataVersionStmt);
     if (rc == SQLITE_DONE) {
-      return finalizeRc;
+      return finalizeRc == SQLITE_OK ? 0 : -1;
     }
-    return rc;
+    return -1;
   }
 
   int version = sqlite3_column_int(pExtData->pPragmaDataVersionStmt, 0);
@@ -280,7 +313,7 @@ int crsql_fetchPragmaDataVersion(sqlite3 *db, crsql_ExtData *pExtData) {
 
   if (version != pExtData->pragmaDataVersion) {
     pExtData->pragmaDataVersion = version;
-    return 1;
+    return 2;
   }
 
   return 0;

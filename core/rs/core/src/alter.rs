@@ -93,9 +93,10 @@ unsafe fn compact_post_alter(
         // TODO: if we move the sentinel metadata to the lookaside this becomes much simpler
         let mut sql = String::from(
             format!(
-              "DELETE FROM \"{tbl_name}__crsql_clock\" WHERE (col_name != '-1' OR (col_name = '-1' AND col_version % 2 != 0))
+              "DELETE FROM \"{tbl_name}__crsql_clock\" WHERE (col_name != '{cl_sentinel}' OR (col_name = '{cl_sentinel}' AND col_version % 2 != 0))
               AND NOT EXISTS (SELECT 1 FROM \"{tbl_name}\" JOIN \"{tbl_name}__crsql_pks\" ON ",
               tbl_name = crate::util::escape_ident(tbl_name_str),
+              cl_sentinel = crate::c::DELETE_SENTINEL,
             ),
         );
         let c_rc = crsql_ensure_table_infos_are_up_to_date(db, ext_data, errmsg);

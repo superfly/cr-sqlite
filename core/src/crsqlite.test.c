@@ -22,7 +22,7 @@
 #define CHANGES_SINCE_VTAB_COL_VRSN 4
 #define CHANGES_SINCE_VTAB_DB_VRSN 5
 #define CHANGES_SINCE_VTAB_SITE_ID 6
-#define CHANGES_SINCE_VTAB_SEQ 7
+#define CHANGES_SINCE_VTAB_SEQ 8
 
 int crsql_close(sqlite3 *db);
 
@@ -63,12 +63,18 @@ int syncLeftToRight(sqlite3 *db1, sqlite3 *db2, sqlite3_int64 since) {
   // printf("err: %s\n", err);
 
   // Set ts so merge_insert doesn't reject the sync
-  sqlite3_exec(db2, "BEGIN", 0, 0, 0);
-  sqlite3_exec(db2, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
-  sqlite3_exec(db2, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  rc += sqlite3_exec(db2, "BEGIN", 0, 0, 0);
+  rc += sqlite3_exec(db2, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc += sqlite3_exec(db2, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  if (rc != SQLITE_OK) {
+    sqlite3_finalize(pStmtWrite);
+    sqlite3_finalize(pStmtRead);
+    sqlite3_finalize(pStmt);
+    return rc;
+  }
 
   while (sqlite3_step(pStmtRead) == SQLITE_ROW) {
-    for (int i = 0; i < 9; ++i) {
+    for (int i = 0; i < 10; ++i) {
       assert(sqlite3_bind_value(pStmtWrite, i + 1,
                                 sqlite3_column_value(pStmtRead, i)) ==
              SQLITE_OK);
@@ -77,13 +83,13 @@ int syncLeftToRight(sqlite3 *db1, sqlite3 *db2, sqlite3_int64 since) {
     sqlite3_reset(pStmtWrite);
   }
 
-  sqlite3_exec(db2, "COMMIT", 0, 0, 0);
+  rc += sqlite3_exec(db2, "COMMIT", 0, 0, 0);
 
   sqlite3_finalize(pStmtWrite);
   sqlite3_finalize(pStmtRead);
   sqlite3_finalize(pStmt);
 
-  return SQLITE_OK;
+  return rc;
 }
 
 static char *crsql_strdup(const char *s) {
@@ -159,8 +165,11 @@ static int columnsAreSame(sqlite3_stmt *pStmt1, sqlite3_stmt *pStmt2, int c) {
 static int stmtsReturnSameResults(sqlite3_stmt *pStmt1, sqlite3_stmt *pStmt2) {
   int rc1 = SQLITE_OK;
   int rc2 = SQLITE_OK;
-  while (sqlite3_step(pStmt1) == SQLITE_ROW) {
+  while ((rc1 = sqlite3_step(pStmt1)) == SQLITE_ROW) {
     rc2 = sqlite3_step(pStmt2);
+    if (rc2 != SQLITE_ROW) {
+      return 0;
+    }
 
     int columns = sqlite3_column_count(pStmt1);
     for (int c = 0; c < columns; ++c) {
@@ -211,6 +220,9 @@ static void teste2e() {
   db1siteid = getQuotedSiteId(db1);
   db2siteid = getQuotedSiteId(db2);
   db3siteid = getQuotedSiteId(db3);
+  assert(db1siteid != NULL);
+  assert(db2siteid != NULL);
+  assert(db3siteid != NULL);
 
   rc += sqlite3_exec(db1, "insert into foo values (1, 2.0e2);", 0, 0, &err);
   rc += sqlite3_exec(db1, "insert into foo values (2, X'1232');", 0, 0, &err);
@@ -458,7 +470,7 @@ static sqlite3_int64 getDbVersion(sqlite3 *db) {
   return db2v;
 }
 
-static const void *getSiteId(sqlite3 *db) {
+static void *getSiteId(sqlite3 *db) {
   sqlite3_stmt *pStmt = 0;
   int rc = sqlite3_prepare_v2(db, "SELECT crsql_site_id()", -1, &pStmt, 0);
   if (rc != SQLITE_OK) {
@@ -468,9 +480,14 @@ static const void *getSiteId(sqlite3 *db) {
 
   sqlite3_step(pStmt);
   const void *site_id = sqlite3_column_blob(pStmt, 0);
+  int len = sqlite3_column_bytes(pStmt, 0);
+  void *ret = sqlite3_malloc(len > 0 ? len : 1);
+  if (ret != NULL && site_id != NULL && len > 0) {
+    memcpy(ret, site_id, len);
+  }
   sqlite3_finalize(pStmt);
 
-  return site_id;
+  return ret;
 }
 
 static sqlite3_int64 getSiteDbVersion(sqlite3 *db, const void *site_id) {
@@ -479,8 +496,7 @@ static sqlite3_int64 getSiteDbVersion(sqlite3 *db, const void *site_id) {
   if (rc != SQLITE_OK) {
     return -1;
   }
-
-  rc = sqlite3_bind_blob(pStmt, 1, site_id, 16, SQLITE_STATIC);
+  rc = sqlite3_bind_blob(pStmt, 1, site_id, 16, SQLITE_TRANSIENT);
   if (rc != SQLITE_OK) {
     return -1;
   }
@@ -539,6 +555,7 @@ static void testLamportCondition() {
   // assert(site_id2 != NULL);
 
   sqlite3_int64 db2_db1v = getSiteDbVersion(db2, site_id1);
+  sqlite3_free((void *)site_id1);
 
   printf("db1v: %lld\n", db1v);
   printf("db2_db1v: %lld\n", db2_db1v);
@@ -649,9 +666,10 @@ static void testPullingOnlyLocalChanges() {
   // TODO: why does `IS NULL` not work in the vtab???
   // `IS NOT NULL` also fails to call the virtual table bestIndex function with
   // any constraints p pIdxInfo->nConstraint
-  sqlite3_prepare_v2(
+  rc = sqlite3_prepare_v2(
       db, "SELECT count(*) FROM crsql_changes WHERE site_id IS crsql_site_id()",
       -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
 
   rc = sqlite3_step(pStmt);
   assert(rc == SQLITE_ROW);
@@ -663,10 +681,11 @@ static void testPullingOnlyLocalChanges() {
   assert(count == 2);
   sqlite3_finalize(pStmt);
 
-  sqlite3_prepare_v2(
+  rc = sqlite3_prepare_v2(
       db,
       "SELECT count(*) FROM crsql_changes WHERE site_id IS NOT crsql_site_id()",
       -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
   rc = sqlite3_step(pStmt);
   assert(rc == SQLITE_ROW);
   count = sqlite3_column_int(pStmt, 0);

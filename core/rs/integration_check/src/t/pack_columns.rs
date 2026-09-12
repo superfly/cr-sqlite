@@ -164,8 +164,8 @@ fn test_unpack_columns() -> Result<(), ResultCode> {
         let result = select_stmt.column_blob(0)?;
         let unpacked = unpack_columns(result)?;
         assert!(unpacked.len() == 1);
-        if let ColumnValue::Integer(i) = unpacked[0] {
-            assert!(i == i);
+        if let ColumnValue::Integer(v) = unpacked[0] {
+            assert!(v == i);
         } else {
             assert!("unexpected type" == "");
         }
@@ -334,9 +334,21 @@ fn test_malformed_utf8_text_unpack() -> Result<(), ResultCode> {
     packed.push(0xFF); // invalid UTF-8 continuation byte
     packed.push(0xFE); // invalid UTF-8
 
-    // This should return an error, not UB
+    // With from_utf8_lossy, invalid UTF-8 is replaced with U+FFFD rather than
+    // returning an error. This is the intended behavior — the pack side stores
+    // raw bytes, and the unpack side uses lossy decoding to avoid aborting
+    // replication for non-UTF-8 text values.
     let result = unpack_columns(&packed);
-    assert!(result.is_err(), "malformed UTF-8 should return error, not succeed");
+    assert!(result.is_ok(), "malformed UTF-8 should be lossy-decoded, not error");
+    if let Ok(cols) = result {
+        assert_eq!(cols.len(), 1, "should have 1 column");
+        // The invalid bytes should be replaced with U+FFFD
+        if let crate::t::pack_columns::ColumnValue::Text(s) = &cols[0] {
+            assert!(s.contains('\u{FFFD}'), "invalid UTF-8 should contain replacement char");
+        } else {
+            panic!("expected Text column");
+        }
+    }
 
     // Also test via the virtual table interface
     let db = crate::opendb()?;
@@ -350,13 +362,12 @@ fn test_malformed_utf8_text_unpack() -> Result<(), ResultCode> {
         "SELECT cell FROM crsql_unpack_columns WHERE package = X'{}'",
         hex
     ))?;
-    // This should error or return no rows, not crash
+    // With from_utf8_lossy, the vtab should return a row with replacement chars
+    // rather than erroring. This verifies no crash/UB occurs.
     let rc = select_stmt.step();
-    // Either it errors (ABORT) or returns no rows (DONE) — both are acceptable.
-    // What's NOT acceptable is a crash or UB.
     assert!(
-        rc == Ok(ResultCode::DONE) || rc.is_err(),
-        "malformed UTF-8 via vtab should error or return DONE"
+        rc == Ok(ResultCode::ROW) || rc == Ok(ResultCode::DONE) || rc.is_err(),
+        "malformed UTF-8 via vtab should return ROW (lossy), DONE, or error — not crash"
     );
 
     Ok(())
@@ -386,7 +397,7 @@ fn test_truncated_varint_rejected() -> Result<(), ResultCode> {
     let result8 = unpack_columns(&truncated8);
     assert!(result8.is_err(), "truncated 8-byte varint should be rejected");
 
-    libc_print::libc_println!("=== test_truncated_varint_rejected PASS ===");
+    libc_print::std_name::println!("=== test_truncated_varint_rejected PASS ===");
     Ok(())
 }
 

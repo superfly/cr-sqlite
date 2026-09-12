@@ -1,7 +1,7 @@
 extern crate alloc;
 use alloc::format;
 use libc_print::std_name::println;
-use sqlite::{Connection, ManagedConnection, ResultCode};
+use sqlite::{Connection, Destructor, ManagedConnection, ResultCode};
 use sqlite_nostd as sqlite;
 
 /// Run incremental maintenance until V2 migration is complete.
@@ -14,25 +14,29 @@ fn migrate_to_v2(db: &ManagedConnection) -> Result<(), ResultCode> {
         let stmt = db.prepare_v2("SELECT crsql_incremental_maintenance(1000)")?;
         stmt.step()?;
         remaining = stmt.column_int(0);
+        if remaining < 0 {
+            return Err(ResultCode::ERROR);
+        }
         iterations += 1;
+    }
+    if remaining > 0 {
+        return Err(ResultCode::ERROR);
     }
     Ok(())
 }
 
 /// Count columns in v2_pks table for a given table name.
 /// Returns 0 if v2_pks doesn't exist.
-fn v2_pks_col_count(db: &ManagedConnection, table: &str) -> i32 {
-    let stmt = db.prepare_v2(&format!(
-        "SELECT count(*) FROM pragma_table_info('{table}__crsql_v2_pks')",
-        table = table
-    ));
-    match stmt {
-        Ok(s) => {
-            s.step().unwrap_or(ResultCode::DONE);
-            s.column_int(0)
-        }
-        Err(_) => 0,
+fn v2_pks_col_count(db: &ManagedConnection, table: &str) -> Result<i32, ResultCode> {
+    // Use parameter binding to avoid SQL injection via the table name.
+    let table_name = format!("{}__crsql_v2_pks", table);
+    let stmt = db.prepare_v2("SELECT count(*) FROM pragma_table_info(?)")?;
+    stmt.bind_text(1, &table_name, Destructor::TRANSIENT)?;
+    let rc = stmt.step()?;
+    if rc != ResultCode::ROW {
+        return Err(ResultCode::ERROR);
     }
+    Ok(stmt.column_int(0))
 }
 
 /// Test that as_crr on a rowid table with safe rowids succeeds.
@@ -49,7 +53,7 @@ fn test_safe_rowids_get_triggers() -> Result<(), ResultCode> {
     // Migrate to V2 and verify v2_pks has skip_hash non-rowid schema.
     // Single integer PK → skip_hash + !key_is_rowid → 3 columns (__crsql_key, "id", cl).
     migrate_to_v2(&db.db)?;
-    let col_count = v2_pks_col_count(&db.db, "foo");
+    let col_count = v2_pks_col_count(&db.db, "foo")?;
     assert!(col_count == 3, "expected 3 columns in v2_pks (skip_hash non-rowid schema), got {}", col_count);
     Ok(())
 }
@@ -116,7 +120,7 @@ fn test_without_rowid_allows_oversized() -> Result<(), ResultCode> {
     // Single integer PK → skip_hash + non-rowid → 3 columns (__crsql_key, id, cl).
     // (Without skip_hash: 4 columns = __crsql_key, id, hashed_pk, cl)
     migrate_to_v2(&db.db)?;
-    let col_count = v2_pks_col_count(&db.db, "foo");
+    let col_count = v2_pks_col_count(&db.db, "foo")?;
     assert!(col_count == 3, "expected 3 columns in v2_pks (skip_hash non-rowid schema), got {}", col_count);
     Ok(())
 }
@@ -263,7 +267,7 @@ fn test_alter_preserves_without_rowid() -> Result<(), ResultCode> {
     // Migrate to V2 and verify v2_pks still has non-rowid schema.
     // Single integer PK → skip_hash + non-rowid → 3 columns (__crsql_key, id, cl).
     migrate_to_v2(&db.db)?;
-    let col_count = v2_pks_col_count(&db.db, "foo");
+    let col_count = v2_pks_col_count(&db.db, "foo")?;
     assert!(col_count == 3, "expected 3 columns in v2_pks after ALTER (skip_hash non-rowid preserved), got {}", col_count);
     Ok(())
 }
@@ -331,7 +335,7 @@ fn test_direct_v2_mode_creates_v2_only() -> Result<(), ResultCode> {
 
     // v2_pks should have skip_hash non-rowid schema.
     // Single integer PK → skip_hash + !key_is_rowid → 3 columns (__crsql_key, "id", cl).
-    let col_count = v2_pks_col_count(&db.db, "foo");
+    let col_count = v2_pks_col_count(&db.db, "foo")?;
     if col_count != 3 {
         println!("test_direct_v2: v2_pks col_count={}, expected 3", col_count);
         return Err(ResultCode::CONSTRAINT);
@@ -468,7 +472,7 @@ fn test_mode3_writes_v2_only_with_v1_present() -> Result<(), ResultCode> {
     let v2_count = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_v2_pks")?;
     v2_count.step()?;
     let v2_rows = v2_count.column_int(0);
-    assert!(v2_rows >= 2, "expected at least 2 rows in v2_pks, got {}", v2_rows);
+    assert!(v2_rows == 2, "expected exactly 2 rows in v2_pks, got {}", v2_rows);
 
     // V1 pks should NOT have the new row (mode 3 = V2-only writes)
     let v1_count = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_pks WHERE __crsql_key = 2")?;

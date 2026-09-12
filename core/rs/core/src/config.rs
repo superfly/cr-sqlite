@@ -492,12 +492,7 @@ fn create_v2_tables_for_existing_crrs(
 
     for tbl_name in &table_names {
         // Check if V2 tables already exist (e.g., table was created in dual-write mode)
-        let check_sql = format!(
-            "SELECT 1 FROM sqlite_master WHERE name = '{}__crsql_v2_pks'\0",
-            tbl_name
-        );
-        let check = db.prepare_v2(&check_sql)?;
-        if check.step()? == ResultCode::ROW {
+        if crate::bootstrap_v2::has_v2_tables(db, tbl_name)? {
             continue; // V2 tables already exist
         }
 

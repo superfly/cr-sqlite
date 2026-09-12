@@ -129,6 +129,7 @@ pub struct TableInfo {
     update_clock_stmt: RefCell<Option<ManagedStmt>>,
     mark_locally_deleted_stmt: RefCell<Option<ManagedStmt>>,
     move_non_sentinels_stmt: RefCell<Option<ManagedStmt>>,
+    move_non_pk_col_stmt: RefCell<Option<ManagedStmt>>,
     mark_locally_created_stmt: RefCell<Option<ManagedStmt>>,
     maybe_mark_locally_reinserted_stmt: RefCell<Option<ManagedStmt>>,
     cl_cache: BTreeMap<i64, i64>,
@@ -577,7 +578,7 @@ impl TableInfo {
         &self,
         db: *mut sqlite3,
     ) -> Result<Ref<Option<ManagedStmt>>, ResultCode> {
-        if self.move_non_sentinels_stmt.try_borrow()?.is_none() {
+        if self.move_non_pk_col_stmt.try_borrow()?.is_none() {
             // Incrementing col_version is especially important for the case where we
             // are updating to a currently existing pk, so that the columns
             // from the old pk can override the ones from the new at a node
@@ -595,9 +596,9 @@ impl TableInfo {
                 table_name = crate::util::escape_ident(&self.tbl_name),
             );
             let ret = db.prepare_v3(&sql, sqlite::PREPARE_PERSISTENT)?;
-            *self.move_non_sentinels_stmt.try_borrow_mut()? = Some(ret);
+            *self.move_non_pk_col_stmt.try_borrow_mut()? = Some(ret);
         }
-        Ok(self.move_non_sentinels_stmt.try_borrow()?)
+        Ok(self.move_non_pk_col_stmt.try_borrow()?)
     }
 
     pub fn get_mark_locally_created_stmt(
@@ -798,6 +799,8 @@ impl TableInfo {
         stmt.take();
         let mut stmt = self.col_version_stmt.try_borrow_mut()?;
         stmt.take();
+        let mut stmt = self.col_site_id_stmt.try_borrow_mut()?;
+        stmt.take();
         let mut stmt = self.merge_pk_only_insert_stmt.try_borrow_mut()?;
         stmt.take();
         let mut stmt = self.merge_delete_stmt.try_borrow_mut()?;
@@ -809,6 +812,8 @@ impl TableInfo {
         let mut stmt = self.mark_locally_deleted_stmt.try_borrow_mut()?;
         stmt.take();
         let mut stmt = self.move_non_sentinels_stmt.try_borrow_mut()?;
+        stmt.take();
+        let mut stmt = self.move_non_pk_col_stmt.try_borrow_mut()?;
         stmt.take();
         let mut stmt = self.mark_locally_created_stmt.try_borrow_mut()?;
         stmt.take();
@@ -981,8 +986,13 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
         return ResultCode::OK as c_int;
     }
 
-    let mut table_infos: Box<Vec<TableInfo>> =
-        unsafe { Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>) };
+    let mut table_infos: Box<Vec<TableInfo>> = if unsafe { (*ext_data).tableInfos.is_null() } {
+        // No tableInfos allocated yet — nothing to update. Return early
+        // rather than dereferencing a null pointer via Box::from_raw.
+        return ResultCode::ERROR as c_int;
+    } else {
+        unsafe { Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>) }
+    };
 
     if schema_changed > 0 || table_infos.len() == 0 {
         // SAFETY: Replacing the cached Vec<TableInfo> contents is safe because
@@ -1361,6 +1371,7 @@ pub fn pull_table_info(
 
         mark_locally_deleted_stmt: RefCell::new(None),
         move_non_sentinels_stmt: RefCell::new(None),
+        move_non_pk_col_stmt: RefCell::new(None),
         mark_locally_created_stmt: RefCell::new(None),
         maybe_mark_locally_reinserted_stmt: RefCell::new(None),
         combo_insert_clock_stmt: RefCell::new(None),

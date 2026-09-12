@@ -4,6 +4,7 @@ use core::ffi::{c_char, c_int, c_void};
 
 use crate::alloc::borrow::ToOwned;
 use crate::create_crr::create_crr;
+use crate::teardown_v2;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -175,13 +176,17 @@ extern "C" fn disconnect(vtab: *mut sqlite::vtab) -> c_int {
 extern "C" fn destroy(vtab: *mut sqlite::vtab) -> c_int {
     let tab = unsafe { Box::from_raw(vtab.cast::<CLSetTab>()) };
     let ret = tab.db.exec_safe(&format!(
-        "DROP TABLE \"{db_name}\".\"{table_name}\";
-        DROP TABLE \"{db_name}\".\"{table_name}__crsql_clock\";
-        DROP TABLE \"{db_name}\".\"{table_name}__crsql_pks\";",
+        "DROP TABLE IF EXISTS \"{db_name}\".\"{table_name}\";
+        DROP TABLE IF EXISTS \"{db_name}\".\"{table_name}__crsql_clock\";
+        DROP TABLE IF EXISTS \"{db_name}\".\"{table_name}__crsql_pks\";",
         table_name = crate::util::escape_ident(&tab.base_table_name),
         db_name = crate::util::escape_ident(&tab.db_name)
     ));
-    match ret {
+    let ret = match ret {
+        Err(rc) | Ok(rc) => rc,
+    };
+    // Drop V2 metadata tables as well (no-op in V1-only mode since IF EXISTS is used).
+    match teardown_v2::remove_crr_v2_tables(tab.db, &tab.base_table_name) {
         Err(rc) | Ok(rc) => rc as c_int,
     }
 }

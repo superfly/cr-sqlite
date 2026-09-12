@@ -6,23 +6,24 @@
 // million entries per second for 3,000 centuries.
 #define MIN_POSSIBLE_DB_VERSION 0L
 
-#define __CRSQL_CLOCK_LEN 13
-
-#define CRR_SPACE 0
-#define USER_SPACE 1
 #define ROWID_SLAB_SIZE 10000000000000
 
-#define CLOCK_TABLES_SELECT                                                  \
-  "SELECT tbl_name FROM sqlite_master WHERE type='table' AND tbl_name LIKE " \
-  "'%__crsql_clock'"
+// Note: CLOCK_TABLES_SELECT uses GLOB (not LIKE) so the underscores are matched
+// literally rather than as single-character wildcards. The pattern matches
+// both V1 clock tables (suffix "__crsql_clock") and V2 clock tables (suffix
+// "__crsql_v2_clock"). The consuming C code path (pSelectClockTablesStmt /
+// crsql_recreate_db_version_stmt) is currently dead -- the statement is
+// prepared and finalized but never stepped -- so this is kept for correctness
+// should it be revived.
+#define CLOCK_TABLES_SELECT                                                    \
+  "SELECT tbl_name FROM sqlite_master WHERE type='table' AND "                \
+  "(tbl_name GLOB '*__crsql_clock' OR tbl_name GLOB '*__crsql_v2_clock')"
 
 #define SET_SYNC_BIT "SELECT crsql_internal_sync_bit(1)"
 #define CLEAR_SYNC_BIT "SELECT crsql_internal_sync_bit(0)"
 
-#define TBL_SITE_ID "site_id"
-#define TBL_DB_VERSION "db_version"
-#define TBL_SCHEMA "crsql_master"
-#define UNION_ALL "UNION ALL"
+#define TBL_SITE_ID "crsql_site_id"
+#define TBL_DB_VERSION "crsql_db_versions"
 
 #define MAX_TBL_NAME_LEN 2048
 #define SITE_ID_LEN 16

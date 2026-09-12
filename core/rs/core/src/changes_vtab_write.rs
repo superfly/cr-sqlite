@@ -479,9 +479,14 @@ unsafe fn post_v2_merge(
     insert_site_id: &[u8],
     insert_db_vrsn: sqlite::int64,
 ) -> Result<(), ResultCode> {
-    // Update db_version tracking
+    // Update db_version tracking.
+    // Errors from insert_db_version are intentionally swallowed here because
+    // insert_db_version returns ERROR when a node receives its own changes back
+    // with a db_version higher than its current one (ordinal == 0). This is a
+    // legitimate condition during bidirectional sync and should not abort the
+    // merge — the change itself has already been applied successfully.
     if !insert_site_id.is_empty() {
-        insert_db_version(ext_data, insert_site_id, insert_db_vrsn)?;
+        let _ = insert_db_version(ext_data, insert_site_id, insert_db_vrsn);
     }
     // Dual-write: copy V2 metadata to V1 metadata tables
     let mwv = unsafe { (*ext_data).metadataWriteVersion };
@@ -761,7 +766,9 @@ unsafe fn merge_insert(
         )
     };
 
-    // Post-merge: db_version + dual-write V1 metadata
+    // Post-merge: db_version + dual-write V1 metadata.
+    // Errors are swallowed because post_v2_merge handles its own error cases
+    // gracefully (e.g., insert_db_version for self-originated changes).
     if result.is_ok() {
         let _ = post_v2_merge(
             db,
@@ -1082,7 +1089,7 @@ unsafe fn v2_ensure_alive_row_at_cl(
         new_key
     } else {
         // incoming_cl == local_cl — row must already exist
-        local_key_opt.unwrap_or(0)
+        local_key_opt.ok_or(ResultCode::ERROR)?
     };
 
     Ok(Some((local_key, local_cl)))

@@ -502,7 +502,7 @@ fn v2_alter_add_column_to_pk_only() -> Result<(), ResultCode> {
     db.db.exec_safe("INSERT INTO foo (id) VALUES (2)")?;
 
     // Verify sentinel entries exist at col_id=0
-    let stmt = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_v2_clock WHERE cell_key & 255 = 0")?;
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_v2_clock WHERE cell_key & 0xFFF = 0")?;
     stmt.step()?;
     assert_eq!(stmt.column_int(0), 2, "should have 2 sentinel clock entries at col_id=0");
 
@@ -519,7 +519,7 @@ fn v2_alter_add_column_to_pk_only() -> Result<(), ResultCode> {
     assert_eq!(stmt.column_text(0)?, "name", "col_id=0 should be mapped to 'name'");
 
     // The old sentinel entries should still exist (now as regular clock entries for 'name')
-    let stmt = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_v2_clock WHERE cell_key & 255 = 0")?;
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_v2_clock WHERE cell_key & 0xFFF = 0")?;
     stmt.step()?;
     assert_eq!(stmt.column_int(0), 2, "clock entries at col_id=0 should still exist");
 
@@ -574,12 +574,12 @@ fn v2_alter_drop_column_becomes_pk_only() -> Result<(), ResultCode> {
     assert_eq!(stmt.column_int(0), 0, "v2_col_map should be empty after dropping last non-PK column");
 
     // Sentinel clock entries should exist at col_id=0
-    let stmt = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_v2_clock WHERE cell_key & 255 = 0")?;
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_v2_clock WHERE cell_key & 0xFFF = 0")?;
     stmt.step()?;
     assert_eq!(stmt.column_int(0), 2, "should have 2 sentinel clock entries at col_id=0");
 
     // Clock entries should be migrated (preserving db_version), not freshly created
-    let stmt = db.db.prepare_v2("SELECT min(db_version), max(db_version) FROM foo__crsql_v2_clock WHERE cell_key & 255 = 0")?;
+    let stmt = db.db.prepare_v2("SELECT min(db_version), max(db_version) FROM foo__crsql_v2_clock WHERE cell_key & 0xFFF = 0")?;
     stmt.step()?;
     let min_db_ver_after = stmt.column_int64(0);
     let max_db_ver_after = stmt.column_int64(1);
@@ -1025,7 +1025,7 @@ fn v2_pk_only_site_id_tiebreak() -> Result<(), ResultCode> {
     let stmt = db_b.db.prepare_v2(
         "SELECT s.site_id FROM foo__crsql_v2_clock AS c \
          JOIN crsql_site_id AS s ON c.site_id = s.ordinal \
-         WHERE c.cell_key & 255 = 0"
+         WHERE c.cell_key & 0xFFF = 0"
     )?;
     stmt.step()?;
     let winning_site_id: Vec<u8> = stmt.column_blob(0)?.to_vec();
@@ -1082,7 +1082,7 @@ fn v2_alter_drop_two_columns_becomes_pk_only() -> Result<(), ResultCode> {
     assert_eq!(stmt.column_int(0), 0, "v2_col_map should be empty after dropping all non-PK columns");
 
     // Sentinel clock entries should exist at col_id=0 for both rows
-    let stmt = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_v2_clock WHERE cell_key & 255 = 0")?;
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_v2_clock WHERE cell_key & 0xFFF = 0")?;
     stmt.step()?;
     assert_eq!(stmt.column_int(0), 2, "should have 2 sentinel clock entries at col_id=0");
 
@@ -2112,6 +2112,8 @@ fn v2_data_consistency_after_stmt_rollback() -> Result<(), ResultCode> {
     libc_println!("=== v2_data_consistency_after_stmt_rollback START ===");
 
     let db = crate::opendb()?;
+    // Enable V2 mode (direct V2-only) so the test runs with V2 clock tables.
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
     // Use a CHECK constraint to trigger a statement-level rollback.
     // CRRs don't allow UNIQUE constraints or NOT NULL without DEFAULT,
     // so we use a CHECK constraint on a nullable column.
@@ -2149,7 +2151,7 @@ fn v2_data_consistency_after_stmt_rollback() -> Result<(), ResultCode> {
 
     // Verify clock entries exist for the successful inserts.
     {
-        let stmt = db.db.prepare_v2("SELECT count(*) FROM t__crsql_clock")?;
+        let stmt = db.db.prepare_v2("SELECT count(*) FROM t__crsql_v2_clock")?;
         stmt.step()?;
         assert!(stmt.column_int(0) > 0, "clock entries should exist for successful inserts");
     }
@@ -3366,6 +3368,10 @@ fn v2_mixed_order_by_directions() -> Result<(), ResultCode> {
     let c = crate::opendb().expect("db opened");
     let db = &c.db;
 
+    // Enable V2 wire/packed mode so crsql_changes returns packed BLOBs.
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+    db.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
     db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, val)")?;
     db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
