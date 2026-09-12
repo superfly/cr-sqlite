@@ -2,14 +2,15 @@ use sqlite_nostd as sqlite;
 use sqlite_nostd::{Connection, ResultCode};
 extern crate alloc;
 use alloc::format;
-use alloc::string::String;
-use alloc::vec::Vec;
 
 pub fn remove_crr_clock_table_if_exists(
     db: *mut sqlite::sqlite3,
     table: &str,
 ) -> Result<ResultCode, ResultCode> {
     let escaped_table = crate::util::escape_ident(table);
+    if escaped_table.is_empty() {
+        return Err(ResultCode::ERROR);
+    }
     db.exec_safe(&format!(
         "DROP TABLE IF EXISTS \"{table}__crsql_clock\"",
         table = escaped_table
@@ -25,6 +26,9 @@ pub fn remove_crr_triggers_if_exist(
     table: &str,
 ) -> Result<ResultCode, ResultCode> {
     let escaped_table = crate::util::escape_ident(table);
+    if escaped_table.is_empty() {
+        return Err(ResultCode::ERROR);
+    }
 
     db.exec_safe(&format!(
         "DROP TRIGGER IF EXISTS \"{table}__crsql_itrig\"",

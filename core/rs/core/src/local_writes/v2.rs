@@ -257,6 +257,26 @@ fn write_clock_entries(
     let col_ids: vec::Vec<i64> = if tbl_info.non_pks.is_empty() {
         vec![0]
     } else {
+        // Guard: col_map must be non-empty and cover every non-PK column.
+        // A stale or incomplete col_map would silently produce zero or
+        // fewer clock entries, leaving columns untracked. Error out rather
+        // than write a partial clock set.
+        if tbl_info.col_map.is_empty() {
+            return Err(
+                "write_clock_entries: col_map is empty for a non-PK-only table \
+                 — v2_col_map is stale or was not loaded"
+                    .to_string(),
+            );
+        }
+        for col in &tbl_info.non_pks {
+            if !tbl_info.col_map.iter().any(|(_, name)| name == &col.name) {
+                return Err(format!(
+                    "write_clock_entries: col_map is missing non-PK column \"{}\" \
+                     — v2_col_map is stale or incomplete",
+                    col.name
+                ));
+            }
+        }
         tbl_info.col_map.iter().map(|(id, _)| *id).collect()
     };
     let mut stmt = v2_stmts.clock_set_initial();

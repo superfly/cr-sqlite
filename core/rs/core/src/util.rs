@@ -48,7 +48,13 @@ pub fn get_dflt_value(
         && ((raw.starts_with('\'') && raw.ends_with('\''))
             || (raw.starts_with('"') && raw.ends_with('"')))
     {
-        raw[1..raw.len() - 1].to_string()
+        // Unescape doubled quote characters inside the default value
+        // (e.g., DEFAULT 'O''Brien' produces raw "'O''Brien'" which
+        // should become O'Brien, not O''Brien).
+        let quote = raw.chars().next().unwrap();
+        let inner = &raw[1..raw.len() - 1];
+        let doubled = format!("{}{}", quote, quote);
+        inner.replace(&doubled, &quote.to_string())
     } else {
         raw
     };
@@ -56,6 +62,13 @@ pub fn get_dflt_value(
 }
 
 pub fn get_db_version_union_query(tbl_names: &[String]) -> String {
+    if tbl_names.is_empty() {
+        // Avoid producing invalid SQL like "SELECT max(version) FROM ( UNION SELECT ...)".
+        // Filter by site_id (bind param 1) to match the per-table union path, which
+        // uses `WHERE site_id = 0` (ordinal 0 = local site). Without this filter we'd
+        // return the max db_version across ALL sites, not just our own.
+        return "SELECT max(db_version) as version FROM crsql_db_versions WHERE site_id = ?".to_string();
+    }
     let unions_str = tbl_names
         .iter()
         .map(|tbl_name| {
@@ -145,7 +158,12 @@ pub fn escape_ident(ident: &str) -> String {
 }
 
 pub fn escape_ident_as_value(ident: &str) -> String {
-    return ident.replace("'", "''");
+    // NUL bytes would truncate the value when passed to SQLite as a C string,
+    // enabling injection. Reject them, matching the behavior of escape_ident.
+    if ident.contains('\0') {
+        return String::new();
+    }
+    ident.replace("'", "''")
 }
 
 pub trait Countable {
@@ -155,8 +173,12 @@ pub trait Countable {
 impl Countable for *mut sqlite::sqlite3 {
     fn count(self, sql: &str) -> Result<i32, ResultCode> {
         let stmt = self.prepare_v2(sql)?;
-        stmt.step()?;
-        Ok(stmt.column_int(0))
+        if stmt.step()? == ResultCode::ROW {
+            Ok(stmt.column_int(0))
+        } else {
+            // No row was produced; return 0 rather than reading an invalid column.
+            Ok(0)
+        }
     }
 }
 
@@ -218,6 +240,24 @@ pub unsafe fn clear_crr_mode_flags(db: *mut sqlite3, table: &str) {
     let _ = clear_master_key(db, &format!("v2_pks_{}", table));
 }
 
+/// Clear ALL per-table crsql_master keys for a table: mode flags, cleanup task
+/// markers, and migration task markers. This prevents stale markers from being
+/// processed by incremental_maintenance after a teardown, which would drop
+/// freshly re-created CRR metadata tables.
+pub unsafe fn clear_all_per_table_master_keys(db: *mut sqlite3, table: &str) {
+    // Mode flags
+    let _ = clear_master_key(db, &format!("use_rowid_{}", table));
+    let _ = clear_master_key(db, &format!("skip_hash_{}", table));
+    let _ = clear_master_key(db, &format!("v2_pks_{}", table));
+    // Cleanup task markers
+    let _ = clear_master_key(db, &format!("cleanup_v1_tables_{}", table));
+    let _ = clear_master_key(db, &format!("cleanup_v2_tables_{}", table));
+    let _ = clear_master_key(db, &format!("cleanup_remaining_{}", table));
+    // Migration task markers
+    let _ = clear_master_key(db, &format!("migration_v1_to_v2_migration_{}", table));
+    let _ = clear_master_key(db, &format!("migration_v1_to_v2_remaining_{}", table));
+}
+
 /// Get a text value from crsql_master by exact key.
 /// Returns None if the key does not exist.
 pub unsafe fn get_master_text_value(db: *mut sqlite3, key: &str) -> Result<Option<alloc::string::String>, ResultCode> {
@@ -272,6 +312,16 @@ mod tests {
         assert_eq!(
             union,
             "SELECT max(version) as version FROM (SELECT max(db_version) as version FROM \"foo\" WHERE site_id = 0 UNION ALL SELECT max(db_version) as version FROM \"bar\" WHERE site_id = 0 UNION ALL SELECT max(db_version) as version FROM \"baz\" WHERE site_id = 0 UNION SELECT value as\n        version FROM crsql_master WHERE key = 'pre_compact_dbversion')"
+        );
+    }
+
+    #[test]
+    fn test_get_db_version_union_query_empty() {
+        // Empty table list: fallback to crsql_db_versions filtered by site_id
+        let union = get_db_version_union_query(&[]);
+        assert_eq!(
+            union,
+            "SELECT max(db_version) as version FROM crsql_db_versions WHERE site_id = ?"
         );
     }
 }

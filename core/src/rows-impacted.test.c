@@ -11,10 +11,14 @@ static sqlite3 *createDb() {
   int rc = SQLITE_OK;
   sqlite3 *db;
   rc = sqlite3_open(":memory:", &db);
-  rc += sqlite3_exec(db, "CREATE TABLE foo (a primary key not null, b)", 0, 0, 0);
-  rc += sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
-  rc += sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
-  rc += sqlite3_exec(db, "SELECT crsql_as_crr('foo')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "CREATE TABLE foo (a primary key not null, b)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_as_crr('foo')", 0, 0, 0);
   assert(rc == SQLITE_OK);
   return db;
 }
@@ -27,28 +31,38 @@ static void testSingleInsertSingleTx() {
   sqlite3_stmt *pStmt = 0;
 
   rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
-  rc += sqlite3_exec(db,
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010901', 'b', "
                      "2, 1, 1, NULL, 1, 1, '0')",
                      0, 0, &err);
-  sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
-  sqlite3_step(pStmt);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
   // creation + setting of column
   assert(sqlite3_column_int(pStmt, 0) == 1);
   sqlite3_finalize(pStmt);
-  rc += sqlite3_exec(db, "COMMIT", 0, 0, 0);
+  rc = sqlite3_exec(db, "COMMIT", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
   // rows impacted gets reset
-  sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
-  sqlite3_step(pStmt);
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
   int impacted = sqlite3_column_int(pStmt, 0);
   assert(impacted == 0);
   sqlite3_finalize(pStmt);
 
-  crsql_close(db);
+  sqlite3_free(err);
+  err = 0;
+  assert(crsql_close(db) == SQLITE_OK);
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
@@ -60,34 +74,46 @@ static void testManyInsertsInATx() {
   sqlite3_stmt *pStmt = 0;
 
   rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
-  rc += sqlite3_exec(db,
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010901', 'b', "
                      "2, 1, 1, NULL, 1, 1, '0')",
                      0, 0, &err);
-  rc += sqlite3_exec(db,
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010902', 'b', "
                      "2, 1, 1, NULL, 1, 1, '0')",
                      0, 0, &err);
-  rc += sqlite3_exec(db,
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010903', 'b', "
                      "2, 1, 1, NULL, 1, 1, '0')",
                      0, 0, &err);
-  sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
-  sqlite3_step(pStmt);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
   assert(sqlite3_column_int(pStmt, 0) == 3);
   sqlite3_finalize(pStmt);
-  rc += sqlite3_exec(db, "COMMIT", 0, 0, 0);
+  rc = sqlite3_exec(db, "COMMIT", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
   // rows impacted gets reset
-  sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
-  sqlite3_step(pStmt);
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
   assert(sqlite3_column_int(pStmt, 0) == 0);
   sqlite3_finalize(pStmt);
 
-  crsql_close(db);
+  sqlite3_free(err);
+  err = 0;
+  assert(crsql_close(db) == SQLITE_OK);
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
@@ -99,28 +125,38 @@ static void testMultipartInsertInTx() {
   sqlite3_stmt *pStmt = 0;
 
   rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
-  rc += sqlite3_exec(db,
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010901', 'b', "
                      "2, 1, 1, NULL, 1, 1, '0'), "
                      "('foo', X'010902', 'b', 2, 1, 1, NULL, 1, 1, '0'), ('foo', "
                      "X'010903', 'b', 2, 1, 1, NULL, 1, 1, '0')",
                      0, 0, &err);
-  sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
-  sqlite3_step(pStmt);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
   assert(sqlite3_column_int(pStmt, 0) == 3);
   sqlite3_finalize(pStmt);
-  rc += sqlite3_exec(db, "COMMIT", 0, 0, 0);
+  rc = sqlite3_exec(db, "COMMIT", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
   // rows impacted gets reset
-  sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
-  sqlite3_step(pStmt);
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
   assert(sqlite3_column_int(pStmt, 0) == 0);
   sqlite3_finalize(pStmt);
 
-  crsql_close(db);
+  sqlite3_free(err);
+  err = 0;
+  assert(crsql_close(db) == SQLITE_OK);
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
@@ -133,39 +169,54 @@ static void testManyTxns() {
   sqlite3_stmt *pStmt = 0;
 
   rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
-  rc += sqlite3_exec(db,
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010901', 'b', "
                      "2, 1, 1, NULL, 1, 1, '0')",
                      0, 0, &err);
-  sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
-  sqlite3_step(pStmt);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
   assert(sqlite3_column_int(pStmt, 0) == 1);
   sqlite3_finalize(pStmt);
-  rc += sqlite3_exec(db, "COMMIT", 0, 0, 0);
+  rc = sqlite3_exec(db, "COMMIT", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
   rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
-  rc += sqlite3_exec(db,
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010902', 'b', "
                      "2, 1, 1, NULL, 1, 1, '0')",
                      0, 0, &err);
-  rc += sqlite3_exec(db,
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010903', 'b', "
                      "2, 1, 1, NULL, 1, 1, '0')",
                      0, 0, &err);
-  sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
-  sqlite3_step(pStmt);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
   int impacted = sqlite3_column_int(pStmt, 0);
   assert(impacted == 2);
   sqlite3_finalize(pStmt);
-  rc += sqlite3_exec(db, "COMMIT", 0, 0, 0);
+  rc = sqlite3_exec(db, "COMMIT", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
-  crsql_close(db);
+  sqlite3_free(err);
+  err = 0;
+  assert(crsql_close(db) == SQLITE_OK);
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
@@ -207,52 +258,73 @@ static void testUpdateThatDoesNotChangeAnything() {
   sqlite3_stmt *pStmt = 0;
 
   rc = sqlite3_exec(db, "INSERT INTO foo VALUES (1, 2)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
 
-  rc += sqlite3_exec(db, "BEGIN", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
-  rc += sqlite3_exec(db,
+  rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', "
                      "crsql_pack_columns(1), 'b', 2, 1, 1, NULL, 1, 1, '0')",
                      0, 0, &err);
-  sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
-  sqlite3_step(pStmt);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
   assert(sqlite3_column_int(pStmt, 0) == 0);
   sqlite3_finalize(pStmt);
-  rc += sqlite3_exec(db, "COMMIT", 0, 0, 0);
+  rc = sqlite3_exec(db, "COMMIT", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
   // now test value <
-  rc += sqlite3_exec(db, "BEGIN", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
-  rc += sqlite3_exec(db,
+  rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', "
                      "crsql_pack_columns(1), 'b', 0, 1, 1, NULL, 1, 1, '0')",
                      0, 0, &err);
-  sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
-  sqlite3_step(pStmt);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
   assert(sqlite3_column_int(pStmt, 0) == 0);
   sqlite3_finalize(pStmt);
-  rc += sqlite3_exec(db, "COMMIT", 0, 0, 0);
+  rc = sqlite3_exec(db, "COMMIT", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
   // now test clock <
-  rc += sqlite3_exec(db, "BEGIN", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
-  rc += sqlite3_exec(db,
+  rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', "
                      "crsql_pack_columns(1), 'b', 2, 0, 0, NULL, 1, 1, '0')",
                      0, 0, &err);
-  sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
-  sqlite3_step(pStmt);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
   assert(sqlite3_column_int(pStmt, 0) == 0);
   sqlite3_finalize(pStmt);
-  rc += sqlite3_exec(db, "COMMIT", 0, 0, 0);
+  rc = sqlite3_exec(db, "COMMIT", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
-  crsql_close(db);
+  sqlite3_free(err);
+  err = 0;
+  assert(crsql_close(db) == SQLITE_OK);
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
@@ -264,24 +336,34 @@ static void testDeleteThatDoesNotChangeAnything() {
   sqlite3_stmt *pStmt = 0;
 
   rc = sqlite3_exec(db, "INSERT INTO foo VALUES (1, 2)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
   rc = sqlite3_exec(db, "DELETE FROM foo", 0, 0, 0);
+  assert(rc == SQLITE_OK);
 
-  rc += sqlite3_exec(db, "BEGIN", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
-  rc += sqlite3_exec(
+  rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(
       db,
       "INSERT INTO crsql_changes VALUES ('foo', crsql_pack_columns(1), "
       "'-1', NULL, 2, 2, NULL, 1, 1, '0')",  //__crsql_del
       0, 0, &err);
-  sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
-  sqlite3_step(pStmt);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
   assert(sqlite3_column_int(pStmt, 0) == 0);
   sqlite3_finalize(pStmt);
-  rc += sqlite3_exec(db, "COMMIT", 0, 0, 0);
+  rc = sqlite3_exec(db, "COMMIT", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
-  crsql_close(db);
+  sqlite3_free(err);
+  err = 0;
+  assert(crsql_close(db) == SQLITE_OK);
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
@@ -293,49 +375,67 @@ static void testDelete() {
   sqlite3_stmt *pStmt = 0;
 
   rc = sqlite3_exec(db, "INSERT INTO foo VALUES (1, 2)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
 
-  rc += sqlite3_exec(db, "BEGIN", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
-  rc += sqlite3_exec(db,
+  rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010901', "
                      "'-1', NULL, 2, 2, NULL, 2, 1, '0')",  //__crsql_del
                      0, 0, &err);
-  sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
-  sqlite3_step(pStmt);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
   assert(sqlite3_column_int(pStmt, 0) == 1);
   sqlite3_finalize(pStmt);
-  rc += sqlite3_exec(db, "COMMIT", 0, 0, 0);
+  rc = sqlite3_exec(db, "COMMIT", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
-  crsql_close(db);
+  sqlite3_free(err);
+  err = 0;
+  assert(crsql_close(db) == SQLITE_OK);
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
 static void testCreateThatDoesNotChangeAnything() {
-  printf("UpdateThatDoesNotChangeAnything\n");
+  printf("CreateThatDoesNotChangeAnything\n");
   int rc = SQLITE_OK;
   char *err = 0;
   sqlite3 *db = createDb();
   sqlite3_stmt *pStmt = 0;
 
   rc = sqlite3_exec(db, "INSERT INTO foo VALUES (1, 2)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
 
-  rc += sqlite3_exec(db, "BEGIN", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
-  rc += sqlite3_exec(db,
+  rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010901', 'b', "
                      "2, 1, 1, NULL, 1, 1, '0')",
                      0, 0, &err);
-  sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
-  sqlite3_step(pStmt);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
   assert(sqlite3_column_int(pStmt, 0) == 0);
   sqlite3_finalize(pStmt);
-  rc += sqlite3_exec(db, "COMMIT", 0, 0, 0);
+  rc = sqlite3_exec(db, "COMMIT", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
-  crsql_close(db);
+  sqlite3_free(err);
+  err = 0;
+  assert(crsql_close(db) == SQLITE_OK);
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
@@ -347,22 +447,31 @@ static void testValueWin() {
   sqlite3_stmt *pStmt = 0;
 
   rc = sqlite3_exec(db, "INSERT INTO foo VALUES (1, 2)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
 
   rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
-  rc += sqlite3_exec(db,
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010901', 'b', "
                      "3, 1, 1, X'00000000000000000000000000000000', 1, 1, '0')",
                      0, 0, &err);
-  sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
-  sqlite3_step(pStmt);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
   assert(sqlite3_column_int(pStmt, 0) == 1);
   sqlite3_finalize(pStmt);
-  rc += sqlite3_exec(db, "COMMIT", 0, 0, 0);
+  rc = sqlite3_exec(db, "COMMIT", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
-  crsql_close(db);
+  sqlite3_free(err);
+  err = 0;
+  assert(crsql_close(db) == SQLITE_OK);
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
@@ -374,22 +483,31 @@ static void testClockWin() {
   sqlite3_stmt *pStmt = 0;
 
   rc = sqlite3_exec(db, "INSERT INTO foo VALUES (1, 2)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
 
   rc = sqlite3_exec(db, "BEGIN", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
-  sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
-  rc += sqlite3_exec(db,
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db,
                      "INSERT INTO crsql_changes VALUES ('foo', X'010901', 'b', "
                      "2, 2, 2, NULL, 1, 1, '0')",
                      0, 0, &err);
-  sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
-  sqlite3_step(pStmt);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_rows_impacted()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
   assert(sqlite3_column_int(pStmt, 0) == 1);
   sqlite3_finalize(pStmt);
-  rc += sqlite3_exec(db, "COMMIT", 0, 0, 0);
+  rc = sqlite3_exec(db, "COMMIT", 0, 0, 0);
   assert(rc == SQLITE_OK);
 
-  crsql_close(db);
+  sqlite3_free(err);
+  err = 0;
+  assert(crsql_close(db) == SQLITE_OK);
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 

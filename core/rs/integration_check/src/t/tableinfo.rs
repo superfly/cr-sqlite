@@ -1,9 +1,12 @@
 extern crate alloc;
 use alloc::boxed::Box;
 use alloc::ffi::CString;
+use alloc::format;
+use alloc::string::String;
 use alloc::string::ToString;
+use alloc::vec;
 use alloc::vec::Vec;
-use core::{ffi::c_char, mem};
+use core::{ffi::c_char, ffi::c_int, mem};
 use crsql_bundle::test_exports;
 use crsql_bundle::test_exports::tableinfo::TableInfo;
 use sqlite::{Connection, ResultCode};
@@ -54,9 +57,11 @@ fn test_ensure_table_infos_are_up_to_date() {
     .expect("made foo clock");
 
     let ext_data = unsafe { test_exports::c::crsql_newExtData(raw_db) };
+    assert!(!ext_data.is_null(), "crsql_newExtData returned null");
     let rc = unsafe { test_exports::c::crsql_initSiteIdExt(raw_db, ext_data, make_site() as *mut core::ffi::c_uchar) };
     assert_eq!(rc, 0);
-    test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err);
+    let rc = test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err);
+    assert_eq!(rc, ResultCode::OK as c_int);
 
     let mut table_infos = unsafe {
         mem::ManuallyDrop::new(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>))
@@ -71,7 +76,8 @@ fn test_ensure_table_infos_are_up_to_date() {
     unsafe {
         (*ext_data).updatedTableInfosThisTx = 0;
     }
-    test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err);
+    let rc = test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err);
+    assert_eq!(rc, ResultCode::OK as c_int);
 
     assert_eq!(table_infos.len(), 1);
     assert_eq!(table_infos[0].tbl_name, "bar");
@@ -94,7 +100,8 @@ fn test_ensure_table_infos_are_up_to_date() {
     unsafe {
         (*ext_data).updatedTableInfosThisTx = 0;
     }
-    test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err);
+    let rc = test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err);
+    assert_eq!(rc, ResultCode::OK as c_int);
 
     assert_eq!(table_infos.len(), 2);
     assert_eq!(table_infos[0].tbl_name, "foo");
@@ -103,14 +110,15 @@ fn test_ensure_table_infos_are_up_to_date() {
     c.exec_safe("DROP TABLE foo").expect("dropped foo");
     c.exec_safe("DROP TABLE boo").expect("dropped boo");
     c.exec_safe("DROP TABLE boo__crsql_clock")
-        .expect("dropped boo");
+        .expect("dropped boo clock");
     c.exec_safe("DROP TABLE foo__crsql_clock")
-        .expect("dropped boo");
+        .expect("dropped foo clock");
 
     unsafe {
         (*ext_data).updatedTableInfosThisTx = 0;
     }
-    test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err);
+    let rc = test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err);
+    assert_eq!(rc, ResultCode::OK as c_int);
     drop_err_ptr(err);
 
     assert_eq!(table_infos.len(), 0);
@@ -285,8 +293,8 @@ fn test_is_table_compatible() {
       ) STRICT;",
     )
     .expect("made ydoc");
-    let is_compatible = test_exports::tableinfo::is_table_compatible(raw_db, "atable2", err)
-        .expect("checked if atable2 is compatible");
+    let is_compatible = test_exports::tableinfo::is_table_compatible(raw_db, "ydoc", err)
+        .expect("checked if ydoc is compatible");
     assert_eq!(is_compatible, true);
     drop_err_ptr(err);
 }
@@ -324,8 +332,92 @@ fn test_create_clock_table_from_table_info() {
     test_exports::bootstrap::create_clock_table(raw_db, &boo_tbl_info, err)
         .expect("created clock table for boo");
 
+    // Verify the clock table schema for each table.
+    // The __crsql_clock table should have columns:
+    // key, col_name, col_version, db_version, site_id, seq, ts
+    // with PRIMARY KEY (key, col_name).
+    for tbl in &["foo", "bar", "baz", "boo"] {
+        assert_clock_table_schema(raw_db, tbl);
+    }
+
     drop_err_ptr(err);
-    // todo: Check that clock tables have expected schema(s)
+}
+
+/// Assert that the `__crsql_clock` table for `tbl` has the expected columns
+/// and primary key. Queries `pragma_table_info` and verifies the dbv index exists.
+fn assert_clock_table_schema(db: *mut sqlite::sqlite3, tbl: &str) {
+    let clock_tbl = format!("{}__crsql_clock", tbl);
+
+    // Collect (name, type, notnull, pk) from pragma_table_info
+    let stmt = db
+        .prepare_v2(&format!(
+            "SELECT \"name\", \"type\", \"notnull\", \"pk\" FROM pragma_table_info('{clock_tbl}') ORDER BY cid"
+        ))
+        .expect("prepared pragma_table_info for clock table");
+    let mut cols: Vec<(String, String, i32, i32)> = vec![];
+    let mut s = stmt;
+    while s.step().expect("stepped pragma_table_info") == ResultCode::ROW {
+        let name = s.column_text(0).expect("col name").to_string();
+        let ty = s.column_text(1).expect("col type").to_string();
+        let notnull = s.column_int(2);
+        let pk = s.column_int(3);
+        cols.push((name, ty, notnull, pk));
+    }
+
+    let expected_cols = [
+        ("key", "INTEGER", 1, 1),
+        ("col_name", "TEXT", 1, 2),
+        ("col_version", "INTEGER", 1, 0),
+        ("db_version", "INTEGER", 1, 0),
+        ("site_id", "INTEGER", 1, 0),
+        ("seq", "INTEGER", 1, 0),
+        ("ts", "TEXT", 1, 0),
+    ];
+    assert_eq!(
+        cols.len(),
+        expected_cols.len(),
+        "clock table {} has unexpected column count",
+        clock_tbl
+    );
+    for (i, (name, ty, notnull, pk)) in expected_cols.iter().enumerate() {
+        assert_eq!(&cols[i].0, name, "clock table {} column {} name", clock_tbl, i);
+        assert_eq!(
+            &cols[i].1, ty,
+            "clock table {} column {} type",
+            clock_tbl,
+            name
+        );
+        assert_eq!(
+            cols[i].2, *notnull,
+            "clock table {} column {} notnull",
+            clock_tbl,
+            name
+        );
+        assert_eq!(
+            cols[i].3, *pk,
+            "clock table {} column {} pk",
+            clock_tbl,
+            name
+        );
+    }
+
+    // The table should have a dbv index (site_id, db_version).
+    let idx_stmt = db
+        .prepare_v2(&format!(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='{tbl}__crsql_clock_dbv_idx'"
+        ))
+        .expect("prepared index count query");
+    let mut idx_s = idx_stmt;
+    assert_eq!(
+        idx_s.step().expect("stepped index count"),
+        ResultCode::ROW
+    );
+    let idx_count = idx_s.column_int(0);
+    assert_eq!(
+        idx_count, 1,
+        "clock table {} should have a dbv index",
+        clock_tbl
+    );
 }
 
 fn test_leak_condition() {
@@ -359,11 +451,64 @@ fn test_leak_condition() {
         .expect("inserted into foo");
     c2.exec_safe("INSERT INTO foo VALUES (4, 5)")
         .expect("inserted into foo");
+
+    // Assert the resulting state: row counts and clock entries.
+    // c1 inserted (1,2) then updated to (1,3), then inserted (3,4).
+    // c2 inserted (2,3) and (4,5). All share the same file-based DB.
+    let raw_db = c1w.db.db;
+    let foo_count = count_rows(raw_db, "foo");
+    assert_eq!(
+        foo_count, 4,
+        "foo should have 4 rows after inserts, got {}",
+        foo_count
+    );
+
+    // The clock table should have entries for the CRR columns.
+    let clock_count = count_rows(raw_db, "foo__crsql_clock");
+    assert!(
+        clock_count > 0,
+        "foo__crsql_clock should have clock entries, got {}",
+        clock_count
+    );
+
+    // bar was created but is not a CRR — it should exist with 0 rows.
+    let bar_count = count_rows(raw_db, "bar");
+    assert_eq!(bar_count, 0, "bar should have 0 rows, got {}", bar_count);
+}
+
+/// Helper: count rows in a table via SELECT count(*).
+fn count_rows(db: *mut sqlite::sqlite3, table: &str) -> i32 {
+    let stmt = db
+        .prepare_v2(&format!("SELECT count(*) FROM {}", table))
+        .expect("prepared count query");
+    let mut s = stmt;
+    assert_eq!(
+        s.step().expect("stepped count query"),
+        ResultCode::ROW
+    );
+    s.column_int(0)
 }
 
 fn test_site_id_initialization() {
+    // Use a file-based DB so state persists across open/close cycles.
+    // Each block opens the same file, so DELETE/DROP of crsql_site_id
+    // in one block is visible to the next, actually testing re-initialization.
+    // (With :memory: each block gets a fresh DB, so the DELETE/DROP has no
+    // effect on subsequent blocks.)
+    let db_file = "test_site_id_initialization";
+
+    // Clean up any leftover state from a previous test run.
     {
-        let db = crate::opendb().expect("Opened DB");
+        let db = crate::opendb_file(db_file).expect("Opened DB for cleanup");
+        let raw_db = db.db.db;
+        raw_db
+            .exec_safe("DROP TABLE IF EXISTS crsql_site_id;")
+            .expect("dropped crsql_site_id for cleanup");
+    }
+
+    // Block 1: site_id should be initialized on first open. Delete it.
+    {
+        let db = crate::opendb_file(db_file).expect("Opened DB");
         let raw_db = db.db.db;
         let site_id = select_site_id(raw_db).expect("selected site id");
         assert_eq!(site_id.len(), 16);
@@ -372,8 +517,9 @@ fn test_site_id_initialization() {
             .expect("deleted site id");
     }
 
+    // Block 2: site_id should be re-initialized after the DELETE.
     {
-        let db = crate::opendb().expect("Opened DB");
+        let db = crate::opendb_file(db_file).expect("Opened DB");
         let raw_db = db.db.db;
         let site_id = select_site_id(raw_db).expect("selected site id");
         assert_eq!(site_id.len(), 16);
@@ -382,8 +528,9 @@ fn test_site_id_initialization() {
             .expect("dropped crsql_site_id");
     }
 
+    // Block 3: site_id should be re-initialized after the DROP TABLE.
     {
-        let db = crate::opendb().expect("Opened DB");
+        let db = crate::opendb_file(db_file).expect("Opened DB");
         let raw_db = db.db.db;
         let site_id = select_site_id(raw_db).expect("selected site id");
         assert_eq!(site_id.len(), 16);

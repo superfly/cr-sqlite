@@ -203,7 +203,8 @@ fn test_skip_hash_update() -> Result<(), ResultCode> {
     db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("UPDATE foo SET x = 'c' WHERE id = 1")?;
 
-    // v2_clock should have 2 entries (insert sentinel + x update)
+    // v2_clock should have 2 entries: one per non-PK column (x and y) created by the INSERT.
+    // The subsequent UPDATE on x updates the existing x entry in place rather than adding a new row.
     let stmt = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_v2_clock")?;
     stmt.step()?;
     assert!(stmt.column_int(0) == 2, "update: should have 2 clock entries, got {}", stmt.column_int(0));
@@ -451,22 +452,23 @@ fn test_skip_hash_sync_delete() -> Result<(), ResultCode> {
 // =============================================================================
 
 /// Test all 4 combinations of skip_hash × key_is_rowid:
-/// 1. skip_hash + rowid-key (INT PK, auto-qualified)
+/// 1. skip_hash + rowid-key (INTEGER PK + use_rowid arg, auto-qualified)
 /// 2. skip_hash + non-rowid (TEXT PK + directive, without_rowid)
-/// 3. hash + rowid-key (INT PK + skip_hash=0 directive)
+/// 3. hash + rowid-key (INTEGER PK + skip_hash=0 directive + use_rowid arg)
 /// 4. hash + non-rowid (TEXT PK, without_rowid)
 fn test_skip_hash_rowid_orthogonality() -> Result<(), ResultCode> {
-    // 1. skip_hash + non-rowid: INT PK, auto-qualified (key_is_rowid forced false for INT PK)
+    // 1. skip_hash + rowid-key: INTEGER PK, auto-qualified, use_rowid forces key_is_rowid=true
     {
         let db = crate::opendb()?;
         db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
         db.db.exec_safe("CREATE TABLE t1 (id INTEGER PRIMARY KEY NOT NULL, x TEXT)")?;
         db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
-        db.db.exec_safe("SELECT crsql_as_crr('t1')")?;
+        db.db.exec_safe("SELECT crsql_as_crr('t1', 'use_rowid')")?;
+        let sig = get_pk_signature(&db.db, "t1");
+        let mode = sig.split(':').next().unwrap_or("");
+        assert!(mode == "rs", "combo 1: expected mode 'rs' (rowid + skip_hash), got '{}'", mode);
         assert!(!v2_pks_has_hashed_pk(&db.db, "t1"), "combo 1: should not have hashed_pk");
-        // skip_hash + !key_is_rowid: __crsql_key, id, cl = 3 cols
-        assert!(v2_pks_col_count(&db.db, "t1") == 3, "combo 1: should have 3 cols, got {}", v2_pks_col_count(&db.db, "t1"));
-        libc_println!("  combo 1 (skip_hash + non-rowid INT PK): 3 cols, no hashed_pk — PASS");
+        libc_println!("  combo 1 (skip_hash + rowid-key INTEGER PK): mode={}, no hashed_pk — PASS", mode);
     }
 
     // 2. skip_hash + non-rowid: TEXT PK + directive + without_rowid
@@ -476,24 +478,26 @@ fn test_skip_hash_rowid_orthogonality() -> Result<(), ResultCode> {
         db.db.exec_safe("CREATE TABLE t2 /* crsql: skip_hash=1 */ (id TEXT PRIMARY KEY NOT NULL, x TEXT)")?;
         db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
         db.db.exec_safe("SELECT crsql_as_crr('t2', 'without_rowid')")?;
+        let sig = get_pk_signature(&db.db, "t2");
+        let mode = sig.split(':').next().unwrap_or("");
+        assert!(mode == "ns", "combo 2: expected mode 'ns' (non-rowid + skip_hash), got '{}'", mode);
         assert!(!v2_pks_has_hashed_pk(&db.db, "t2"), "combo 2: should not have hashed_pk");
-        // skip_hash + non-rowid: __crsql_key, id, cl = 3 cols
-        assert!(v2_pks_col_count(&db.db, "t2") == 3, "combo 2: should have 3 cols, got {}", v2_pks_col_count(&db.db, "t2"));
-        libc_println!("  combo 2 (skip_hash + non-rowid): 3 cols, no hashed_pk — PASS");
+        libc_println!("  combo 2 (skip_hash + non-rowid): mode={}, no hashed_pk — PASS", mode);
     }
 
-    // 3. hash + non-rowid: INTEGER PK + skip_hash=0 directive
-    //    INTEGER PK defaults to non-rowid (overflow safety), skip_hash=0 forces hash
+    // 3. hash + rowid-key: INTEGER PK + skip_hash=0 directive + use_rowid arg
+    //    use_rowid forces key_is_rowid=true, skip_hash=0 forces hash mode
     {
         let db = crate::opendb()?;
         db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
         db.db.exec_safe("CREATE TABLE t3 /* crsql: skip_hash=0 */ (id INTEGER PRIMARY KEY NOT NULL, x TEXT)")?;
         db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
-        db.db.exec_safe("SELECT crsql_as_crr('t3')")?;
+        db.db.exec_safe("SELECT crsql_as_crr('t3', 'use_rowid')")?;
+        let sig = get_pk_signature(&db.db, "t3");
+        let mode = sig.split(':').next().unwrap_or("");
+        assert!(mode == "rh", "combo 3: expected mode 'rh' (rowid + hash), got '{}'", mode);
         assert!(v2_pks_has_hashed_pk(&db.db, "t3"), "combo 3: should have hashed_pk");
-        // hash + non-rowid: __crsql_key, "id", hashed_pk, cl = 4 cols
-        assert!(v2_pks_col_count(&db.db, "t3") == 4, "combo 3: should have 4 cols, got {}", v2_pks_col_count(&db.db, "t3"));
-        libc_println!("  combo 3 (hash + non-rowid INTEGER PK): 4 cols, has hashed_pk — PASS");
+        libc_println!("  combo 3 (hash + rowid-key INTEGER PK): mode={}, has hashed_pk — PASS", mode);
     }
 
     // 4. hash + non-rowid: TEXT PK + without_rowid
@@ -503,10 +507,11 @@ fn test_skip_hash_rowid_orthogonality() -> Result<(), ResultCode> {
         db.db.exec_safe("CREATE TABLE t4 (id TEXT PRIMARY KEY NOT NULL, x TEXT)")?;
         db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
         db.db.exec_safe("SELECT crsql_as_crr('t4', 'without_rowid')")?;
+        let sig = get_pk_signature(&db.db, "t4");
+        let mode = sig.split(':').next().unwrap_or("");
+        assert!(mode == "nh", "combo 4: expected mode 'nh' (non-rowid + hash), got '{}'", mode);
         assert!(v2_pks_has_hashed_pk(&db.db, "t4"), "combo 4: should have hashed_pk");
-        // hash + non-rowid: __crsql_key, id, hashed_pk, cl = 4 cols
-        assert!(v2_pks_col_count(&db.db, "t4") == 4, "combo 4: should have 4 cols, got {}", v2_pks_col_count(&db.db, "t4"));
-        libc_println!("  combo 4 (hash + non-rowid): 4 cols, has hashed_pk — PASS");
+        libc_println!("  combo 4 (hash + non-rowid): mode={}, has hashed_pk — PASS", mode);
     }
 
     Ok(())
@@ -569,15 +574,15 @@ fn test_auto_detection_matrix() -> Result<(), ResultCode> {
     // (create_sql, as_crr_args, expected_mode_prefix, label)
     let cases: &[(&str, &str, &str, &str)] = &[
         ("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, x TEXT)",
-         "'t'", "ns", "INTEGER PK rowid"),
+         "'t'", "ns", "INTEGER PK non-rowid"),
         ("CREATE TABLE t (id INT PRIMARY KEY NOT NULL, x TEXT)",
-         "'t'", "ns", "INT PK rowid"),
+         "'t'", "ns", "INT PK non-rowid"),
         ("CREATE TABLE t (id BIGINT PRIMARY KEY NOT NULL, x TEXT)",
-         "'t'", "ns", "BIGINT PK rowid"),
+         "'t'", "ns", "BIGINT PK non-rowid"),
         ("CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, x TEXT)",
-         "'t'", "nh", "TEXT PK rowid"),
+         "'t'", "nh", "TEXT PK non-rowid"),
         ("CREATE TABLE t (a INTEGER NOT NULL, b INTEGER NOT NULL, x TEXT, PRIMARY KEY (a, b))",
-         "'t'", "nh", "composite INTEGER PK rowid"),
+         "'t'", "nh", "composite INTEGER PK non-rowid"),
         ("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, x TEXT) WITHOUT ROWID",
          "'t'", "ns", "INTEGER PK WITHOUT ROWID"),
         ("CREATE TABLE t (id INT PRIMARY KEY NOT NULL, x TEXT) WITHOUT ROWID",

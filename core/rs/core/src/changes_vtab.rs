@@ -222,7 +222,7 @@ fn changes_best_index(
     // and return V1-style scalar rows so aggregates like MAX(seq) work correctly.
     let distinct = sqlite::vtab_distinct(index_info);
     let mut flags: u8 = 0;
-    if distinct == 1 || distinct == 2 {
+    if distinct == 1 || distinct == 2 || distinct == 3 {
         flags |= IDX_FLAG_SCALAR_MODE;
     }
 
@@ -437,6 +437,13 @@ unsafe fn changes_filter(
         if !(*cursor).cached_pChangesStmt.is_null() {
             (*cursor).cached_pChangesStmt.finalize()?;
             (*cursor).cached_pChangesStmt = null_mut();
+        }
+        // If xFilter is called before the cursor reached EOF (e.g., nested
+        // loop join), the active statement is still pending — finalize it
+        // before overwriting to avoid leaking the prepared statement.
+        if !(*cursor).pChangesStmt.is_null() {
+            (*cursor).pChangesStmt.finalize()?;
+            (*cursor).pChangesStmt = null_mut();
         }
         (*cursor).cached_idx_str = null_mut();
 

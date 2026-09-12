@@ -1,13 +1,23 @@
 extern crate alloc;
-use alloc::{ffi::CString, format, string::String};
+use alloc::{format, string::String};
 use core::ffi::c_char;
 use crsql_bundle::test_exports;
 use sqlite::{Connection, ResultCode};
 use sqlite_nostd::{self as sqlite, ManagedStmt};
 
+/// Allocate a site_id buffer via the SQLite allocator (sqlite3_malloc) so that
+/// `crsql_freeExtData` — which frees `siteId` with `sqlite3_free` — releases
+/// memory from the correct allocator. Using `CString::into_raw()` would
+/// allocate via Rust's global allocator, causing a mismatch (UB if SQLite
+/// uses a custom allocator).
 fn make_site() -> *mut c_char {
-    let inner_ptr: *mut c_char = CString::new("0000000000000000").unwrap().into_raw();
-    inner_ptr
+    let bytes = b"0000000000000000";
+    let buf = sqlite::malloc(bytes.len());
+    assert!(!buf.is_null(), "sqlite::malloc failed for site_id buffer");
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+    }
+    buf as *mut c_char
 }
 
 fn get_site_id(db: *mut sqlite::sqlite3) -> *mut c_char {
@@ -17,11 +27,19 @@ fn get_site_id(db: *mut sqlite::sqlite3) -> *mut c_char {
 
     stmt.step().expect("failed to execute crsql_site_id query");
 
-    let blob_ptr = stmt.column_blob(0).expect("failed to get site_id");
+    let blob = stmt.column_blob(0).expect("failed to get site_id");
 
-    // use vec_unchecked because `new` errors if there's a 0 byte in the vec.
-    let cstring = unsafe { CString::from_vec_unchecked(blob_ptr.to_vec()) };
-    cstring.into_raw() as *mut c_char
+    // Allocate via the SQLite allocator (sqlite3_malloc) so that
+    // crsql_freeExtData — which frees siteId with sqlite3_free — releases the
+    // correct allocator. Avoid CString entirely: the 16-byte random site_id
+    // may contain interior null bytes (~6% probability), which would violate
+    // the CString invariant (from_vec_unchecked is UB in that case).
+    let buf = sqlite::malloc(blob.len());
+    assert!(!buf.is_null(), "sqlite::malloc failed for site_id buffer");
+    unsafe {
+        core::ptr::copy_nonoverlapping(blob.as_ptr(), buf, blob.len());
+    }
+    buf as *mut c_char
 }
 
 fn test_fetch_db_version_from_storage() -> Result<ResultCode, String> {

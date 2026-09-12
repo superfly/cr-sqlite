@@ -240,12 +240,32 @@ pub fn create_v2_tables(
 }
 
 /// Populate the col_map table with column names from the table info.
-/// Assigns 0-based col_id to each non-PK column.
+/// Preserves existing col_ids for columns that still exist, deletes stale
+/// entries for dropped columns, and adds new columns with fresh col_ids.
 fn populate_col_map(
     db: *mut sqlite::sqlite3,
     table_info: &TableInfo,
 ) -> Result<ResultCode, ResultCode> {
     let escaped = crate::util::escape_ident(&table_info.tbl_name);
+
+    // Delete stale col_map entries for columns that no longer exist.
+    let current_cols: Vec<String> = table_info
+        .non_pks
+        .iter()
+        .map(|c| format!("'{}'", c.name.replace('\'', "''")))
+        .collect();
+    if !current_cols.is_empty() {
+        let delete_sql = format!(
+            "DELETE FROM \"{escaped}{suffix}\" WHERE col_name NOT IN ({cols})",
+            escaped = escaped,
+            suffix = consts::V2_COL_MAP_SUFFIX,
+            cols = current_cols.join(", ")
+        );
+        let del_stmt = db.prepare_v2(&delete_sql)?;
+        del_stmt.step()?;
+    }
+
+    // Use INSERT OR IGNORE to preserve existing col_ids for existing columns.
     let stmt = db.prepare_v2(&format!(
         "INSERT OR IGNORE INTO \"{escaped}{suffix}\" (col_id, col_name) VALUES (?, ?)",
         escaped = escaped,
@@ -287,6 +307,9 @@ pub fn drop_v2_tables(
     table: &str,
 ) -> Result<ResultCode, ResultCode> {
     let escaped = crate::util::escape_ident(table);
+    if escaped.is_empty() {
+        return Err(ResultCode::ERROR);
+    }
 
     let suffixes = [
         consts::V2_COL_MAP_SUFFIX,

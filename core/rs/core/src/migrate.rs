@@ -438,8 +438,8 @@ unsafe fn cleanup_tables_chunk(
             Ok(remaining)
         }
         Err(e) => {
-            db.exec_safe("ROLLBACK TO SAVEPOINT cleanup_chunk")?;
-            db.exec_safe("RELEASE cleanup_chunk")?;
+            let _ = db.exec_safe("ROLLBACK TO SAVEPOINT cleanup_chunk");
+            let _ = db.exec_safe("RELEASE cleanup_chunk");
             Err(e)
         }
     }
@@ -825,8 +825,8 @@ unsafe fn backfill_untracked_v2_pks(
     } else if tbl_info.skip_hash {
         format!(
             "vp.\"{}\" = b.\"{}\"",
-            crate::util::escape_ident(&tbl_info.skip_hash_pk_col),
-            crate::util::escape_ident(&tbl_info.skip_hash_pk_col)
+            tbl_info.skip_hash_pk_col,
+            tbl_info.skip_hash_pk_col
         )
     } else {
         format!("vp.hashed_pk = crsql_hash_pk({})", pk_cols_base)

@@ -41,17 +41,24 @@ fn create_insert_trigger(
 ) -> Result<ResultCode, ResultCode> {
     let rowid_expr = if table_info.key_is_rowid {
         let alias = crate::util::escape_ident(&table_info.rowid_alias);
+        if alias.is_empty() {
+            return Err(ResultCode::ERROR);
+        }
         format!(", NEW.\"{alias}\"")
     } else {
         String::new()
     };
+    let escaped_ident = crate::util::escape_ident(&table_info.tbl_name);
+    if escaped_ident.is_empty() {
+        return Err(ResultCode::ERROR);
+    }
     let create_trigger_sql = format!(
         "CREATE TRIGGER IF NOT EXISTS \"{escaped_ident}__crsql_itrig\"
       AFTER INSERT ON \"{escaped_ident}\" WHEN crsql_internal_sync_bit() = 0
       BEGIN
         VALUES (crsql_after_insert('{escaped_val}', {pk_new_list}{rowid_expr}));
       END;",
-        escaped_ident = crate::util::escape_ident(&table_info.tbl_name),
+        escaped_ident = escaped_ident,
         escaped_val = crate::util::escape_ident_as_value(&table_info.tbl_name),
         pk_new_list = crate::util::as_identifier_list(&table_info.pks, Some("NEW."))?,
         rowid_expr = rowid_expr
@@ -73,6 +80,9 @@ fn create_update_trigger(
 
     let rowid_expr = if table_info.key_is_rowid {
         let alias = crate::util::escape_ident(&table_info.rowid_alias);
+        if alias.is_empty() {
+            return Err(ResultCode::ERROR);
+        }
         format!(", NEW.\"{alias}\", OLD.\"{alias}\"")
     } else {
         String::new()
@@ -97,13 +107,17 @@ fn create_update_trigger(
         rowid_expr = rowid_expr
       )
     };
+    let escaped_table = crate::util::escape_ident(table_name);
+    if escaped_table.is_empty() {
+        return Err(ResultCode::ERROR);
+    }
     db.exec_safe(&format!(
         "CREATE TRIGGER IF NOT EXISTS \"{table_name}__crsql_utrig\"
       AFTER UPDATE ON \"{table_name}\" WHEN crsql_internal_sync_bit() = 0
       BEGIN
         {trigger_body};
       END;",
-        table_name = crate::util::escape_ident(table_name),
+        table_name = escaped_table,
     ))
 }
 
@@ -116,13 +130,17 @@ fn create_delete_trigger(
     let pk_columns = &table_info.pks;
     let pk_old_list = crate::util::as_identifier_list(pk_columns, Some("OLD."))?;
 
+    let escaped_ident = crate::util::escape_ident(table_name);
+    if escaped_ident.is_empty() {
+        return Err(ResultCode::ERROR);
+    }
     let create_trigger_sql = format!(
         "CREATE TRIGGER IF NOT EXISTS \"{escaped_ident}__crsql_dtrig\"
     AFTER DELETE ON \"{escaped_ident}\" WHEN crsql_internal_sync_bit() = 0
     BEGIN
       VALUES (crsql_after_delete('{escaped_val}', {pk_old_list}));
     END;",
-        escaped_ident = crate::util::escape_ident(table_name),
+        escaped_ident = escaped_ident,
         escaped_val = crate::util::escape_ident_as_value(table_name),
         pk_old_list = pk_old_list
     );

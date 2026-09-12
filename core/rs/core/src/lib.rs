@@ -135,8 +135,12 @@ fn crsql_as_table_impl(db: *mut sqlite::sqlite3, table: &str) -> Result<ResultCo
     remove_crr_triggers_if_exist(db, table)?;
     // Also remove V2 metadata tables and crsql_master flags.
     crate::teardown_v2::remove_crr_v2_tables(db, table)?;
-    // Clean up remaining crsql_master mode flags (use_rowid, skip_hash, v2_pks).
-    unsafe { crate::util::clear_crr_mode_flags(db, table); }
+    // Clean up ALL per-table crsql_master keys: mode flags (use_rowid, skip_hash,
+    // v2_pks) AND cleanup/migration task markers (cleanup_v1_tables_, cleanup_v2_tables_,
+    // cleanup_remaining_, migration_v1_to_v2_migration_, migration_v1_to_v2_remaining_).
+    // Stale markers would cause incremental_maintenance to drop freshly re-created
+    // CRR metadata tables on re-registration.
+    unsafe { crate::util::clear_all_per_table_master_keys(db, table); }
     Ok(ResultCode::OK)
 }
 
@@ -411,7 +415,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_next_db_version function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -429,7 +432,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_peek_next_db_version function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -447,7 +449,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_sha function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -465,7 +466,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_version function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -483,7 +483,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_increment_and_get_seq function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -501,7 +500,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_get_seq function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -519,7 +517,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_as_crr function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -537,7 +534,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_set_ts function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -555,7 +551,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_change_wins function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -571,7 +566,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         None,
     ) {
         set_err_msg("cr-sqlite: failed to create crsql_cache_site_ordinal function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -587,7 +581,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         None,
     ) {
         set_err_msg("cr-sqlite: failed to create crsql_cache_pk_cl function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -603,7 +596,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         None,
     ) {
         set_err_msg("cr-sqlite: failed to create crsql_cache_db_version function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -621,7 +613,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_set_db_version function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -639,7 +630,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_get_ts function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -657,7 +647,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_begin_alter function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -675,7 +664,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_commit_alter function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -693,7 +681,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_finalize function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -711,7 +698,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_after_update function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -729,7 +715,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_after_insert function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -747,7 +732,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_after_delete function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -765,7 +749,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_rows_impacted function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -783,7 +766,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(sqlite::ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_config_set function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -801,7 +783,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(sqlite::ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_config_get function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -820,7 +801,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_hash_pk function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -838,7 +818,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_pack_agg function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -856,7 +835,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_pack_varint_agg function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -875,7 +853,6 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
         set_err_msg("cr-sqlite: failed to create crsql_incremental_maintenance function");
-        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
@@ -1567,7 +1544,6 @@ unsafe extern "C" fn x_crsql_version(
 
 unsafe extern "C" fn x_free_connection_ext_data(data: *mut c_void) {
     let ext_data = data as *mut c::crsql_ExtData;
-    crsql_freeExtData(ext_data);
 }
 
 pub unsafe extern "C" fn crsql_sqlite_free(ptr: *mut c_void) {

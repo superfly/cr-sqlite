@@ -275,7 +275,7 @@ pub fn unpack_columns(data: &[u8]) -> Result<Vec<ColumnValue>, ResultCode> {
                 if buf.remaining() < intlen {
                     return Err(ResultCode::ABORT);
                 }
-                let len = buf.get_int(intlen) as usize;
+                let len = buf.get_uint(intlen) as usize;
                 if buf.remaining() < len {
                     return Err(ResultCode::ABORT);
                 }
@@ -307,8 +307,9 @@ pub fn unpack_columns(data: &[u8]) -> Result<Vec<ColumnValue>, ResultCode> {
                     return Err(ResultCode::ABORT);
                 }
                 let bytes = buf.copy_to_bytes(len);
-                let s = alloc::string::String::from_utf8(bytes.to_vec())
-                    .map_err(|_| ResultCode::ABORT)?;
+                // The pack side stores raw bytes via value.blob() without UTF-8
+                // validation, so decode lossy to handle invalid UTF-8 gracefully.
+                let s = alloc::string::String::from_utf8_lossy(&bytes).into_owned();
                 ret.push(ColumnValue::Text(s));
             }
             None => return Err(ResultCode::MISUSE),
@@ -334,6 +335,12 @@ pub fn bind_slot(
     val: &ColumnValue,
     stmt: *mut sqlite::stmt,
 ) -> Result<ResultCode, ResultCode> {
+    // SAFETY: Blob and Text variants are bound with Destructor::STATIC because
+    // the data is owned by the ColumnValue, which is in turn owned by the
+    // Vec<ColumnValue> passed to bind_package_to_stmt. Callers must step or
+    // reset the statement before that Vec drops, ensuring SQLite has finished
+    // reading the bound data. Since STATIC tells SQLite not to copy or free
+    // the data, the pointers remain valid for the duration of the binding.
     match val {
         ColumnValue::Blob(b) => stmt.bind_blob(slot_num as i32, b, sqlite::Destructor::STATIC),
         ColumnValue::Float(f) => stmt.bind_double(slot_num as i32, *f),
@@ -392,7 +399,16 @@ pub unsafe extern "C" fn crsql_pack_agg_step(
 pub unsafe extern "C" fn crsql_pack_agg_final(ctx: *mut sqlite::context) {
     let acc_ptr = aggregate_context(ctx, 0) as *mut PackAggAcc;
 
-    if acc_ptr.is_null() || (*acc_ptr).buf.is_null() {
+    if acc_ptr.is_null() {
+        // No rows were processed (xStep never called, so no aggregate context
+        // was allocated). Return an empty packed blob: just varint(0).
+        let mut empty = Vec::new();
+        put_varint(&mut empty, 0);
+        ctx.result_blob_owned(empty);
+        return;
+    }
+
+    if (*acc_ptr).buf.is_null() {
         // No rows were processed (xStep never called).
         // Return an empty packed blob: just varint(0).
         let mut empty = Vec::new();
@@ -469,7 +485,16 @@ pub unsafe extern "C" fn crsql_pack_varint_agg_step(
 pub unsafe extern "C" fn crsql_pack_varint_agg_final(ctx: *mut sqlite::context) {
     let acc_ptr = aggregate_context(ctx, 0) as *mut PackVarintAcc;
 
-    if acc_ptr.is_null() || (*acc_ptr).buf.is_null() {
+    if acc_ptr.is_null() {
+        // No rows were processed (xStep never called, so no aggregate context
+        // was allocated). Emit varint(0) so the blob is self-describing.
+        let mut empty = Vec::new();
+        put_varint(&mut empty, 0);
+        ctx.result_blob_owned(empty);
+        return;
+    }
+
+    if (*acc_ptr).buf.is_null() {
         // No rows: emit varint(0) so the blob is self-describing.
         let mut empty = Vec::new();
         put_varint(&mut empty, 0);

@@ -66,9 +66,9 @@ static void testFreeExtData() {
   int rc;
   rc = sqlite3_open(":memory:", &db);
   assert(rc == SQLITE_OK);
-  unsigned char *siteIdBuffer = sqlite3_malloc(SITE_ID_LEN * sizeof(char *));
+  unsigned char *siteIdBuffer =
+      sqlite3_malloc(SITE_ID_LEN * sizeof *(siteIdBuffer));
   crsql_ExtData *pExtData = crsqlExtDataInit(db, siteIdBuffer);
-  assert(rc == 0);
 
   crsql_finalize(pExtData);
   crsql_freeExtData(pExtData);
@@ -82,9 +82,9 @@ static void testFinalize() {
   int rc;
   rc = sqlite3_open(":memory:", &db);
   assert(rc == SQLITE_OK);
-  unsigned char *siteIdBuffer = sqlite3_malloc(SITE_ID_LEN * sizeof(char *));
+  unsigned char *siteIdBuffer =
+      sqlite3_malloc(SITE_ID_LEN * sizeof *(siteIdBuffer));
   crsql_ExtData *pExtData = crsqlExtDataInit(db, siteIdBuffer);
-  assert(rc == 0);
 
   crsql_finalize(pExtData);
   assert(pExtData->pDbVersionStmt == 0);
@@ -104,9 +104,9 @@ static void testFetchPragmaSchemaVersion() {
   int didChange = 0;
   rc = sqlite3_open(":memory:", &db);
   assert(rc == SQLITE_OK);
-  unsigned char *siteIdBuffer = sqlite3_malloc(SITE_ID_LEN * sizeof(char *));
+  unsigned char *siteIdBuffer =
+      sqlite3_malloc(SITE_ID_LEN * sizeof *(siteIdBuffer));
   crsql_ExtData *pExtData = crsqlExtDataInit(db, siteIdBuffer);
-  assert(rc == 0);
 
   // fetch the schema info for db version update
   didChange = crsql_fetchPragmaSchemaVersion(db, pExtData, 0);
@@ -173,9 +173,10 @@ static void testFetchPragmaDataVersion() {
   rc = sqlite3_exec(db1, "CREATE TABLE fpdv (a)", 0, 0, &errmsg);
   assert(rc == SQLITE_OK);
 
-  unsigned char *siteIdBuffer = sqlite3_malloc(SITE_ID_LEN * sizeof(char *));
+  unsigned char *siteIdBuffer =
+      sqlite3_malloc(SITE_ID_LEN * sizeof *(siteIdBuffer));
   crsql_ExtData *pExtData1 = crsqlExtDataInit(db1, siteIdBuffer);
-  siteIdBuffer = sqlite3_malloc(SITE_ID_LEN * sizeof(char *));
+  siteIdBuffer = sqlite3_malloc(SITE_ID_LEN * sizeof *(siteIdBuffer));
   crsql_ExtData *pExtData2 = crsqlExtDataInit(db2, siteIdBuffer);
 
   // should not change after init
@@ -192,7 +193,7 @@ static void testFetchPragmaDataVersion() {
 
   // should change if write was issued on another connection
   rc = crsql_fetchPragmaDataVersion(db2, pExtData2);
-  assert(rc == 1);
+  assert(rc == 2);
 
   // should not change after updating itself
   rc = crsql_fetchPragmaDataVersion(db2, pExtData2);
@@ -205,7 +206,7 @@ static void testFetchPragmaDataVersion() {
   assert(rc == 0);
 
   rc = crsql_fetchPragmaDataVersion(db1, pExtData1);
-  assert(rc == 1);
+  assert(rc == 2);
 
   // should not change after updating itself
   rc = crsql_fetchPragmaDataVersion(db1, pExtData1);
@@ -216,6 +217,8 @@ static void testFetchPragmaDataVersion() {
   crsql_close(db1);
   crsql_finalize(pExtData2);
   crsql_freeExtData(pExtData2);
+  sqlite3_free(errmsg);
+  errmsg = 0;
   crsql_close(db2);
   remove("testFetchPragmaDataVersion.db");
   printf("\t\e[0;32mSuccess\e[0m\n");

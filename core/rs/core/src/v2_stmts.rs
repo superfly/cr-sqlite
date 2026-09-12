@@ -83,19 +83,11 @@ pub struct V2Stmts {
     clock_bump_version: ManagedStmt,
     /// DELETE FROM v2_clock WHERE cell_key >= ? AND <= ?
     clock_delete_range: ManagedStmt,
-    /// INSERT INTO v2_clock SELECT ? + col_id ... FROM v2_col_map (ensure alive row)
-    clock_zero_fill: ManagedStmt,
     /// Per-column merge upsert with crsql_change_wins. Keyed by column name.
     clock_merge_upserts: alloc::collections::BTreeMap<String, ManagedStmt>,
     /// Sentinel merge upsert for PK-only tables (col_id=0). merge_equal baked in.
     /// Only prepared for PK-only tables (non_pks.is_empty()).
     sentinel_merge_upsert: Option<ManagedStmt>,
-
-    // --- v2_col_map ---
-    /// SELECT col_id FROM v2_col_map WHERE col_name = ?
-    col_id_lookup: ManagedStmt,
-    /// SELECT col_id FROM v2_col_map (all columns, for clock entry creation)
-    col_ids_all: ManagedStmt,
 
     // --- Base table ---
     /// INSERT INTO base table (pk_cols) VALUES (?, ...) — for merge new row creation
@@ -290,25 +282,6 @@ impl V2Stmts {
         let clock_delete_range = db.prepare_v3(&format!(
             "DELETE FROM \"{escaped}{}\" WHERE cell_key >= ? AND cell_key <= ?",
             consts::V2_CLOCK_SUFFIX
-        ), sqlite::PREPARE_PERSISTENT)?;
-
-        let clock_zero_fill = db.prepare_v3(&format!(
-            "INSERT INTO \"{escaped}{}\" (cell_key, col_version, site_id, db_version, seq, ts) \
-             SELECT ? + col_id, 0, ?, ?, 0, crsql_get_ts() \
-             FROM \"{escaped}{}\"",
-            consts::V2_CLOCK_SUFFIX, consts::V2_COL_MAP_SUFFIX
-        ), sqlite::PREPARE_PERSISTENT)?;
-
-        // --- v2_col_map ---
-
-        let col_id_lookup = db.prepare_v3(&format!(
-            "SELECT col_id FROM \"{escaped}{}\" WHERE col_name = ?",
-            consts::V2_COL_MAP_SUFFIX
-        ), sqlite::PREPARE_PERSISTENT)?;
-
-        let col_ids_all = db.prepare_v3(&format!(
-            "SELECT col_id FROM \"{escaped}{}\" ORDER BY col_id",
-            consts::V2_COL_MAP_SUFFIX
         ), sqlite::PREPARE_PERSISTENT)?;
 
         // --- Base table ---
@@ -512,7 +485,6 @@ impl V2Stmts {
             clock_set_initial,
             clock_bump_version,
             clock_delete_range,
-            clock_zero_fill,
             clock_merge_upserts: {
                 let mut map = alloc::collections::BTreeMap::new();
                 for col in &tbl_info.non_pks {
@@ -547,8 +519,6 @@ impl V2Stmts {
             } else {
                 None
             },
-            col_id_lookup,
-            col_ids_all,
             base_insert,
             base_delete_rowid,
             base_delete_nonrowid,
@@ -607,9 +577,6 @@ impl V2Stmts {
     pub fn clock_set_initial(&mut self) -> StmtGuard { StmtGuard::new(&mut self.clock_set_initial) }
     pub fn clock_bump_version(&mut self) -> StmtGuard { StmtGuard::new(&mut self.clock_bump_version) }
     pub fn clock_delete_range(&mut self) -> StmtGuard { StmtGuard::new(&mut self.clock_delete_range) }
-    pub fn clock_zero_fill(&mut self) -> StmtGuard { StmtGuard::new(&mut self.clock_zero_fill) }
-    pub fn col_id_lookup(&mut self) -> StmtGuard { StmtGuard::new(&mut self.col_id_lookup) }
-    pub fn col_ids_all(&mut self) -> StmtGuard { StmtGuard::new(&mut self.col_ids_all) }
     pub fn base_insert(&mut self) -> StmtGuard { StmtGuard::new(&mut self.base_insert) }
     pub fn base_delete_rowid(&mut self) -> Result<StmtGuard, ResultCode> {
         self.base_delete_rowid.as_mut().map(StmtGuard::new).ok_or(ResultCode::ERROR)

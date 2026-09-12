@@ -65,6 +65,14 @@ fn create_crr_inner(
             // V2 tables exist — check if they're stale (base table was dropped and
             // re-created). If no crsql triggers exist, the table was likely dropped
             // and re-created — drop the stale V2 tables and clear flags.
+            //
+            // Note: This uses a `LIKE '%crsql%'` trigger name check rather than the
+            // exact trigger-name matching used by `is_crr.rs`. This is intentional:
+            // this is a recovery/cleanup path, not a CRR-membership test. The LIKE
+            // match is more lenient so it catches triggers even if the naming
+            // convention changes between versions, avoiding false positives that
+            // would destroy valid V2 metadata. `is_crr.rs` uses exact names because
+            // it answers the precise "is this a CRR?" question.
             let has_triggers = db.prepare_v2(&format!(
                 "SELECT 1 FROM sqlite_master WHERE type='trigger' AND tbl_name='{}' AND name LIKE '%crsql%'",
                 crate::util::escape_ident_as_value(table)
@@ -85,15 +93,21 @@ fn create_crr_inner(
 
     let metadata_write_version = get_metadata_write_version(db, err)?;
 
-    // Resolve use_rowid: as_crr arg takes precedence, then schema directive, then auto.
-    // Some(true)  = force rowid-key mode (caller guarantees rowids < MAX_ROWID_KEY)
-    // Some(false) = force non-rowid-key mode
-    // None        = auto-detect (default for INTEGER PK is non-rowid)
-    let use_rowid_directive = crate::schema_directive::read_use_rowid_directive_opt(db, table)
+    // Read all crsql directives once and reuse for both use_rowid and skip_hash
+    // resolution. This avoids a redundant sqlite_master query per CRR creation.
+    let directives = crate::schema_directive::read_directives(db, table)
         .map_err(|e| {
             err.set(&format!("directive read error: {}", e));
             e
         })?;
+
+    // Resolve use_rowid: as_crr arg takes precedence, then schema directive, then auto.
+    // Some(true)  = force rowid-key mode (caller guarantees rowids < MAX_ROWID_KEY)
+    // Some(false) = force non-rowid-key mode
+    // None        = auto-detect (default for INTEGER PK is non-rowid)
+    let use_rowid_directive = directives
+        .get("use_rowid")
+        .map(|v| crate::schema_directive::is_truthy(v));
     let use_rowid_resolved = use_rowid.or(use_rowid_directive);
 
     // Override key_is_rowid based on the resolved use_rowid preference.
@@ -160,11 +174,7 @@ fn create_crr_inner(
     // Only persist if there was an explicit directive or flag (not just auto-qualified).
     // For auto-qualified tables, the auto rule will re-apply on reload.
     // For explicitly enabled/disabled tables, we need to persist.
-    let directive = crate::schema_directive::read_skip_hash_directive_opt(db, table)
-        .map_err(|e| {
-            err.set(&format!("directive read error: {}", e));
-            e
-        })?;
+    let directive = directives.get("skip_hash");
     if directive.is_some() || skip_hash_flag {
         unsafe { crate::util::set_master_value(db, &format!("skip_hash_{}", table), skip_hash_val as i64) }?;
     }

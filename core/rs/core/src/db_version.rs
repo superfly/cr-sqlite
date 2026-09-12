@@ -144,18 +144,26 @@ pub extern "C" fn crsql_init_ordinal_map(ext_data: *mut crsql_ExtData) {
 #[no_mangle]
 pub extern "C" fn crsql_drop_last_db_versions_map(ext_data: *mut crsql_ExtData) {
     unsafe {
+        if (*ext_data).lastDbVersions.is_null() {
+            return;
+        }
         drop(Box::from_raw(
             (*ext_data).lastDbVersions as *mut BTreeMap<Vec<u8>, i64>,
         ));
+        (*ext_data).lastDbVersions = core::ptr::null_mut();
     }
 }
 
 #[no_mangle]
 pub extern "C" fn crsql_drop_ordinal_map(ext_data: *mut crsql_ExtData) {
     unsafe {
+        if (*ext_data).ordinalMap.is_null() {
+            return;
+        }
         drop(Box::from_raw(
             (*ext_data).ordinalMap as *mut BTreeMap<Vec<u8>, i64>,
         ));
+        (*ext_data).ordinalMap = core::ptr::null_mut();
     }
 }
 
