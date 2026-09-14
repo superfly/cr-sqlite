@@ -110,8 +110,12 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
 
   sqlite3_stmt *pStmt;
 
+  // Use substr to strip the literal "config." prefix. Do NOT use
+  // ltrim(key, 'config.') — SQLite's ltrim(X, Y) treats Y as a SET of
+  // characters, not a prefix string, so any config key whose name portion
+  // starts with one of c/o/n/f/i/g/. would be over-stripped and misparsed.
   rc = sqlite3_prepare_v2(db,
-                           "SELECT ltrim(key, 'config.'), value FROM "
+                           "SELECT substr(key, length('config.') + 1), value FROM "
                            "crsql_master WHERE key LIKE 'config.%';",
                            -1, &pStmt, 0);
 

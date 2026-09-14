@@ -66,17 +66,20 @@ pub extern "C" fn crsql_config_set(
         return;
     }
 
-    // Collect ext_data mutations to apply only after persistence succeeds.
-    let mut ext_data_updates: Option<alloc::boxed::Box<dyn FnOnce()>> = None;
+    // Collect config changes as (config_name, int_value) pairs.
+    // The first entry is always the explicitly-requested key; any subsequent
+    // entries are cascaded side-effects. This single list drives BOTH
+    // crsql_master persistence and ext_data updates, so the two can never
+    // diverge — a cascaded in-memory change is impossible to add without also
+    // persisting it, because both come from the same list.
+    let mut config_changes: Vec<(&'static str, c_int)> = Vec::new();
 
     let value_result = (|| -> Result<*mut sqlite::value, ()> {
         let value = match name {
             MERGE_EQUAL_VALUES => {
                 let value = args[1];
                 let v = value.int();
-                ext_data_updates = Some(alloc::boxed::Box::new(move || {
-                    unsafe { (*ext_data).mergeEqualValues = v; }
-                }));
+                config_changes.push((MERGE_EQUAL_VALUES, v));
                 value
             }
             METADATA_WRITE_VERSION => {
@@ -172,8 +175,11 @@ pub extern "C" fn crsql_config_set(
                         }
                     }
                 }
-                // Collect ext_data mutations to apply after persistence succeeds.
                 // Auto-cascade dependent config values to prevent invalid states.
+                // Each cascaded value is appended to config_changes so it is BOTH
+                // persisted to crsql_master AND applied to ext_data. Without
+                // persisting cascades, new connections load stale values from
+                // crsql_master.
                 let new_use_version = if new_val == METADATA_VERSION_V1 {
                     Some(1)
                 } else if new_val == METADATA_VERSION_V2 {
@@ -182,16 +188,13 @@ pub extern "C" fn crsql_config_set(
                     None
                 };
                 let new_sync_log = if new_val == METADATA_VERSION_V1 { Some(1) } else { None };
-                let new_write_version = new_val;
-                ext_data_updates = Some(alloc::boxed::Box::new(move || {
-                    if let Some(uv) = new_use_version {
-                        unsafe { (*ext_data).metadataUseVersion = uv; }
-                    }
-                    if let Some(sl) = new_sync_log {
-                        unsafe { (*ext_data).syncLogVersion = sl; }
-                    }
-                    unsafe { (*ext_data).metadataWriteVersion = new_write_version; }
-                }));
+                config_changes.push((METADATA_WRITE_VERSION, new_val));
+                if let Some(uv) = new_use_version {
+                    config_changes.push((METADATA_USE_VERSION, uv));
+                }
+                if let Some(sl) = new_sync_log {
+                    config_changes.push((SYNC_LOG_VERSION, sl));
+                }
                 args[1]
             }
             METADATA_USE_VERSION => {
@@ -216,10 +219,7 @@ pub extern "C" fn crsql_config_set(
                         return Err(());
                     }
                 }
-                let nv = new_val;
-                ext_data_updates = Some(alloc::boxed::Box::new(move || {
-                    unsafe { (*ext_data).metadataUseVersion = nv; }
-                }));
+                config_changes.push((METADATA_USE_VERSION, new_val));
                 args[1]
             }
             SYNC_LOG_VERSION => {
@@ -249,10 +249,7 @@ pub extern "C" fn crsql_config_set(
                         return Err(());
                     }
                 }
-                let nv = new_val;
-                ext_data_updates = Some(alloc::boxed::Box::new(move || {
-                    unsafe { (*ext_data).syncLogVersion = nv; }
-                }));
+                config_changes.push((SYNC_LOG_VERSION, new_val));
                 args[1]
             }
             _ => {
@@ -266,20 +263,40 @@ pub extern "C" fn crsql_config_set(
 
     match value_result {
         Ok(value) => {
+            // Persist the explicitly-requested key first. insert_config_setting
+            // returns the stored value via RETURNING, but we use the input
+            // value (args[1]) for the function result so the statement can be
+            // dropped immediately — freeing the connection to persist cascaded
+            // values without SQLite BUSY errors (a statement sitting on a ROW
+            // blocks other writes on the same connection).
             match insert_config_setting(db, name, value) {
-                Ok((_stmt, value)) => {
-                    // Copy the result value into the SQLite context before
-                    // releasing the savepoint — sqlite3_result_value copies
-                    // the value, so it's safe to drop the statement after.
-                    ctx.result_value(value);
-                    // Drop the prepared statement before releasing the
-                    // savepoint. SQLite returns BUSY if you try to RELEASE
-                    // while a statement is still active.
-                    drop(_stmt);
-                    // Persistence succeeded — apply ext_data mutations and release savepoint.
-                    if let Some(f) = ext_data_updates {
-                        f();
+                Ok((stmt, _ret_value)) => {
+                    drop(stmt);
+                    // Persist any cascaded config changes (entries after the
+                    // primary key). These are side-effects of the requested set
+                    // (e.g. setting metadata-write-version cascades to
+                    // metadata-use-version and sync-log-version). They MUST be
+                    // persisted or new connections load stale values from
+                    // crsql_master.
+                    let mut cascade_err: Option<ResultCode> = None;
+                    for (cname, cvalue) in config_changes.iter().skip(1) {
+                        if let Err(rc) = persist_config_int(db, cname, *cvalue) {
+                            cascade_err = Some(rc);
+                            break;
+                        }
                     }
+                    if let Some(rc) = cascade_err {
+                        let _ = db.exec_safe("ROLLBACK TO config_set");
+                        let _ = db.exec_safe("RELEASE config_set");
+                        ctx.result_error("Could not persist cascaded config in database");
+                        ctx.result_error_code(rc);
+                        return;
+                    }
+                    // All persistence succeeded — set the result, apply the
+                    // ext_data updates (driven by the same config_changes list),
+                    // and release the savepoint.
+                    ctx.result_value(value);
+                    apply_config_changes_to_ext_data(ext_data, config_changes);
                     let _ = db.exec_safe("RELEASE config_set");
                 }
                 Err(rc) => {
@@ -296,6 +313,37 @@ pub extern "C" fn crsql_config_set(
             // Rollback any schema changes made before the error.
             let _ = db.exec_safe("ROLLBACK TO config_set");
             let _ = db.exec_safe("RELEASE config_set");
+        }
+    }
+}
+
+/// Persist an integer config setting to crsql_master as `config.{name}`.
+/// Must be called within a transaction/savepoint so a failure can roll back
+/// any preceding writes (including the primary config key and schema changes).
+fn persist_config_int(
+    db: *mut sqlite_nostd::sqlite3,
+    name: &str,
+    value: c_int,
+) -> Result<(), ResultCode> {
+    unsafe { crate::util::set_master_value(db, &format!("config.{name}"), value as i64) }
+}
+
+/// Apply a list of (config_name, value) changes to the in-memory ext_data
+/// struct. This is the ext_data counterpart to persisting the same list to
+/// crsql_master. Driving both persistence and ext_data updates from the same
+/// list prevents the two from diverging — the bug where a cascaded in-memory
+/// change was not persisted and thus lost on reconnect.
+fn apply_config_changes_to_ext_data(
+    ext_data: *mut crsql_ExtData,
+    changes: Vec<(&'static str, c_int)>,
+) {
+    for (name, value) in changes {
+        match name {
+            MERGE_EQUAL_VALUES => unsafe { (*ext_data).mergeEqualValues = value; }
+            METADATA_WRITE_VERSION => unsafe { (*ext_data).metadataWriteVersion = value; }
+            METADATA_USE_VERSION => unsafe { (*ext_data).metadataUseVersion = value; }
+            SYNC_LOG_VERSION => unsafe { (*ext_data).syncLogVersion = value; }
+            _ => {}
         }
     }
 }

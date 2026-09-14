@@ -2077,6 +2077,95 @@ fn test_config_persists_across_reopen() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// Setting metadata-write-version cascades metadata-use-version (and, when
+/// rolling back to v1, sync-log-version) in-memory. The cascade MUST also be
+/// persisted to crsql_master or a new connection loads the stale default.
+/// This test guards against the bug where crsql_config_set persisted only the
+/// explicitly-requested key, not the cascaded side-effects.
+fn test_config_cascade_persists_across_reopen() -> Result<(), ResultCode> {
+    libc_println!("=== test_config_cascade_persists_across_reopen START ===");
+
+    let path = "crsql_config_cascade_reopen_test.db\0";
+    let path_str = path.trim_end_matches('\0');
+
+    #[cfg(not(target_os = "windows"))]
+    extern "C" {
+        fn unlink(pathname: *const core::ffi::c_char) -> core::ffi::c_int;
+    }
+    #[cfg(target_os = "windows")]
+    extern "C" {
+        fn _unlink(pathname: *const core::ffi::c_char) -> core::ffi::c_int;
+    }
+
+    // Remove any leftover file from previous runs
+    unsafe {
+        #[cfg(not(target_os = "windows"))]
+        unlink(path.as_ptr() as *const core::ffi::c_char);
+        #[cfg(target_os = "windows")]
+        _unlink(path.as_ptr() as *const core::ffi::c_char);
+    }
+
+    // Create DB with no CRR tables, set metadata-write-version to 3 (V2-only
+    // direct transition). This cascades metadata-use-version to 2 in-memory.
+    {
+        let db = crate::opendb_file(path_str)?;
+        db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+        // Verify in-memory cascade took effect on this connection
+        let stmt = db.db.prepare_v2("SELECT crsql_config_get('metadata-use-version')")?;
+        stmt.step()?;
+        let val = stmt.column_int(0);
+        assert_eq!(
+            val, 2,
+            "metadata-use-version should cascade to 2 in-memory, got {}",
+            val
+        );
+        // Verify the cascaded value was persisted to crsql_master
+        let stmt = db
+            .db
+            .prepare_v2("SELECT value FROM crsql_master WHERE key = 'config.metadata-use-version'")?;
+        stmt.step()?;
+        let val = stmt.column_int(0);
+        assert_eq!(
+            val, 2,
+            "cascaded metadata-use-version should be persisted to crsql_master, got {}",
+            val
+        );
+    }
+    // Connection closed (dropped)
+
+    // Reopen — cascaded config must be loaded from crsql_master, not reset to
+    // the default of 1.
+    {
+        let db = crate::opendb_file(path_str)?;
+        let stmt = db.db.prepare_v2("SELECT crsql_config_get('metadata-write-version')")?;
+        stmt.step()?;
+        let val = stmt.column_int(0);
+        assert_eq!(
+            val, 3,
+            "metadata-write-version should be 3 after reopen, got {}",
+            val
+        );
+        let stmt = db.db.prepare_v2("SELECT crsql_config_get('metadata-use-version')")?;
+        stmt.step()?;
+        let val = stmt.column_int(0);
+        assert_eq!(
+            val, 2,
+            "metadata-use-version should be 2 after reopen (cascade must persist), got {}",
+            val
+        );
+        libc_println!("=== test_config_cascade_persists_across_reopen PASS ===");
+    }
+
+    // Cleanup
+    unsafe {
+        #[cfg(not(target_os = "windows"))]
+        unlink(path.as_ptr() as *const core::ffi::c_char);
+        #[cfg(target_os = "windows")]
+        _unlink(path.as_ptr() as *const core::ffi::c_char);
+    }
+    Ok(())
+}
+
 /// After DROP COLUMN, col_map ids no longer match non_pks indices.
 /// UPDATE must pack the col_map id, not the pragma ordinal.
 fn test_v2_update_uses_col_map_id_after_drop() -> Result<(), ResultCode> {
@@ -2327,6 +2416,7 @@ pub fn run_suite() -> Result<(), ResultCode> {
     test_tombstone_conflict_resolution()?;
     test_ts_not_set_errors()?;
     test_config_persists_across_reopen()?;
+    test_config_cascade_persists_across_reopen()?;
     test_v2_update_uses_col_map_id_after_drop()?;
     test_default_ts_basic()?;
     test_default_ts_explicit_wins()?;
