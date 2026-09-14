@@ -113,6 +113,7 @@ pub extern "C" fn crsql_as_table(
 ) {
     let args = sqlite::args!(argc, argv);
     let db = ctx.db_handle();
+    let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
     let table = args[0].text();
 
     if let Err(_) = db.exec_safe("SAVEPOINT as_table;") {
@@ -120,7 +121,7 @@ pub extern "C" fn crsql_as_table(
         return;
     }
 
-    if let Err(_) = crsql_as_table_impl(db, table) {
+    if let Err(_) = crsql_as_table_impl(db, table, ext_data) {
         ctx.result_error("failed to downgrade the crr");
         if let Err(_) = db.exec_safe("ROLLBACK") {
             // fine.
@@ -133,7 +134,11 @@ pub extern "C" fn crsql_as_table(
     }
 }
 
-fn crsql_as_table_impl(db: *mut sqlite::sqlite3, table: &str) -> Result<ResultCode, ResultCode> {
+fn crsql_as_table_impl(
+    db: *mut sqlite::sqlite3,
+    table: &str,
+    ext_data: *mut c::crsql_ExtData,
+) -> Result<ResultCode, ResultCode> {
     remove_crr_clock_table_if_exists(db, table)?;
     remove_crr_triggers_if_exist(db, table)?;
     // Also remove V2 metadata tables and crsql_master flags.
@@ -144,6 +149,14 @@ fn crsql_as_table_impl(db: *mut sqlite::sqlite3, table: &str) -> Result<ResultCo
     // Stale markers would cause incremental_maintenance to drop freshly re-created
     // CRR metadata tables on re-registration.
     unsafe { crate::util::clear_all_per_table_master_keys(db, table); }
+    // The DDL above (DROP TABLE, DROP TRIGGER) bumps PRAGMA schema_version,
+    // which would trigger a cache refresh on the next `ensure` call. But
+    // `updatedTableInfosThisTx` may still be 1 from earlier in this transaction,
+    // causing `ensure` to skip the refresh. Reset it to force a re-pull so
+    // the dropped CRR's TableInfo is removed from the in-memory cache.
+    if !ext_data.is_null() {
+        unsafe { (*ext_data).updatedTableInfosThisTx = 0; }
+    }
     Ok(ResultCode::OK)
 }
 
@@ -1132,6 +1145,20 @@ unsafe extern "C" fn x_crsql_commit_alter(
             Err(rc) => rc as c_int,
         }
     } else {
+        // Ensure table infos are up to date before reading the cache to decide
+        // which compaction to run. Without this, a fresh connection (empty cache)
+        // would skip compaction entirely, leaving stale clock entries for
+        // dropped/renamed columns.
+        let ensure_rc = crsql_ensure_table_infos_are_up_to_date(
+            db,
+            ext_data,
+            &mut err_msg as *mut _,
+        );
+        if ensure_rc != ResultCode::OK as c_int {
+            sqlite::result_error_code(ctx, ensure_rc);
+            return;
+        }
+
         // Check schema version from table infos to decide which compaction to run
         let table_infos =
             mem::ManuallyDrop::new(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>));

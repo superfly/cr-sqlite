@@ -829,7 +829,7 @@ pub extern "C" fn crsql_changes_release(_vtab: *mut sqlite::vtab, _n: c_int) -> 
     ResultCode::OK as c_int
 }
 
-// clear ordinal cache on rollback so we don't have wrong data in the cache.
+// clear caches on rollback so we don't have stale data after a savepoint rollback.
 #[no_mangle]
 pub extern "C" fn crsql_changes_rollback_to(vtab: *mut sqlite::vtab, _: c_int) -> c_int {
     let tab = vtab.cast::<crsql_Changes_vtab>();
@@ -837,6 +837,12 @@ pub extern "C" fn crsql_changes_rollback_to(vtab: *mut sqlite::vtab, _: c_int) -
     let mut ordinals = unsafe {
         mem::ManuallyDrop::new(Box::from_raw(
             (*(*tab).pExtData).ordinalMap as *mut BTreeMap<Vec<u8>, i64>,
+        ))
+    };
+
+    let mut last_db_versions = unsafe {
+        mem::ManuallyDrop::new(Box::from_raw(
+            (*(*tab).pExtData).lastDbVersions as *mut BTreeMap<Vec<u8>, i64>,
         ))
     };
 
@@ -850,5 +856,6 @@ pub extern "C" fn crsql_changes_rollback_to(vtab: *mut sqlite::vtab, _: c_int) -
     }
 
     ordinals.clear();
+    last_db_versions.clear();
     ResultCode::OK as c_int
 }

@@ -286,8 +286,7 @@ pub extern "C" fn crsql_config_set(
                         }
                     }
                     if let Some(rc) = cascade_err {
-                        let _ = db.exec_safe("ROLLBACK TO config_set");
-                        let _ = db.exec_safe("RELEASE config_set");
+                        rollback_config_set(db, ext_data);
                         ctx.result_error("Could not persist cascaded config in database");
                         ctx.result_error_code(rc);
                         return;
@@ -301,8 +300,7 @@ pub extern "C" fn crsql_config_set(
                 }
                 Err(rc) => {
                     // Persistence failed — rollback schema changes, don't apply ext_data mutations.
-                    let _ = db.exec_safe("ROLLBACK TO config_set");
-                    let _ = db.exec_safe("RELEASE config_set");
+                    rollback_config_set(db, ext_data);
                     ctx.result_error("Could not persist config in database");
                     ctx.result_error_code(rc);
                 }
@@ -311,9 +309,26 @@ pub extern "C" fn crsql_config_set(
         Err(()) => {
             // Error already reported to ctx via result_error.
             // Rollback any schema changes made before the error.
-            let _ = db.exec_safe("ROLLBACK TO config_set");
-            let _ = db.exec_safe("RELEASE config_set");
+            rollback_config_set(db, ext_data);
         }
+    }
+}
+
+/// Rollback the config_set savepoint and invalidate any in-memory table info
+/// cache that may have been populated by schema changes (e.g. V2 table
+/// creation during the 1->2 transition) that are now being rolled back.
+/// Without resetting these flags, the stale cache would persist for the
+/// remainder of the transaction — `crsql_ensure_table_infos_are_up_to_date`
+/// would see `updatedTableInfosThisTx == 1` and `schema_changed == 0` (the
+/// DDL was rolled back so PRAGMA schema_version reverted) and return early
+/// without re-pulling, leaving V2 TableInfo entries for tables that no
+/// longer exist.
+fn rollback_config_set(db: *mut sqlite_nostd::sqlite3, ext_data: *mut crsql_ExtData) {
+    let _ = db.exec_safe("ROLLBACK TO config_set");
+    let _ = db.exec_safe("RELEASE config_set");
+    unsafe {
+        (*ext_data).updatedTableInfosThisTx = 0;
+        (*ext_data).pragmaSchemaVersionForTableInfos = -1;
     }
 }
 
@@ -590,8 +605,11 @@ fn is_migration_complete(db: *mut sqlite_nostd::sqlite3) -> Result<bool, ResultC
 }
 
 /// Clear all pending migration markers. Called when aborting migration (2->1 rollback).
+/// Clears both the task-existence markers and the cached remaining-count keys.
+/// Without clearing `remaining_*`, a subsequent 1->2 re-transition would read
+/// the stale cached count via get_or_count instead of recounting.
 fn clear_migration_markers(db: *mut sqlite_nostd::sqlite3) -> Result<(), ResultCode> {
-    let sql = "DELETE FROM crsql_master WHERE key LIKE 'migration_v1_to_v2_migration_%'";
+    let sql = "DELETE FROM crsql_master WHERE key LIKE 'migration_v1_to_v2_migration_%' OR key LIKE 'migration_v1_to_v2_remaining_%'";
     db.exec_safe(sql)?;
     Ok(())
 }
