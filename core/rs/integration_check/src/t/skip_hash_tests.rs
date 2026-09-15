@@ -731,6 +731,83 @@ fn test_non_strict_int_pk_accepts_text_value() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// Non-STRICT WITHOUT ROWID table with INTEGER PRIMARY KEY: the PK has INTEGER
+/// affinity but is NOT a rowid alias, so it can hold non-integer values (text,
+/// real, blob) that can't be losslessly converted. The mirror uses ANY, which
+/// has no affinity — values must pass through verbatim with no implicit cast.
+/// This test pins that property: for each storage class, the mirror stores the
+/// value with the same storage class as the source.
+fn test_non_strict_without_rowid_int_pk_preserves_storage_class() -> Result<(), ResultCode> {
+    let db = crate::opendb()?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    // Non-STRICT WITHOUT ROWID: INTEGER PK is NOT a rowid alias.
+    db.db
+        .exec_safe("CREATE TABLE tests (id INTEGER NOT NULL PRIMARY KEY, text TEXT) WITHOUT ROWID")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('tests')")?;
+
+    // Mirror PK columns must be ANY (non-STRICT, non-rowid).
+    let pk_type = column_type(&db.db, "tests__crsql_v2_pks", "id");
+    assert!(
+        pk_type == "ANY",
+        "v2_pks.id should be ANY, got '{}'",
+        pk_type
+    );
+
+    // Insert values that exercise different storage classes under INTEGER
+    // affinity:
+    //   5              → integer (already integer)
+    //   5.5            → real (cannot losslessly convert to integer)
+    //   'service-id-0' → text (not a well-formed integer literal)
+    //   x'deadbeef'    → blob (affinity never converts blobs)
+    db.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
+    db.db.exec_safe("INSERT INTO tests (id, text) VALUES (5, 'a')")?;
+    db.db.exec_safe("INSERT INTO tests (id, text) VALUES (5.5, 'b')")?;
+    db.db.exec_safe("INSERT INTO tests (id, text) VALUES ('service-id-0', 'c')")?;
+    db.db
+        .exec_safe("INSERT INTO tests (id, text) VALUES (x'deadbeef', 'd')")?;
+
+    // For each row, verify the source and mirror agree on the storage class.
+    // This proves no implicit cast happens when the trigger writes NEW.id
+    // into the STRICT ANY column.
+    let cases: &[(&str, &str)] = &[
+        ("5", "integer"),
+        ("5.5", "real"),
+        ("'service-id-0'", "text"),
+        ("x'deadbeef'", "blob"),
+    ];
+    for (literal, expected_type) in cases {
+        // Source table
+        let stmt = db.db
+            .prepare_v2(&format!("SELECT typeof(id) FROM tests WHERE id = {}", literal))?;
+        stmt.step()?;
+        let src_type = stmt.column_text(0)?;
+        assert!(
+            src_type == *expected_type,
+            "source: typeof(id) for {} should be '{}', got '{}'",
+            literal,
+            expected_type,
+            src_type
+        );
+
+        // Mirror table (STRICT ANY column — no affinity, no cast)
+        let stmt = db.db
+            .prepare_v2(&format!("SELECT typeof(id) FROM tests__crsql_v2_pks WHERE id = {}", literal))?;
+        stmt.step()?;
+        let mirror_type = stmt.column_text(0)?;
+        assert!(
+            mirror_type == *expected_type,
+            "mirror: typeof(id) for {} should be '{}', got '{}' (implicit cast detected)",
+            literal,
+            expected_type,
+            mirror_type
+        );
+    }
+
+    libc_println!("  non-strict without rowid int PK preserves storage class — PASS");
+    Ok(())
+}
+
 /// STRICT source table with INTEGER PRIMARY KEY: the V2 mirror tables use the
 /// declared PK type (INTEGER) to preserve type safety. A non-integer value is
 /// rejected by the source table itself, so the mirror never sees one.
@@ -837,6 +914,7 @@ pub fn run_suite() -> Result<(), ResultCode> {
 
     libc_println!("=== non-strict/strict PK type tests ===");
     test_non_strict_int_pk_accepts_text_value().map_err(|e| { libc_println!("test_non_strict_int_pk_accepts_text_value FAILED: {:?}", e); e })?;
+    test_non_strict_without_rowid_int_pk_preserves_storage_class().map_err(|e| { libc_println!("test_non_strict_without_rowid_int_pk_preserves_storage_class FAILED: {:?}", e); e })?;
     test_strict_int_pk_uses_declared_type().map_err(|e| { libc_println!("test_strict_int_pk_uses_declared_type FAILED: {:?}", e); e })?;
     test_non_strict_rowid_int_pk_uses_integer().map_err(|e| { libc_println!("test_non_strict_rowid_int_pk_uses_integer FAILED: {:?}", e); e })?;
 
