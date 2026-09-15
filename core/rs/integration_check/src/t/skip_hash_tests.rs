@@ -654,6 +654,158 @@ fn test_auto_detection_matrix() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// Helper: return the declared type of a column in a table, or "" if absent.
+fn column_type(db: &sqlite::ManagedConnection, table: &str, col: &str) -> String {
+    let stmt = db.prepare_v2(&format!(
+        "SELECT type FROM pragma_table_info('{table}') WHERE name = '{col}'",
+        table = table,
+        col = col,
+    ));
+    match stmt {
+        Ok(s) => {
+            if s.step().unwrap_or(ResultCode::DONE) == ResultCode::ROW {
+                s.column_text(0).unwrap_or("").to_string()
+            } else {
+                String::new()
+            }
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// Non-STRICT source table with INTEGER PRIMARY KEY: type affinity allows
+/// storing a TEXT value in the PK column. The V2 mirror tables (v2_pks,
+/// v2_tombstones) must accept that value too, so their PK columns use ANY
+/// rather than the declared INTEGER type. Regression test for the bug where
+/// skip_hash mirror tables hardcoded INTEGER and rejected valid TEXT PKs.
+fn test_non_strict_int_pk_accepts_text_value() -> Result<(), ResultCode> {
+    let db = crate::opendb()?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    // Non-STRICT WITHOUT ROWID table with INTEGER PRIMARY KEY.
+    db.db.exec_safe(
+        "CREATE TABLE tests (id INTEGER NOT NULL PRIMARY KEY, text TEXT) WITHOUT ROWID",
+    )?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('tests')")?;
+
+    // The v2_pks PK column must be ANY (non-STRICT source).
+    let pk_type = column_type(&db.db, "tests__crsql_v2_pks", "id");
+    assert!(
+        pk_type == "ANY",
+        "non-strict: v2_pks.id should be ANY, got '{}'",
+        pk_type
+    );
+    // The v2_tombstones PK column must be ANY (non-STRICT source).
+    let tomb_type = column_type(&db.db, "tests__crsql_v2_tombstones", "id");
+    assert!(
+        tomb_type == "ANY",
+        "non-strict: v2_tombstones.id should be ANY, got '{}'",
+        tomb_type
+    );
+
+    // Inserting a TEXT value into the INTEGER PK is allowed by affinity.
+    // Before the fix this failed with CONSTRAINT_DATATYPE from the v2 trigger.
+    db.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
+    db.db.exec_safe("INSERT INTO tests (id, text) VALUES ('service-id-0', 'hello')")?;
+
+    // The PK value should be stored verbatim in v2_pks.
+    let stmt = db.db.prepare_v2("SELECT id, cl FROM tests__crsql_v2_pks")?;
+    stmt.step()?;
+    assert!(
+        stmt.column_text(0)? == "service-id-0",
+        "non-strict: v2_pks should store text pk verbatim"
+    );
+    assert!(stmt.column_int64(1) == 1, "non-strict: cl should be 1");
+
+    // Deleting the row must also work — the tombstone stores the text PK.
+    db.db.exec_safe("SELECT crsql_set_ts('1700000002')")?;
+    db.db.exec_safe("DELETE FROM tests WHERE id = 'service-id-0'")?;
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM tests__crsql_v2_tombstones")?;
+    stmt.step()?;
+    assert!(
+        stmt.column_int(0) == 1,
+        "non-strict: delete should produce 1 tombstone"
+    );
+
+    libc_println!("  non-strict int PK accepts text value (insert + delete) — PASS");
+    Ok(())
+}
+
+/// STRICT source table with INTEGER PRIMARY KEY: the V2 mirror tables use the
+/// declared PK type (INTEGER) to preserve type safety. A non-integer value is
+/// rejected by the source table itself, so the mirror never sees one.
+fn test_strict_int_pk_uses_declared_type() -> Result<(), ResultCode> {
+    let db = crate::opendb()?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    db.db.exec_safe(
+        "CREATE TABLE tests (id INTEGER NOT NULL PRIMARY KEY, text TEXT) WITHOUT ROWID, STRICT",
+    )?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('tests')")?;
+
+    // STRICT source → mirror PK columns use the declared type (INTEGER).
+    let pk_type = column_type(&db.db, "tests__crsql_v2_pks", "id");
+    assert!(
+        pk_type == "INTEGER",
+        "strict: v2_pks.id should be INTEGER, got '{}'",
+        pk_type
+    );
+    let tomb_type = column_type(&db.db, "tests__crsql_v2_tombstones", "id");
+    assert!(
+        tomb_type == "INTEGER",
+        "strict: v2_tombstones.id should be INTEGER, got '{}'",
+        tomb_type
+    );
+
+    // Valid integer insert works end-to-end.
+    db.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
+    db.db.exec_safe("INSERT INTO tests (id, text) VALUES (42, 'hello')")?;
+    let stmt = db.db.prepare_v2("SELECT id FROM tests__crsql_v2_pks")?;
+    stmt.step()?;
+    assert!(stmt.column_int64(0) == 42, "strict: v2_pks should store 42");
+
+    libc_println!("  strict int PK uses declared type INTEGER — PASS");
+    Ok(())
+}
+
+/// Non-STRICT rowid table with INTEGER PRIMARY KEY: the PK is a rowid alias,
+/// so the value is always a 64-bit integer regardless of type affinity. The
+/// mirror tables use INTEGER (not ANY). A non-integer text value is rejected
+/// by the source table itself (rowid must be a valid integer), so the mirror
+/// never sees one.
+fn test_non_strict_rowid_int_pk_uses_integer() -> Result<(), ResultCode> {
+    let db = crate::opendb()?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    // Non-STRICT rowid table (NOT WITHOUT ROWID) with INTEGER PRIMARY KEY.
+    db.db.exec_safe("CREATE TABLE tests (id INTEGER NOT NULL PRIMARY KEY, text TEXT)")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('tests')")?;
+
+    // Non-STRICT rowid table + INTEGER PK (rowid alias) → mirror uses INTEGER.
+    let pk_type = column_type(&db.db, "tests__crsql_v2_pks", "id");
+    assert!(
+        pk_type == "INTEGER",
+        "non-strict rowid: v2_pks.id should be INTEGER, got '{}'",
+        pk_type
+    );
+    let tomb_type = column_type(&db.db, "tests__crsql_v2_tombstones", "id");
+    assert!(
+        tomb_type == "INTEGER",
+        "non-strict rowid: v2_tombstones.id should be INTEGER, got '{}'",
+        tomb_type
+    );
+
+    // Valid integer insert works end-to-end.
+    db.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
+    db.db.exec_safe("INSERT INTO tests (id, text) VALUES (42, 'hello')")?;
+    let stmt = db.db.prepare_v2("SELECT id FROM tests__crsql_v2_pks")?;
+    stmt.step()?;
+    assert!(stmt.column_int64(0) == 42, "non-strict rowid: v2_pks should store 42");
+
+    libc_println!("  non-strict rowid int PK uses INTEGER — PASS");
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), ResultCode> {
     libc_println!("=== skip_hash detection tests ===");
     test_auto_qualified_int_pk().map_err(|e| { libc_println!("test_auto_qualified_int_pk FAILED: {:?}", e); e })?;
@@ -682,6 +834,11 @@ pub fn run_suite() -> Result<(), ResultCode> {
 
     libc_println!("=== auto-detection matrix test ===");
     test_auto_detection_matrix().map_err(|e| { libc_println!("test_auto_detection_matrix FAILED: {:?}", e); e })?;
+
+    libc_println!("=== non-strict/strict PK type tests ===");
+    test_non_strict_int_pk_accepts_text_value().map_err(|e| { libc_println!("test_non_strict_int_pk_accepts_text_value FAILED: {:?}", e); e })?;
+    test_strict_int_pk_uses_declared_type().map_err(|e| { libc_println!("test_strict_int_pk_uses_declared_type FAILED: {:?}", e); e })?;
+    test_non_strict_rowid_int_pk_uses_integer().map_err(|e| { libc_println!("test_non_strict_rowid_int_pk_uses_integer FAILED: {:?}", e); e })?;
 
     libc_println!("=== ALL skip_hash tests PASS ===");
     Ok(())

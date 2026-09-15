@@ -6,3 +6,4 @@ dist-ios/
 dist-ios-sim/
 dist-macos/
 test_leak_condition
+test_site_id_initialization
