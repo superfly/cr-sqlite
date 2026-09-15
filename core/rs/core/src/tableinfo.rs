@@ -96,6 +96,13 @@ pub struct TableInfo {
     /// True when the table is declared WITHOUT ROWID.
     /// Used to guard key_is_rowid — WITHOUT ROWID tables have no rowid.
     pub is_without_rowid: bool,
+    /// True when the table is declared STRICT.
+    /// STRICTness cannot change via ALTER TABLE — it requires dropping and
+    /// recreating the table, which re-runs crsql_as_crr and regenerates the
+    /// mirror tables. Used to decide PK column types in V2 mirror tables:
+    /// STRICT source → use the declared PK type (type safety preserved);
+    /// non-STRICT source → use ANY (type affinity allows any storage class).
+    pub is_strict: bool,
 
     // Lookaside --
     // insert returning?
@@ -1204,6 +1211,15 @@ pub fn pull_table_info(
         "SELECT wr FROM pragma_table_list('{name}')",
         name = crate::util::escape_ident_as_value(table),
     )).map(|v| v == 1)?;
+    // STRICTness: detected via pragma_table_list(strict). STRICTness cannot
+    // change via ALTER TABLE (requires DROP + CREATE), so it is stable for the
+    // lifetime of a registered table and only re-evaluated when crsql_as_crr
+    // re-runs after a table recreate. Used to pick PK column types in V2 mirror
+    // tables: STRICT source uses the declared type; non-STRICT uses ANY.
+    let is_strict = db.count(&format!(
+        "SELECT strict FROM pragma_table_list('{name}')",
+        name = crate::util::escape_ident_as_value(table),
+    )).map(|v| v == 1)?;
     // Initial value: false for all tables. Only set to true if:
     // 1. The table has INTEGER PRIMARY KEY (rowid alias, stable), AND
     // 2. The table is not WITHOUT ROWID, AND
@@ -1355,6 +1371,7 @@ pub fn pull_table_info(
         skip_hash_pk_col,
         col_map,
         is_without_rowid,
+        is_strict,
         set_winner_clock_stmt: RefCell::new(None),
         local_cl_stmt: RefCell::new(None),
         col_version_stmt: RefCell::new(None),

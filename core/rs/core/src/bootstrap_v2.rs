@@ -67,8 +67,11 @@ pub fn create_v2_tables(
     // PK is NOT stored in v2_pks — it's fetched from the base table via JOIN when needed.
     // key_is_rowid can be explicitly disabled/enabled for rowid tables via schema comments or at as_crr time,
     // but cannot be enabled for WITHOUT ROWID tables (they have no rowid to use).
-    // STRICT always used. For !key_is_rowid tables, dynamic PK columns use ANY type
-    // (https://www.sqlite.org/stricttables.html) so STRICT works regardless of base table type.
+    // STRICT always used. For !key_is_rowid tables, PK columns use the declared
+    // type when the source table is STRICT (type safety preserved), or ANY
+    // (https://www.sqlite.org/stricttables.html) when the source is non-STRICT
+    // (type affinity allows any storage class) so STRICT works regardless of
+    // base table type. See mirror_pk_type().
     //
     // skip_hash mode: no hashed_pk column. PK or rowid value used directly for lookups.
     // skip_hash requires a single-column PK (enforced at as_crr time), tables with compound PK's are always using hashing.
@@ -90,11 +93,7 @@ pub fn create_v2_tables(
         } else {
             // Single PK column (skip_hash requires single PK)
             let pk_col = &table_info.pks[0];
-            let pk_type = if pk_col.col_type.to_uppercase().contains("INT") {
-                "INTEGER"
-            } else {
-                "ANY"
-            };
+            let pk_type = mirror_pk_type(table_info, pk_col);
             db.exec_safe(&format!(
                 "CREATE TABLE IF NOT EXISTS \"{escaped}{suffix}\" (
                   __crsql_key INTEGER PRIMARY KEY,
@@ -129,7 +128,7 @@ pub fn create_v2_tables(
             suffix = consts::V2_PKS_SUFFIX,
         ))?;
     } else {
-        let pk_cols_sql = build_pk_cols_sql(&table_info.pks);
+        let pk_cols_sql = build_pk_cols_sql(table_info);
 
         let create_sql = format!(
             "CREATE TABLE IF NOT EXISTS \"{escaped}{suffix}\" (
@@ -160,11 +159,7 @@ pub fn create_v2_tables(
     if table_info.skip_hash {
         // skip_hash: single PK column replaces hashed_pk (skip_hash requires single PK).
         let pk_col = &table_info.pks[0];
-        let pk_type = if pk_col.col_type.to_uppercase().contains("INT") {
-            "INTEGER"
-        } else {
-            "ANY"
-        };
+        let pk_type = mirror_pk_type(table_info, pk_col);
         db.exec_safe(&format!(
             "CREATE TABLE IF NOT EXISTS \"{escaped}{suffix}\" (
               site_id INTEGER NOT NULL,
@@ -214,7 +209,7 @@ pub fn create_v2_tables(
     // 5. Tombstone PKs (V1 compat) — NOT created for skip_hash tables.
     // The PK value is stored directly in v2_tombstones, so no hash→PK mapping is needed.
     if !table_info.skip_hash {
-        let tombstone_pk_cols_sql = build_pk_cols_sql(&table_info.pks);
+        let tombstone_pk_cols_sql = build_pk_cols_sql(table_info);
 
         let tombstone_pks_sql = format!(
             "CREATE TABLE IF NOT EXISTS \"{escaped}{suffix}\" (
@@ -347,15 +342,53 @@ pub fn has_v2_tables(
     Ok(rc == ResultCode::ROW)
 }
 
-/// Build a comma-separated list of `"col" ANY NOT NULL` column definitions
+/// Pick the column type to use for a PK column in a STRICT mirror table.
+///
+/// - STRICT source table: use the declared PK type. STRICT rules guarantee the
+///   declared type is one of INTEGER/REAL/TEXT/BLOB/ANY, so type safety is
+///   preserved in the mirror table.
+/// - non-STRICT rowid table with INTEGER PRIMARY KEY: use INTEGER. The PK is a
+///   rowid alias, so the value is always a 64-bit integer regardless of type
+///   affinity — SQLite rejects non-integer values at the source table itself.
+/// - non-STRICT otherwise (incl. WITHOUT ROWID tables): use ANY. SQLite type
+///   affinity lets a non-STRICT column store any storage class regardless of
+///   its declared type (e.g. a TEXT value in an `INTEGER PRIMARY KEY` column of
+///   a WITHOUT ROWID table), so the mirror table must accept any value type to
+///   match. STRICT + ANY is the STRICT-compatible way to accept any storage
+///   class.
+fn mirror_pk_type(table_info: &TableInfo, pk_col: &ColumnInfo) -> &'static str {
+    if table_info.is_strict {
+        match pk_col.col_type.to_uppercase().as_str() {
+            "INTEGER" => "INTEGER",
+            "REAL" => "REAL",
+            "TEXT" => "TEXT",
+            "BLOB" => "BLOB",
+            "ANY" => "ANY",
+            // Defensive: STRICT tables can only declare the five types above,
+            // so this branch is unreachable in practice.
+            _ => "ANY",
+        }
+    } else if table_info.has_integer_pk && !table_info.is_without_rowid {
+        // Non-STRICT rowid table with INTEGER PRIMARY KEY: the PK is a rowid
+        // alias, so the value is always a 64-bit integer. Safe to use INTEGER.
+        "INTEGER"
+    } else {
+        "ANY"
+    }
+}
+
+/// Build a comma-separated list of `"col" <type> NOT NULL` column definitions
 /// for the given PK columns. Used when creating v2_pks and v2_tombstone_pks tables.
-fn build_pk_cols_sql(pks: &[ColumnInfo]) -> String {
+/// The column type is chosen by [`mirror_pk_type`]: declared type for STRICT
+/// source tables, ANY for non-STRICT source tables.
+fn build_pk_cols_sql(table_info: &TableInfo) -> String {
     let mut sql = String::new();
-    for (i, pk) in pks.iter().enumerate() {
+    for (i, pk) in table_info.pks.iter().enumerate() {
         if i > 0 { sql.push_str(", "); }
         sql.push_str(&format!(
-            "\"{}\" ANY NOT NULL",
-            crate::util::escape_ident(&pk.name)
+            "\"{}\" {} NOT NULL",
+            crate::util::escape_ident(&pk.name),
+            mirror_pk_type(table_info, pk)
         ));
     }
     sql
