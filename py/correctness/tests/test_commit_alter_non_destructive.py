@@ -6,6 +6,7 @@ import time
 def test_commit_alter():
   c = connect(":memory:")
   c.execute("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, title TEXT)")
+  c.execute("SELECT crsql_set_ts('1700000000')")
   c.execute("SELECT crsql_as_crr('foo')")
   c.commit()
 
@@ -13,8 +14,10 @@ def test_commit_alter():
   c.commit()
 
   start_time = time.time()
+  c.execute("SELECT crsql_set_ts('1700000000')")
   c.execute("SELECT crsql_begin_alter('foo')")
   c.execute("ALTER TABLE foo ADD COLUMN owner TEXT")
+  c.execute("SELECT crsql_set_ts('1700000000')")
   c.execute("SELECT crsql_commit_alter('main', 'foo', 1)")
   end_time = time.time()
   print(f"non-destructive alter time: {end_time - start_time}")

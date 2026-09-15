@@ -25,21 +25,21 @@ static int changesConnect(sqlite3 *db, void *pAux, int argc,
 
   rc = sqlite3_declare_vtab(
       db,
-      "CREATE TABLE x([table] TEXT NOT NULL, [pk] BLOB NOT NULL, [cid] TEXT "
+      "CREATE TABLE x([table] TEXT NOT NULL, [pk] BLOB NOT NULL, [cid] BLOB "
       "NOT NULL, [val] ANY, [col_version] INTEGER NOT NULL, [db_version] "
       "INTEGER NOT NULL, [site_id] BLOB NOT NULL, [cl] INTEGER NOT NULL, [seq] "
-      "INTEGER NOT NULL, [ts] TEXT NOT NULL)");
+      "BLOB NOT NULL, [ts] TEXT NOT NULL)");
   if (rc != SQLITE_OK) {
     *pzErr = sqlite3_mprintf("Could not define the table");
     return rc;
   }
   pNew = sqlite3_malloc(sizeof(*pNew));
-  *ppVtab = (sqlite3_vtab *)pNew;
   if (pNew == 0) {
     *pzErr = sqlite3_mprintf("Out of memory");
     return SQLITE_NOMEM;
   }
   memset(pNew, 0, sizeof(*pNew));
+  *ppVtab = (sqlite3_vtab *)pNew;
   pNew->db = db;
   pNew->pExtData = (crsql_ExtData *)pAux;
 
@@ -48,6 +48,7 @@ static int changesConnect(sqlite3 *db, void *pAux, int argc,
   if (rc != SQLITE_OK) {
     *pzErr = sqlite3_mprintf("Could not update table infos");
     sqlite3_free(pNew);
+    *ppVtab = 0;
     return rc;
   }
 
@@ -63,6 +64,8 @@ static int changesConnect(sqlite3 *db, void *pAux, int argc,
 static int changesDisconnect(sqlite3_vtab *pVtab) {
   crsql_Changes_vtab *p = (crsql_Changes_vtab *)pVtab;
   // ext data is free by other registered extensions
+  sqlite3_free(p->base.zErrMsg);
+  p->base.zErrMsg = 0;
   sqlite3_free(p);
   return SQLITE_OK;
 }
@@ -89,6 +92,8 @@ static int changesCrsrFinalize(crsql_Changes_cursor *crsr) {
   int rc = SQLITE_OK;
   rc += sqlite3_finalize(crsr->pChangesStmt);
   crsr->pChangesStmt = 0;
+  rc += sqlite3_finalize(crsr->cached_pChangesStmt);
+  crsr->cached_pChangesStmt = 0;
   if (crsr->pRowStmt != 0) {
     rc += sqlite3_clear_bindings(crsr->pRowStmt);
     rc += sqlite3_reset(crsr->pRowStmt);
@@ -107,7 +112,9 @@ static int changesCrsrFinalize(crsql_Changes_cursor *crsr) {
  * We, of course, do not de-allocated the `pTab` reference
  * given `pTab` must persist for the life of the connection.
  *
- * `pChangesStmt` and `pRowStmt` must be finalized.
+ * `pChangesStmt` must be finalized.
+ * `pRowStmt` is cache-borrowed from TableInfo and must NOT be finalized —
+ * only reset/clear_bindings is needed (the cache owns the lifetime).
  *
  * `colVrsns` does not need to be freed as it comes from
  * `pChangesStmt` thus finalizing `pChangesStmt` will

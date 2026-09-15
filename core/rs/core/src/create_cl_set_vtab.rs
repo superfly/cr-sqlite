@@ -4,6 +4,7 @@ use core::ffi::{c_char, c_int, c_void};
 
 use crate::alloc::borrow::ToOwned;
 use crate::create_crr::create_crr;
+use crate::teardown_v2;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -70,7 +71,7 @@ fn create_impl(
     let schema = vtab_args.database_name;
     let table = base_name_from_virtual_name(vtab_args.table_name);
 
-    create_crr(db, schema, table, false, true, err)
+    create_crr(db, schema, table, false, true, None, false, err)
 }
 
 fn create_clset_storage(
@@ -84,6 +85,14 @@ fn create_clset_storage(
     let table_def = args.arguments.join(",");
     if !args.table_name.ends_with("_schema") {
         err.set("CLSet virtual table names must end with `_schema`");
+        return Err(ResultCode::MISUSE);
+    }
+
+    // Reject table_def containing semicolons to prevent multi-statement injection
+    // via sqlite3_exec. The column definitions should be a single CREATE TABLE
+    // body without embedded SQL statements.
+    if table_def.contains(';') {
+        err.set("CLSet table definition must not contain semicolons");
         return Err(ResultCode::MISUSE);
     }
 
@@ -167,13 +176,17 @@ extern "C" fn disconnect(vtab: *mut sqlite::vtab) -> c_int {
 extern "C" fn destroy(vtab: *mut sqlite::vtab) -> c_int {
     let tab = unsafe { Box::from_raw(vtab.cast::<CLSetTab>()) };
     let ret = tab.db.exec_safe(&format!(
-        "DROP TABLE \"{db_name}\".\"{table_name}\";
-        DROP TABLE \"{db_name}\".\"{table_name}__crsql_clock\";
-        DROP TABLE \"{db_name}\".\"{table_name}__crsql_pks\";",
+        "DROP TABLE IF EXISTS \"{db_name}\".\"{table_name}\";
+        DROP TABLE IF EXISTS \"{db_name}\".\"{table_name}__crsql_clock\";
+        DROP TABLE IF EXISTS \"{db_name}\".\"{table_name}__crsql_pks\";",
         table_name = crate::util::escape_ident(&tab.base_table_name),
         db_name = crate::util::escape_ident(&tab.db_name)
     ));
-    match ret {
+    let ret = match ret {
+        Err(rc) | Ok(rc) => rc,
+    };
+    // Drop V2 metadata tables as well (no-op in V1-only mode since IF EXISTS is used).
+    match teardown_v2::remove_crr_v2_tables(tab.db, &tab.base_table_name) {
         Err(rc) | Ok(rc) => rc as c_int,
     }
 }

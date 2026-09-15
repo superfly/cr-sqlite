@@ -10,8 +10,14 @@ fn new_empty_table() -> Result<(), ResultCode> {
     // Just testing that we can execute these statements without error
     db.db
         .exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, name);")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
     db.db.exec_safe("SELECT * FROM foo__crsql_clock;")?;
+    // An empty table has no rows, so backfilling should produce no clock
+    // entries. Assert the clock table is empty.
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_clock;")?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int(0), 0, "clock table should be empty for an empty table");
     Ok(())
 }
 
@@ -21,9 +27,14 @@ fn new_nonempty_table(apply_twice: bool) -> Result<(), ResultCode> {
         .exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, name);")?;
     db.db
         .exec_safe("INSERT INTO foo VALUES (1, 'one'), (2, 'two');")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
     let stmt = db.db.prepare_v2("SELECT * FROM foo__crsql_clock;")?;
+    // Re-registering an already-registered table (crsql_as_crr called twice)
+    // should be idempotent: the clock table must remain correct. This exercises
+    // the re-registration code path and verifies it does not corrupt state.
     if apply_twice {
+        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
         db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
     }
 
@@ -39,10 +50,10 @@ fn new_nonempty_table(apply_twice: bool) -> Result<(), ResultCode> {
 
     // select from crsql_changes too
     let stmt = db.db.prepare_v2(
-        "SELECT [table], [pk], [cid], [val], [col_version], [db_version] FROM crsql_changes;",
+        "SELECT [table], [pk], [cid], [val], [col_version], [db_version] FROM crsql_changes ORDER BY [pk];",
     )?;
     let mut cnt = 0;
-    while stmt.step().unwrap() == ResultCode::ROW {
+    while stmt.step()? == ResultCode::ROW {
         cnt = cnt + 1;
         if cnt == 1 {
             assert_eq!(stmt.column_blob(1)?, [1, 9, 1]); // pk
@@ -65,10 +76,20 @@ fn reapplied_empty_table() -> Result<(), ResultCode> {
     // Just testing that we can execute these statements without error
     db.db
         .exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, name);")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
     db.db.exec_safe("SELECT * FROM foo__crsql_clock;")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('foo');")?;
     db.db.exec_safe("SELECT * FROM foo__crsql_clock;")?;
+    // Re-registering an empty table should still leave the clock table empty.
+    let stmt = db.db.prepare_v2("SELECT count(*) FROM foo__crsql_clock;")?;
+    stmt.step()?;
+    assert_eq!(
+        stmt.column_int(0),
+        0,
+        "clock table should be empty after re-registering an empty table"
+    );
     Ok(())
 }
 

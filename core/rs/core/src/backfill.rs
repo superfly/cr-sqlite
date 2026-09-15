@@ -49,7 +49,8 @@ pub fn backfill_table(
 
     if let Err(e) = result {
         if !no_tx {
-            db.exec_safe("ROLLBACK")?;
+            let _ = db.exec_safe("ROLLBACK TO SAVEPOINT backfill");
+            let _ = db.exec_safe("RELEASE backfill");
         }
 
         return Err(e);
@@ -57,7 +58,8 @@ pub fn backfill_table(
 
     if let Err(e) = backfill_missing_columns(db, table, pk_cols, non_pk_cols, is_commit_alter) {
         if !no_tx {
-            db.exec_safe("ROLLBACK")?;
+            let _ = db.exec_safe("ROLLBACK TO SAVEPOINT backfill");
+            let _ = db.exec_safe("RELEASE backfill");
         }
 
         return Err(e);
@@ -106,8 +108,8 @@ fn create_clock_rows_from_stmt(
     // to determine if rows should resurrect on a future insertion event provided by a peer.
     let sql = format!(
         "INSERT OR IGNORE INTO \"{table}__crsql_clock\"
-          (key, col_name, col_version, db_version, seq) VALUES
-          (?, ?, 1, {dbversion_getter}, crsql_increment_and_get_seq())",
+          (key, col_name, col_version, db_version, seq, ts) VALUES
+          (?, ?, 1, {dbversion_getter}, crsql_increment_and_get_seq(), crsql_get_ts())",
         table = crate::util::escape_ident(table),
         dbversion_getter = if is_commit_alter {
             "crsql_db_version()"
@@ -223,14 +225,25 @@ fn fill_column(
             ))
             .collect::<Vec<_>>()
             .join(" AND "),
-        dflt_value_condition = if let Some(dflt) = dflt_value {
-            format!("AND t1.\"{}\" IS NOT {}", &non_pk_col.name, dflt)
-        } else {
-            String::from("")
+        dflt_value_condition = match &dflt_value {
+            Some(d) if d == "NULL" => {
+                // Default is NULL — skip rows where the column value IS NULL.
+                // Use `IS NOT NULL` since binding the string "NULL" would not match actual NULLs.
+                format!("AND t1.\"{}\" IS NOT NULL", crate::util::escape_ident(&non_pk_col.name))
+            }
+            Some(_) => {
+                format!("AND t1.\"{}\" IS NOT ?", crate::util::escape_ident(&non_pk_col.name))
+            }
+            None => String::from(""),
         },
     );
     let read_stmt = db.prepare_v2(&sql)?;
     read_stmt.bind_text(1, &non_pk_col.name, Destructor::STATIC)?;
+    if let Some(ref dflt) = dflt_value {
+        if dflt != "NULL" {
+            read_stmt.bind_text(2, dflt, Destructor::STATIC)?;
+        }
+    }
 
     // TODO: rm clone?
     let non_pk_cols = vec![non_pk_col];

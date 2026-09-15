@@ -17,10 +17,13 @@ static void testManyPkTable() {
   sqlite3_stmt *pStmt;
   int rc;
   rc = sqlite3_open(":memory:", &db);
+  assert(rc == SQLITE_OK);
 
   rc = sqlite3_exec(
       db, "CREATE TABLE foo (a not null, b not null, c, primary key (a, b));",
       0, 0, 0);
+  rc += sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc += sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   rc += sqlite3_exec(db, "SELECT crsql_as_crr('foo');", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc += sqlite3_exec(db, "INSERT INTO foo VALUES (4,5,6);", 0, 0, 0);
@@ -31,6 +34,7 @@ static void testManyPkTable() {
                            -1, &pStmt, 0);
   assert(rc == SQLITE_OK);
 
+  int rowCount = 0;
   while (sqlite3_step(pStmt) == SQLITE_ROW) {
     const unsigned char *pk = sqlite3_column_text(pStmt, 1);
     // pk: 4, 5
@@ -40,8 +44,11 @@ static void testManyPkTable() {
     // 04 -> 4
     // 09 -> 1 byte integer
     // 05 -> 5
+    assert(pk != NULL);
     assert(strcmp("X'0209040905'", (char *)pk) == 0);
+    ++rowCount;
   }
+  assert(rowCount >= 1);
 
   sqlite3_finalize(pStmt);
   crsql_close(db);
@@ -64,9 +71,12 @@ static void testFilters() {
   sqlite3 *db;
   int rc;
   rc = sqlite3_open(":memory:", &db);
+  assert(rc == SQLITE_OK);
 
   rc = sqlite3_exec(db, "CREATE TABLE foo (a primary key not null, b);", 0, 0,
                     0);
+  rc += sqlite3_exec(db, "SELECT crsql_set_ts('1700000000')", 0, 0, 0);
+  rc += sqlite3_exec(db, "SELECT crsql_config_set('default-ts', 1700000000)", 0, 0, 0);
   rc += sqlite3_exec(db, "SELECT crsql_as_crr('foo');", 0, 0, 0);
   assert(rc == SQLITE_OK);
   rc += sqlite3_exec(db, "INSERT INTO foo VALUES (1,2);", 0, 0, 0);
@@ -75,7 +85,7 @@ static void testFilters() {
   assert(rc == SQLITE_OK);
 
   printf("no filters\n");
-  // 6 - 1 for each row creation, 1 for each b
+  // 3 - 1 for each row creation (b is the only non-pk column tracked)
   assertCount(db, "SELECT count(*) FROM crsql_changes", 3);
 
   // now test:
