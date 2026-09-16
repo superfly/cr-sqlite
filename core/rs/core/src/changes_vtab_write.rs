@@ -1,7 +1,6 @@
 use alloc::boxed::Box;
 use alloc::ffi::CString;
 use alloc::format;
-use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_int};
@@ -14,13 +13,13 @@ use crate::c::crsql_ExtData;
 use crate::c::{crsql_Changes_vtab, CrsqlChangesColumn};
 use crate::compare_values::crsql_compare_sqlite_values;
 use crate::config;
+use crate::consts;
 use crate::db_version::{get_or_set_site_ordinal, insert_db_version};
 use crate::pack_columns::bind_package_to_stmt;
 use crate::pack_columns::{unpack_columns, unpack_varints, ColumnValue};
 use crate::stmt_cache::reset_cached_stmt;
-use crate::tableinfo::{crsql_ensure_table_infos_are_up_to_date, TableInfo, SchemaVersion};
+use crate::tableinfo::{crsql_ensure_table_infos_are_up_to_date, TableInfo};
 use crate::util::slab_rowid;
-use crate::consts;
 
 /// Set the sync bit, run `f`, then clear the sync bit.
 /// Ensures the clear always runs even if `f` returns an error.
@@ -467,43 +466,125 @@ fn get_local_cl(
     Ok(cl)
 }
 
-/// Post-merge processing shared by all V2 merge paths:
-/// 1. Update db_version tracking (if site_id is present)
-/// 2. Dual-write: copy V2 metadata to V1 metadata tables (if in dual-write mode)
+/// Post-merge processing shared by all V2 merge paths.
+///
+/// V1 compatibility metadata is updated incrementally at each winning V2
+/// mutation. Keeping only db_version bookkeeping here avoids the old full-row
+/// V2→V1 rebuild after every remote change.
 unsafe fn post_v2_merge(
-    db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
-    tbl_info: &TableInfo,
-    unpacked_pks: Option<&Vec<ColumnValue>>,
-    hashed_pk: &[u8],
     insert_site_id: &[u8],
     insert_db_vrsn: sqlite::int64,
 ) -> Result<(), ResultCode> {
-    // Update db_version tracking.
     // Errors from insert_db_version are intentionally swallowed here because
-    // insert_db_version returns ERROR when a node receives its own changes back
-    // with a db_version higher than its current one (ordinal == 0). This is a
-    // legitimate condition during bidirectional sync and should not abort the
-    // merge — the change itself has already been applied successfully.
+    // receiving our own change back with a higher db_version is legitimate.
     if !insert_site_id.is_empty() {
         let _ = insert_db_version(ext_data, insert_site_id, insert_db_vrsn);
     }
-    // Dual-write: copy V2 metadata to V1 metadata tables
-    let mwv = unsafe { (*ext_data).metadataWriteVersion };
-    if mwv == config::METADATA_VERSION_V2_AND_V1 {
-        let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
-        let (v2_key_opt, v2_cl) =
-            v2_lookup_key_and_cl(db, &escaped, tbl_info, hashed_pk, unpacked_pks.unwrap_or(&Vec::new()), ext_data)?;
-        v2_to_v1_mirror_metadata(
+    Ok(())
+}
+
+/// Return whether V1 compatibility writes are enabled for this connection.
+#[inline]
+fn dual_write_enabled(ext_data: *mut crsql_ExtData) -> bool {
+    unsafe { (*ext_data).metadataWriteVersion == config::METADATA_VERSION_V2_AND_V1 }
+}
+
+/// Ensure V1 has the row lifecycle state corresponding to a winning V2 alive
+/// row transition. This only touches the PK lookaside row and, for causal
+/// lengths beyond the initial insert, the V1 insert/delete sentinel.
+unsafe fn mirror_v1_alive_transition(
+    db: *mut sqlite3,
+    ext_data: *mut crsql_ExtData,
+    tbl_info: &TableInfo,
+    pks: &Vec<ColumnValue>,
+    incoming_cl: i64,
+    db_version: i64,
+    site_id: &[u8],
+    seq: i64,
+    ts: i64,
+    local_cl: i64,
+) -> Result<(), ResultCode> {
+    let v1_key = tbl_info.get_or_create_key(db, pks)?;
+    if incoming_cl > local_cl && incoming_cl > 1 {
+        // Match the V1 resurrection semantics: old non-sentinel clocks are
+        // retained at version zero until winning column changes replace them.
+        zero_clocks_on_resurrect(db, tbl_info, v1_key)?;
+        set_winner_clock(
             db,
             ext_data,
             tbl_info,
-            unpacked_pks,
-            hashed_pk,
-            v2_key_opt,
-            v2_cl,
+            v1_key,
+            crate::c::INSERT_SENTINEL,
+            incoming_cl,
+            db_version,
+            site_id,
+            seq,
+            ts,
         )?;
     }
+    Ok(())
+}
+
+/// Mirror one winning V2 value clock into the corresponding V1 clock row.
+/// The base table is deliberately not touched: V2 already performed that
+/// mutation under the sync bit.
+unsafe fn mirror_v1_value_change(
+    db: *mut sqlite3,
+    ext_data: *mut crsql_ExtData,
+    tbl_info: &TableInfo,
+    pks: &Vec<ColumnValue>,
+    col_name: &str,
+    col_vrsn: i64,
+    db_version: i64,
+    site_id: &[u8],
+    seq: i64,
+    ts: i64,
+) -> Result<(), ResultCode> {
+    if !dual_write_enabled(ext_data) {
+        return Ok(());
+    }
+    let key = tbl_info.get_or_create_key(db, pks)?;
+    set_winner_clock(
+        db, ext_data, tbl_info, key, col_name, col_vrsn, db_version, site_id, seq, ts,
+    )?;
+    Ok(())
+}
+
+/// Mirror a winning V2 tombstone into V1 without replaying the user-table
+/// delete. The caller supplies the same incoming metadata used by V2.
+unsafe fn mirror_v1_delete(
+    db: *mut sqlite3,
+    ext_data: *mut crsql_ExtData,
+    tbl_info: &TableInfo,
+    pks: &Vec<ColumnValue>,
+    col_vrsn: i64,
+    db_version: i64,
+    site_id: &[u8],
+    seq: i64,
+    ts: i64,
+) -> Result<(), ResultCode> {
+    if !dual_write_enabled(ext_data) {
+        return Ok(());
+    }
+    let key = tbl_info.get_or_create_key(db, pks)?;
+    set_winner_clock(
+        db,
+        ext_data,
+        tbl_info,
+        key,
+        crate::c::DELETE_SENTINEL,
+        col_vrsn,
+        db_version,
+        site_id,
+        seq,
+        ts,
+    )?;
+    let stmt_ref = tbl_info.get_merge_delete_drop_clocks_stmt(db)?;
+    let stmt = stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
+    stmt.bind_int64(1, key)?;
+    stmt.step()?;
+    reset_cached_stmt(stmt.stmt)?;
     Ok(())
 }
 
@@ -566,8 +647,7 @@ unsafe fn merge_insert(
     let is_v2_hash_tombstone = insert_col == crate::consts::V2_HASH_TOMBSTONE_CID;
     let is_tombstone = insert_col == crate::c::DELETE_SENTINEL || is_v2_hash_tombstone;
     let is_v2_wire_packed = !is_tombstone
-        && (col_vrsn_type == sqlite::ColumnType::Text
-            || col_vrsn_type == sqlite::ColumnType::Blob);
+        && (col_vrsn_type == sqlite::ColumnType::Text || col_vrsn_type == sqlite::ColumnType::Blob);
 
     // Skip column name length check for V2 packed rows (col names are null-separated)
     if !is_v2_wire_packed && insert_col.len() > crate::consts::MAX_TBL_NAME_LEN as usize {
@@ -652,7 +732,8 @@ unsafe fn merge_insert(
     // V2 hash tombstone: pks blob IS the hashed_pk, no unpacked pks needed.
     // skip_hash mode: no hashed_pk — lookups use PK column directly.
     let skip_hash = tbl_info.skip_hash;
-    let (unpacked_pks_opt, hashed_pk): (Option<Vec<ColumnValue>>, Vec<u8>) = if is_v2_hash_tombstone {
+    let (unpacked_pks_opt, hashed_pk): (Option<Vec<ColumnValue>>, Vec<u8>) = if is_v2_hash_tombstone
+    {
         (None, insert_pks.blob().to_vec())
     } else {
         let packed_pks = insert_pks.blob();
@@ -668,13 +749,7 @@ unsafe fn merge_insert(
     // Hydrate V2 from V1 metadata in dual-write mode for V1 wire format
     if !is_v2_wire_packed && !is_v2_hash_tombstone && mwv == config::METADATA_VERSION_V2_AND_V1 {
         if let Some(ref unpacked_pks) = unpacked_pks_opt {
-            v1_to_v2_hydrate_row(
-                db,
-                (*tab).pExtData,
-                tbl_info,
-                unpacked_pks,
-                &hashed_pk,
-            )?;
+            v1_to_v2_hydrate_row(db, (*tab).pExtData, tbl_info, unpacked_pks, &hashed_pk)?;
         }
     }
 
@@ -706,44 +781,55 @@ unsafe fn merge_insert(
         )
     } else {
         // Packed merge: compute vectors based on wire format
-        let (col_names, col_vrsns, seqs, unpacked_vals, sentinel_col_vrsn, sentinel_seq) = if is_v2_wire_packed {
-            let col_names: Vec<&str> = insert_col.split('\0').collect();
-            let col_vrsns: Vec<i64> = unpack_varints(insert_col_vrsn_raw.blob())?;
-            let seqs: Vec<i64> = unpack_varints(insert_seq_raw.blob())?;
-            let unpacked_vals = unpack_columns(insert_val.blob())?;
+        let (col_names, col_vrsns, seqs, unpacked_vals, sentinel_col_vrsn, sentinel_seq) =
+            if is_v2_wire_packed {
+                let col_names: Vec<&str> = insert_col.split('\0').collect();
+                let col_vrsns: Vec<i64> = unpack_varints(insert_col_vrsn_raw.blob())?;
+                let seqs: Vec<i64> = unpack_varints(insert_seq_raw.blob())?;
+                let unpacked_vals = unpack_columns(insert_val.blob())?;
 
-            let n_cols = col_names.len();
-            if col_vrsns.len() != n_cols || seqs.len() != n_cols || unpacked_vals.len() != n_cols {
-                let err = CString::new(format!(
+                let n_cols = col_names.len();
+                if col_vrsns.len() != n_cols
+                    || seqs.len() != n_cols
+                    || unpacked_vals.len() != n_cols
+                {
+                    let err = CString::new(format!(
                     "crsql - V2 wire packed row has mismatched lengths: col_names={}, col_vrsns={}, seqs={}, vals={}",
                     n_cols, col_vrsns.len(), seqs.len(), unpacked_vals.len()
                 ))?;
-                *errmsg = err.into_raw();
-                return Err(ResultCode::ERROR);
-            }
-            // V2 wire doesn't send a separate sentinel — it's implied by the CL.
-            (col_names, col_vrsns, seqs, unpacked_vals, None, None)
-        } else {
-            // V1 wire format: convert to single-element (or empty) vectors
-            let insert_col_vrsn = insert_col_vrsn_raw.int64();
-            let insert_seq = insert_seq_raw.int64();
-
-            if insert_col == crate::c::INSERT_SENTINEL {
-                // Sentinel-only change (PK-only table insert, or sentinel-only row).
-                // Pass col_version and seq through for the sentinel clock entry at col_id=0.
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(insert_col_vrsn), Some(insert_seq))
+                    *errmsg = err.into_raw();
+                    return Err(ResultCode::ERROR);
+                }
+                // V2 wire doesn't send a separate sentinel — it's implied by the CL.
+                (col_names, col_vrsns, seqs, unpacked_vals, None, None)
             } else {
-                let col_val = sqlite_value_to_column_value(insert_val);
-                (
-                    vec![insert_col],
-                    vec![insert_col_vrsn],
-                    vec![insert_seq],
-                    vec![col_val],
-                    None,
-                    None,
-                )
-            }
-        };
+                // V1 wire format: convert to single-element (or empty) vectors
+                let insert_col_vrsn = insert_col_vrsn_raw.int64();
+                let insert_seq = insert_seq_raw.int64();
+
+                if insert_col == crate::c::INSERT_SENTINEL {
+                    // Sentinel-only change (PK-only table insert, or sentinel-only row).
+                    // Pass col_version and seq through for the sentinel clock entry at col_id=0.
+                    (
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Some(insert_col_vrsn),
+                        Some(insert_seq),
+                    )
+                } else {
+                    let col_val = sqlite_value_to_column_value(insert_val);
+                    (
+                        vec![insert_col],
+                        vec![insert_col_vrsn],
+                        vec![insert_seq],
+                        vec![col_val],
+                        None,
+                        None,
+                    )
+                }
+            };
 
         v2_packed_merge(
             db,
@@ -770,15 +856,7 @@ unsafe fn merge_insert(
     // Errors are swallowed because post_v2_merge handles its own error cases
     // gracefully (e.g., insert_db_version for self-originated changes).
     if result.is_ok() {
-        let _ = post_v2_merge(
-            db,
-            (*tab).pExtData,
-            tbl_info,
-            unpacked_pks_opt.as_ref(),
-            &hashed_pk,
-            insert_site_id,
-            insert_db_vrsn,
-        );
+        let _ = post_v2_merge((*tab).pExtData, insert_site_id, insert_db_vrsn);
     }
 
     return result;
@@ -1061,7 +1139,8 @@ unsafe fn v2_ensure_alive_row_at_cl(
 ) -> Result<Option<(i64, i64)>, ResultCode> {
     let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
 
-    let (local_key_opt, local_cl) = v2_lookup_key_and_cl(db, &escaped, tbl_info, hashed_pk, unpacked_pks, ext_data)?;
+    let (local_key_opt, local_cl) =
+        v2_lookup_key_and_cl(db, &escaped, tbl_info, hashed_pk, unpacked_pks, ext_data)?;
 
     if incoming_cl < local_cl {
         return Ok(None);
@@ -1085,7 +1164,15 @@ unsafe fn v2_ensure_alive_row_at_cl(
         //   are invisible to crsql_changes until modified locally.
         // - PK-only tables get a sentinel at col_id=0 from the sentinel_merge_upsert
         //   in v2_packed_merge.
-        let new_key = v2_insert_pk_row(db, ext_data, &escaped, tbl_info, unpacked_pks, hashed_pk, incoming_cl)?;
+        let new_key = v2_insert_pk_row(
+            db,
+            ext_data,
+            &escaped,
+            tbl_info,
+            unpacked_pks,
+            hashed_pk,
+            incoming_cl,
+        )?;
         new_key
     } else {
         // incoming_cl == local_cl — row must already exist
@@ -1152,7 +1239,9 @@ pub unsafe fn v1_to_v2_hydrate_row(
 ) -> Result<(), ResultCode> {
     // V2 clock tables require a non-zero ts. Error early if not set.
     if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
-        crate::debug::debug_log("v1_to_v2_hydrate_row: timestamp not set — call crsql_set_ts() first or set default-ts");
+        crate::debug::debug_log(
+            "v1_to_v2_hydrate_row: timestamp not set — call crsql_set_ts() first or set default-ts",
+        );
         return Err(ResultCode::ERROR);
     }
     let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
@@ -1161,7 +1250,8 @@ pub unsafe fn v1_to_v2_hydrate_row(
 
     // Guard: if V2 already has an entry for this row, skip hydration.
     // The row was either already migrated or written via dual-write triggers.
-    let (existing_v2_key, existing_v2_cl) = v2_lookup_key_and_cl(db, &escaped, tbl_info, hashed_pk, unpacked_pks, ext_data)?;
+    let (existing_v2_key, existing_v2_cl) =
+        v2_lookup_key_and_cl(db, &escaped, tbl_info, hashed_pk, unpacked_pks, ext_data)?;
     if existing_v2_key.is_some() || existing_v2_cl != 0 {
         return Ok(());
     }
@@ -1219,7 +1309,12 @@ pub unsafe fn v1_to_v2_hydrate_row(
             stmt.bind_int64(1, v1_key)?;
             if stmt.step()? == ResultCode::ROW {
                 let ts = stmt.column_int64(3);
-                (stmt.column_int64(0), stmt.column_int64(1), stmt.column_int64(2), if ts > 0 { ts } else { ts_fallback })
+                (
+                    stmt.column_int64(0),
+                    stmt.column_int64(1),
+                    stmt.column_int64(2),
+                    if ts > 0 { ts } else { ts_fallback },
+                )
             } else {
                 return Ok(()); // No sentinel detail — shouldn't happen but bail
             }
@@ -1232,7 +1327,11 @@ pub unsafe fn v1_to_v2_hydrate_row(
             ins.bind_int64(2, db_version)?;
             ins.bind_int64(3, seq)?;
             if tbl_info.skip_hash {
-                crate::pack_columns::bind_slot(4, unpacked_pks.first().ok_or(ResultCode::ERROR)?, ins.stmt)?;
+                crate::pack_columns::bind_slot(
+                    4,
+                    unpacked_pks.first().ok_or(ResultCode::ERROR)?,
+                    ins.stmt,
+                )?;
             } else {
                 ins.bind_blob(4, hashed_pk, sqlite::Destructor::STATIC)?;
             }
@@ -1283,7 +1382,11 @@ pub unsafe fn v1_to_v2_hydrate_row(
             let next_slot = if tbl_info.skip_hash {
                 unpacked_pks.len() as i32 + 1
             } else {
-                ins.bind_blob(unpacked_pks.len() as i32 + 1, hashed_pk, sqlite::Destructor::STATIC)?;
+                ins.bind_blob(
+                    unpacked_pks.len() as i32 + 1,
+                    hashed_pk,
+                    sqlite::Destructor::STATIC,
+                )?;
                 unpacked_pks.len() as i32 + 2
             };
             ins.bind_int64(next_slot, v1_cl)?;
@@ -1311,7 +1414,10 @@ pub unsafe fn v1_to_v2_hydrate_row_from_values(
     tbl_info: &TableInfo,
     pks: &[*mut sqlite::value],
 ) -> Result<(), ResultCode> {
-    let unpacked_pks: Vec<ColumnValue> = pks.iter().map(|v| sqlite_value_to_column_value(*v)).collect();
+    let unpacked_pks: Vec<ColumnValue> = pks
+        .iter()
+        .map(|v| sqlite_value_to_column_value(*v))
+        .collect();
     let packed = crate::pack_columns::pack_column_values(&unpacked_pks)?;
     let hashed_pk = crate::hash_pk::hash_packed_blob(&packed);
     v1_to_v2_hydrate_row(db, ext_data, tbl_info, &unpacked_pks, &hashed_pk)
@@ -1380,7 +1486,11 @@ unsafe fn v2_insert_pk_row(
         let next_slot = if tbl_info.skip_hash {
             unpacked_pks.len() as i32 + 1
         } else {
-            ins.bind_blob(unpacked_pks.len() as i32 + 1, hashed_pk, sqlite::Destructor::STATIC)?;
+            ins.bind_blob(
+                unpacked_pks.len() as i32 + 1,
+                hashed_pk,
+                sqlite::Destructor::STATIC,
+            )?;
             unpacked_pks.len() as i32 + 2
         };
         ins.bind_int64(next_slot, cl)?;
@@ -1436,7 +1546,8 @@ unsafe fn v2_merge_insert_tombstone(
     };
 
     // Look up key and CL from v2_pks (alive) or v2_tombstones (dead)
-    let (local_key, local_cl) = v2_lookup_key_and_cl(db, &escaped, tbl_info, hashed_pk, &unpacked_pks, ext_data)?;
+    let (local_key, local_cl) =
+        v2_lookup_key_and_cl(db, &escaped, tbl_info, hashed_pk, &unpacked_pks, ext_data)?;
 
     // Bail early if incoming CL can't beat local CL
     if insert_cl < local_cl {
@@ -1445,6 +1556,14 @@ unsafe fn v2_merge_insert_tombstone(
 
     // Track whether any statement actually modified data.
     let mut impacted = false;
+    // Skip-hash tombstones carry their PK values directly. Hash tombstones may
+    // recover them from the alive row below; unknown hash-only deletes cannot
+    // be mirrored to V1 until a PK mapping exists.
+    let mut mirror_pks = if tbl_info.skip_hash {
+        Some(unpacked_pks.clone())
+    } else {
+        None
+    };
 
     // V2 hash tombstone for a completely unknown row (no v2_pks, no v2_tombstones):
     // we can't emit this delete in V1 wire format because we have no PK values for
@@ -1461,7 +1580,7 @@ unsafe fn v2_merge_insert_tombstone(
         let err = CString::new(
             "crsql - received V2 hash tombstone for a row not present locally \
              while sync-log-version is 1. The delete cannot be forwarded to V1 wire peers \
-             without a PK mapping. Set sync-log-version to 2 or sync the insert first."
+             without a PK mapping. Set sync-log-version to 2 or sync the insert first.",
         )?;
         *errmsg = err.into_raw();
         return Err(ResultCode::ERROR);
@@ -1480,7 +1599,11 @@ unsafe fn v2_merge_insert_tombstone(
         stmt.bind_int64(2, insert_db_vrsn)?;
         stmt.bind_int64(3, insert_seq)?;
         if tbl_info.skip_hash {
-            crate::pack_columns::bind_slot(4, unpacked_pks.first().ok_or(ResultCode::ERROR)?, stmt.stmt)?;
+            crate::pack_columns::bind_slot(
+                4,
+                unpacked_pks.first().ok_or(ResultCode::ERROR)?,
+                stmt.stmt,
+            )?;
         } else {
             stmt.bind_blob(4, hashed_pk, sqlite::Destructor::STATIC)?;
         }
@@ -1495,12 +1618,15 @@ unsafe fn v2_merge_insert_tombstone(
             impacted = true;
         }
     }
+    drop(v2_ref);
 
     // If the row was alive, nuke its local state (clocks, v2_pks, base table row).
     // Also save PK values into v2_tombstone_pks for future lookups (hash mode only).
     // For seeded snapshots (local_key=None but row exists in base table), we still
     // need to delete the base table row and save PK values for tombstone_pks.
     if let Some(local_key) = local_key {
+        let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
+        let v2 = v2_ref.as_mut().unwrap();
         // Look up PK values once — used for both tombstone_pks insert and v2_nuke_local_row.
         let mut local_pks: Vec<ColumnValue> = Vec::new();
         {
@@ -1522,12 +1648,33 @@ unsafe fn v2_merge_insert_tombstone(
 
         // Drop v2_ref before calling v2_nuke_local_row which needs its own borrow
         drop(v2_ref);
+        if !local_pks.is_empty() {
+            mirror_pks = Some(local_pks.clone());
+        }
 
         // Nuke clocks, v2_pks, and base table row
         v2_nuke_local_row(db, ext_data, &escaped, local_key, &local_pks, tbl_info)?;
         let ch = db.changes64();
         if ch > 0 {
             impacted = true;
+        }
+    }
+
+    // Mirror only a winning tombstone. This updates the V1 delete sentinel and
+    // drops obsolete V1 value clocks, but never performs the user-table delete.
+    if impacted {
+        if let Some(ref pks) = mirror_pks {
+            mirror_v1_delete(
+                db,
+                ext_data,
+                tbl_info,
+                pks,
+                insert_cl,
+                insert_db_vrsn,
+                insert_site_id,
+                insert_seq,
+                insert_ts,
+            )?;
         }
     }
 
@@ -1552,9 +1699,7 @@ pub unsafe fn sqlite_value_to_column_value(val: *mut sqlite::value) -> ColumnVal
         sqlite::ColumnType::Text => {
             ColumnValue::Text(alloc::string::ToString::to_string(val.text()))
         }
-        sqlite::ColumnType::Blob => {
-            ColumnValue::Blob(val.blob().to_vec())
-        }
+        sqlite::ColumnType::Blob => ColumnValue::Blob(val.blob().to_vec()),
         sqlite::ColumnType::Null => ColumnValue::Null,
     }
 }
@@ -1594,12 +1739,37 @@ unsafe fn v2_packed_merge(
     // skipped-delete cleanup, and new row creation in one shot.
     let site_ordinal = get_site_ordinal_or_zero(ext_data, site_id)?;
     let (local_key, local_cl) = match v2_ensure_alive_row_at_cl(
-        db, ext_data, tbl_info, unpacked_pks, hashed_pk, incoming_cl,
-        db_vrsn, site_ordinal,
+        db,
+        ext_data,
+        tbl_info,
+        unpacked_pks,
+        hashed_pk,
+        incoming_cl,
+        db_vrsn,
+        site_ordinal,
     )? {
         Some(result) => result,
         None => return Ok(ResultCode::OK), // stale CL — no-op, *rowid stays 0
     };
+
+    // V2 has created or resurrected the row. Mirror only this lifecycle
+    // transition into V1; later value clocks are mirrored individually after
+    // their V2 conflict check succeeds.
+    if dual_write_enabled(ext_data) && incoming_cl > local_cl {
+        let lifecycle_seq = seqs.first().copied().or(sentinel_seq).unwrap_or(0);
+        mirror_v1_alive_transition(
+            db,
+            ext_data,
+            tbl_info,
+            unpacked_pks,
+            incoming_cl,
+            db_vrsn,
+            site_id,
+            lifecycle_seq,
+            ts,
+            local_cl,
+        )?;
+    }
 
     // Track whether any upsert actually modified data.
     // We use changes() after each statement to detect if rows were impacted.
@@ -1611,9 +1781,20 @@ unsafe fn v2_packed_merge(
     // - When CL is equal, the WHERE clause compares col_version and values.
     for i in 0..col_names.len() {
         v2_apply_value_change_colval(
-            db, ext_data, tbl_info, &escaped, local_key, col_names[i],
-            &unpacked_vals[i], col_vrsns[i], db_vrsn, site_id, seqs[i], ts,
-            unpacked_pks, col_id_bits,
+            db,
+            ext_data,
+            tbl_info,
+            &escaped,
+            local_key,
+            col_names[i],
+            &unpacked_vals[i],
+            col_vrsns[i],
+            db_vrsn,
+            site_id,
+            seqs[i],
+            ts,
+            unpacked_pks,
+            col_id_bits,
         )?;
         let ch = db.changes64();
         if ch > 0 {
@@ -1656,6 +1837,21 @@ unsafe fn v2_packed_merge(
         let ch = db.changes64();
         if ch > 0 {
             impacted = true;
+            if dual_write_enabled(ext_data) {
+                let v1_key = tbl_info.get_or_create_key(db, unpacked_pks)?;
+                set_winner_clock(
+                    db,
+                    ext_data,
+                    tbl_info,
+                    v1_key,
+                    crate::c::INSERT_SENTINEL,
+                    incoming_col_vrsn,
+                    db_vrsn,
+                    site_id,
+                    seq,
+                    ts,
+                )?;
+            }
         }
     }
 
@@ -1740,7 +1936,11 @@ unsafe fn v2_nuke_tombstone(
     {
         let mut stmt = v2.tomb_delete();
         if tbl_info.skip_hash {
-            crate::pack_columns::bind_slot(1, unpacked_pks.first().ok_or(ResultCode::ERROR)?, stmt.stmt)?;
+            crate::pack_columns::bind_slot(
+                1,
+                unpacked_pks.first().ok_or(ResultCode::ERROR)?,
+                stmt.stmt,
+            )?;
         } else {
             stmt.bind_blob(1, hashed_pk, sqlite::Destructor::STATIC)?;
         }
@@ -1751,138 +1951,6 @@ unsafe fn v2_nuke_tombstone(
     if !tbl_info.skip_hash {
         let mut stmt = v2.tomb_pks_delete()?;
         stmt.bind_blob(1, hashed_pk, sqlite::Destructor::STATIC)?;
-        stmt.step()?;
-    }
-
-    Ok(())
-}
-
-/// Look up PK values from V2 metadata tables (v2_pks or v2_tombstone_pks) by hashed_pk.
-/// Used when unpacked PKs are not available from the wire (e.g., hash tombstone case).
-/// Only called in hash mode — skip_hash mode always has unpacked PKs from the wire.
-unsafe fn v2_lookup_pks_for_v1_copy(
-    db: *mut sqlite3,
-    escaped: &str,
-    tbl_info: &TableInfo,
-    hashed_pk: &[u8],
-    ext_data: *mut crsql_ExtData,
-) -> Result<Vec<ColumnValue>, ResultCode> {
-    // skip_hash tables don't have hashed_pk columns — return empty.
-    if tbl_info.skip_hash {
-        return Ok(Vec::new());
-    }
-    let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
-    let v2 = v2_ref.as_mut().unwrap();
-
-    // Try v2_tombstone_pks first (row might have been deleted)
-    {
-        let mut stmt = v2.lookup_pks_tomb()?;
-        stmt.bind_blob(1, hashed_pk, sqlite::Destructor::STATIC)?;
-        if stmt.step()? == ResultCode::ROW {
-            return Ok(collect_pks_from_stmt(stmt.stmt, tbl_info.pks.len())?);
-        }
-    }
-
-    // Try v2_pks (row might still be alive)
-    {
-        let mut stmt = v2.lookup_pks_alive()?;
-        stmt.bind_blob(1, hashed_pk, sqlite::Destructor::STATIC)?;
-        if stmt.step()? == ResultCode::ROW {
-            return Ok(collect_pks_from_stmt(stmt.stmt, tbl_info.pks.len())?);
-        }
-    }
-
-    Ok(Vec::new())
-}
-
-/// Copy V2 metadata state to V1 metadata tables for dual-write mode.
-/// Called after V2 merge has completed for SchemaVersion::V2AndV1 tables.
-/// Receives the post-merge V2 key/CL from the caller to avoid a redundant lookup.
-/// Reads the current V2 clock entries and mirrors them to V1 tables
-/// (__crsql_pks + __crsql_clock), ensuring semantic equivalence
-/// without relying on trigger-based V1 metadata population.
-unsafe fn v2_to_v1_mirror_metadata(
-    db: *mut sqlite3,
-    ext_data: *mut crsql_ExtData,
-    tbl_info: &TableInfo,
-    unpacked_pks: Option<&Vec<ColumnValue>>,
-    hashed_pk: &[u8],
-    v2_key_opt: Option<i64>,
-    v2_cl: i64,
-) -> Result<(), ResultCode> {
-    let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
-    let ts_fallback = unsafe { (*ext_data).timestamp as i64 };
-    if v2_cl == 0 {
-        return Ok(());
-    }
-
-    // 1. Get unpacked PKs — from parameter or look up from V2 tables
-    let looked_up_pks;
-    let pks: &Vec<ColumnValue> = match unpacked_pks {
-        Some(p) => p,
-        None => {
-            looked_up_pks = v2_lookup_pks_for_v1_copy(db, &escaped, tbl_info, hashed_pk, ext_data)?;
-            &looked_up_pks
-        }
-    };
-
-    if pks.is_empty() {
-        return Ok(());
-    }
-
-    // 3. Get or create V1 PK entry
-    let v1_key = tbl_info.get_or_create_key(db, pks)?;
-
-    let mut v2_ref = tbl_info.get_v2_stmts(db, ext_data)?;
-    let v2 = v2_ref.as_mut().unwrap();
-
-    // 4. Delete all existing V1 clock entries and sentinels for this v1 key
-    {
-        let mut del = v2.v1_clock_delete()?;
-        del.bind_int64(1, v1_key)?;
-        del.step()?;
-    }
-
-    let col_id_bits = consts::CRSQL_COL_ID_BITS as i64;
-    let col_id_mask = consts::CRSQL_COL_ID_MASK as i64;
-
-    // Set the V1 sentinel if needed (CL > 1 only).
-    // Bind order for cached stmts: 1=key, 2=cl, 3=ts_fallback, 4=lookup_param
-    if v2_cl > 1 {
-        if let Some(k) = v2_key_opt {
-            // Alive: look up from v2_clock by cell_key
-            let mut ins = v2.v1_sentinel_insert_alive()?;
-            ins.bind_int64(1, v1_key)?;
-            ins.bind_int64(2, v2_cl)?;
-            ins.bind_int64(3, ts_fallback)?;
-            ins.bind_int64(4, (k << col_id_bits) | 0)?;
-            ins.step()?;
-        } else {
-            // Dead: look up from v2_tombstones
-            let mut ins = v2.v1_sentinel_insert_dead()?;
-            ins.bind_int64(1, v1_key)?;
-            ins.bind_int64(2, v2_cl)?;
-            ins.bind_int64(3, ts_fallback)?;
-            if tbl_info.skip_hash {
-                crate::pack_columns::bind_slot(4, pks.first().ok_or(ResultCode::ERROR)?, ins.stmt)?;
-            } else {
-                ins.bind_blob(4, hashed_pk, sqlite::Destructor::STATIC)?;
-            }
-            ins.step()?;
-        }
-    }
-
-    // Copy clocks from V2 to V1. For PK only tables it's a no-op as the
-    // insert sentinel was created already and the V2_COL_MAP_SUFFIX join will filter it out
-    if let Some(v2_key) = v2_key_opt {
-        let base = v2_key << col_id_bits;
-        // Bind order: 1=key, 2=ts_fallback, 3=col_id_mask, 4=cell_key_base, 5=cell_key_end
-        let mut stmt = v2.v1_clock_copy()?;
-        stmt.bind_int64(1, v1_key)?;
-        stmt.bind_int64(2, ts_fallback)?;
-        stmt.bind_int64(3, col_id_mask)?;
-        stmt.bind_int64(4, base)?;
-        stmt.bind_int64(5, base | col_id_mask)?;
         stmt.step()?;
     }
 
@@ -1913,7 +1981,11 @@ unsafe fn v2_apply_value_change_colval(
     let site_ordinal = get_site_ordinal_or_zero(ext_data, site_id)?;
 
     // Get col_id from in-memory col_map (loaded at TableInfo creation)
-    let col_id = tbl_info.col_map.iter().find(|(_, name)| name == col_name).map(|(id, _)| *id);
+    let col_id = tbl_info
+        .col_map
+        .iter()
+        .find(|(_, name)| name == col_name)
+        .map(|(id, _)| *id);
     if col_id.is_none() {
         return Ok(());
     }
@@ -1941,11 +2013,21 @@ unsafe fn v2_apply_value_change_colval(
     stmt.bind_int64(6, ts)?;
     // Bind incoming value for crsql_change_wins (param 7)
     match val {
-        ColumnValue::Integer(i) => { stmt.bind_int64(7, *i)?; }
-        ColumnValue::Float(f) => { stmt.bind_double(7, *f)?; }
-        ColumnValue::Text(t) => { stmt.bind_text(7, t, sqlite::Destructor::STATIC)?; }
-        ColumnValue::Blob(b) => { stmt.bind_blob(7, b, sqlite::Destructor::STATIC)?; }
-        ColumnValue::Null => { stmt.bind_null(7)?; }
+        ColumnValue::Integer(i) => {
+            stmt.bind_int64(7, *i)?;
+        }
+        ColumnValue::Float(f) => {
+            stmt.bind_double(7, *f)?;
+        }
+        ColumnValue::Text(t) => {
+            stmt.bind_text(7, t, sqlite::Destructor::STATIC)?;
+        }
+        ColumnValue::Blob(b) => {
+            stmt.bind_blob(7, b, sqlite::Destructor::STATIC)?;
+        }
+        ColumnValue::Null => {
+            stmt.bind_null(7)?;
+        }
     }
     // Bind subquery params (params 8..8+subquery_param_count)
     if tbl_info.key_is_rowid {
@@ -1954,7 +2036,11 @@ unsafe fn v2_apply_value_change_colval(
         bind_package_to_stmt(stmt.stmt, unpacked_pks, 7)?;
     }
     // Bind incoming site_id blob for comparison (param 8+subquery_param_count)
-    stmt.bind_blob(8 + subquery_param_count, site_id, sqlite::Destructor::STATIC)?;
+    stmt.bind_blob(
+        8 + subquery_param_count,
+        site_id,
+        sqlite::Destructor::STATIC,
+    )?;
     // Bind mergeEqualValues flag (param 9+subquery_param_count)
     stmt.bind_int(9 + subquery_param_count, merge_equal)?;
 
@@ -1964,6 +2050,22 @@ unsafe fn v2_apply_value_change_colval(
     if !won {
         return Ok(());
     }
+
+    // The V2 clock won, so mirror exactly this clock mutation into V1. This
+    // intentionally happens before the base-table update and never calls the
+    // V1 merge path, which would mutate the user table a second time.
+    mirror_v1_value_change(
+        db,
+        ext_data,
+        tbl_info,
+        unpacked_pks,
+        col_name,
+        col_vrsn,
+        db_version,
+        site_id,
+        seq,
+        ts,
+    )?;
 
     // Change won — update the actual user table.
     // Set sync bit to suppress triggers that would overwrite V2 clock with local site_id.
@@ -1980,11 +2082,21 @@ unsafe fn v2_apply_value_change_colval(
         let mut update_stmt = v2.base_update(col_name)?;
         // Bind value as param 1
         match val {
-            ColumnValue::Integer(i) => { update_stmt.bind_int64(1, *i)?; }
-            ColumnValue::Float(f) => { update_stmt.bind_double(1, *f)?; }
-            ColumnValue::Text(t) => { update_stmt.bind_text(1, t, sqlite::Destructor::STATIC)?; }
-            ColumnValue::Blob(b) => { update_stmt.bind_blob(1, b, sqlite::Destructor::STATIC)?; }
-            ColumnValue::Null => { update_stmt.bind_null(1)?; }
+            ColumnValue::Integer(i) => {
+                update_stmt.bind_int64(1, *i)?;
+            }
+            ColumnValue::Float(f) => {
+                update_stmt.bind_double(1, *f)?;
+            }
+            ColumnValue::Text(t) => {
+                update_stmt.bind_text(1, t, sqlite::Destructor::STATIC)?;
+            }
+            ColumnValue::Blob(b) => {
+                update_stmt.bind_blob(1, b, sqlite::Destructor::STATIC)?;
+            }
+            ColumnValue::Null => {
+                update_stmt.bind_null(1)?;
+            }
         }
         // Bind rowid or PKs as params 2..
         if tbl_info.key_is_rowid {

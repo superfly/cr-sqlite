@@ -117,23 +117,8 @@ pub struct V2Stmts {
     v1_any_clock_lookup: Option<ManagedStmt>,
     /// SELECT site_id, db_version, seq, ts FROM V1 clock WHERE key = ? AND col_name = DELETE_SENTINEL
     v1_sentinel_detail: Option<ManagedStmt>,
-    /// DELETE FROM V1 clock WHERE key = ?
-    v1_clock_delete: Option<ManagedStmt>,
-    /// INSERT INTO V1 clock SELECT ... FROM v2_clock WHERE cell_key = ? (alive sentinel)
-    v1_sentinel_insert_alive: Option<ManagedStmt>,
-    /// INSERT INTO V1 clock SELECT ... FROM v2_tombstones WHERE ... (dead sentinel)
-    /// skip_hash: WHERE pk_col = ?, hash: WHERE hashed_pk = ?
-    v1_sentinel_insert_dead: Option<ManagedStmt>,
-    /// INSERT INTO V1 clock SELECT ... FROM v2_clock JOIN v2_col_map (clock copy)
-    v1_clock_copy: Option<ManagedStmt>,
     /// INSERT INTO v2_clock SELECT ... FROM V1 clock JOIN v2_col_map (hydration clock copy)
     hydrate_clock_copy: Option<ManagedStmt>,
-
-    // --- PK lookup by hashed_pk (hash mode only, for v1 copy) ---
-    /// SELECT pk_cols FROM v2_tombstone_pks WHERE hashed_pk = ?
-    lookup_pks_tomb: Option<ManagedStmt>,
-    /// SELECT pk_cols FROM v2_pks [JOIN base] WHERE hashed_pk = ?
-    lookup_pks_alive: Option<ManagedStmt>,
 
     /// The merge_equal value baked into the SQL at prepare time.
     merge_equal: i32,
@@ -369,61 +354,6 @@ impl V2Stmts {
             ), sqlite::PREPARE_PERSISTENT)?)
         } else { None };
 
-        let v1_clock_delete = if has_v1 {
-            Some(db.prepare_v3(&format!(
-                "DELETE FROM \"{escaped}__crsql_clock\" WHERE key = ?"
-            ), sqlite::PREPARE_PERSISTENT)?)
-        } else { None };
-
-        // v1_sentinel_insert_alive: INSERT INTO V1 clock SELECT ... FROM v2_clock WHERE cell_key = ?
-        // Bind order: 1=key, 2=cl, 3=ts_fallback, 4=cell_key
-        let v1_sentinel_insert_alive = if has_v1 {
-            Some(db.prepare_v3(&format!(
-                "INSERT INTO \"{escaped}__crsql_clock\" (key, col_name, col_version, site_id, db_version, seq, ts) \
-                 SELECT ?, '-1', ?, site_id, db_version, seq, \
-                 CASE WHEN ts > 0 THEN ts ELSE ? END \
-                 FROM (SELECT site_id, db_version, seq, ts FROM \"{escaped}{}\" WHERE cell_key = ?) LIMIT 1",
-                consts::V2_CLOCK_SUFFIX
-            ), sqlite::PREPARE_PERSISTENT)?)
-        } else { None };
-
-        // v1_sentinel_insert_dead: depends on skip_hash vs hash
-        // Bind order: 1=key, 2=cl, 3=ts_fallback, 4=pk lookup value
-        let v1_sentinel_insert_dead = if has_v1 {
-            if tbl_info.skip_hash {
-                Some(db.prepare_v3(&format!(
-                    "INSERT INTO \"{escaped}__crsql_clock\" (key, col_name, col_version, site_id, db_version, seq, ts) \
-                    SELECT ?, '-1', ?, site_id, db_version, seq, \
-                    CASE WHEN ts > 0 THEN ts ELSE ? END \
-                    FROM (SELECT site_id, db_version, seq, ts FROM \"{escaped}{}\" WHERE \"{pk_col}\" = ?) LIMIT 1",
-                    consts::V2_TOMBSTONES_SUFFIX,
-                    pk_col = tbl_info.skip_hash_pk_col,
-                ), sqlite::PREPARE_PERSISTENT)?)
-            } else {
-                Some(db.prepare_v3(&format!(
-                    "INSERT INTO \"{escaped}__crsql_clock\" (key, col_name, col_version, db_version, seq, site_id, ts) \
-                    SELECT ?, '-1', ?, db_version, seq, site_id, \
-                    CASE WHEN ts > 0 THEN ts ELSE ? END \
-                    FROM (SELECT site_id, db_version, seq, ts FROM \"{escaped}{}\" WHERE hashed_pk = ?) LIMIT 1",
-                    consts::V2_TOMBSTONES_SUFFIX,
-                ), sqlite::PREPARE_PERSISTENT)?)
-            }
-        } else { None };
-
-        // v1_clock_copy: bind order: 1=key, 2=ts_fallback, 3=col_id_mask, 4=cell_key_base, 5=cell_key_end
-        let v1_clock_copy = if has_v1 {
-            Some(db.prepare_v3(&format!(
-                "INSERT INTO \"{escaped}__crsql_clock\" (key, col_name, col_version, db_version, seq, site_id, ts) \
-                 SELECT ?, m.col_name, c.col_version, c.db_version, c.seq, \
-                 c.site_id, \
-                 CASE WHEN c.ts > 0 THEN c.ts ELSE ? END \
-                 FROM \"{escaped}{}\" c \
-                 JOIN \"{escaped}{}\" m ON (c.cell_key & ?) = m.col_id \
-                 WHERE c.cell_key >= ? AND c.cell_key <= ?",
-                consts::V2_CLOCK_SUFFIX, consts::V2_COL_MAP_SUFFIX
-            ), sqlite::PREPARE_PERSISTENT)?)
-        } else { None };
-
         // hydrate_clock_copy: bind order: 1=v2_key, 2=ts_fallback, 3=v1_key
         let hydrate_clock_copy = if has_v1 {
             Some(db.prepare_v3(&format!(
@@ -437,41 +367,6 @@ impl V2Stmts {
                 col_id_bits = consts::CRSQL_COL_ID_BITS
             ), sqlite::PREPARE_PERSISTENT)?)
         } else { None };
-
-        // --- PK lookup by hashed_pk (hash mode only) ---
-
-        let (lookup_pks_tomb, lookup_pks_alive) = if !tbl_info.skip_hash {
-            let pk_list: Vec<String> = tbl_info.pks.iter()
-                .map(|c| crate::util::escape_ident(&c.name))
-                .collect();
-
-            let tomb = db.prepare_v3(&format!(
-                "SELECT {pk_list} FROM \"{escaped}{}\" WHERE hashed_pk = ?",
-                consts::V2_TOMBSTONE_PKS_SUFFIX,
-                pk_list = pk_list.join(", ")
-            ), sqlite::PREPARE_PERSISTENT)?;
-
-            let alive = if tbl_info.key_is_rowid {
-                let alias = crate::util::escape_ident(&tbl_info.rowid_alias);
-                let t_pk_list: Vec<String> = pk_list.iter().map(|c| format!("t.{c}")).collect();
-                db.prepare_v3(&format!(
-                    "SELECT {t_pk_list} FROM \"{escaped}{}\" p \
-                     JOIN \"{escaped}\" t ON t.\"{alias}\" = p.__crsql_key \
-                     WHERE p.hashed_pk = ?",
-                    consts::V2_PKS_SUFFIX,
-                    t_pk_list = t_pk_list.join(", ")
-                ), sqlite::PREPARE_PERSISTENT)?
-            } else {
-                db.prepare_v3(&format!(
-                    "SELECT {pk_list} FROM \"{escaped}{}\" WHERE hashed_pk = ?",
-                    consts::V2_PKS_SUFFIX,
-                    pk_list = pk_list.join(", ")
-                ), sqlite::PREPARE_PERSISTENT)?
-            };
-            (Some(tomb), Some(alive))
-        } else {
-            (None, None)
-        };
 
         Ok(Self {
             lookup_row_state,
@@ -535,13 +430,7 @@ impl V2Stmts {
             v1_sentinel_lookup,
             v1_any_clock_lookup,
             v1_sentinel_detail,
-            v1_clock_delete,
-            v1_sentinel_insert_alive,
-            v1_sentinel_insert_dead,
-            v1_clock_copy,
             hydrate_clock_copy,
-            lookup_pks_tomb,
-            lookup_pks_alive,
             merge_equal,
         })
     }
@@ -596,18 +485,6 @@ impl V2Stmts {
     pub fn v1_sentinel_detail(&mut self) -> Result<StmtGuard, ResultCode> {
         self.v1_sentinel_detail.as_mut().map(StmtGuard::new).ok_or(ResultCode::ERROR)
     }
-    pub fn v1_clock_delete(&mut self) -> Result<StmtGuard, ResultCode> {
-        self.v1_clock_delete.as_mut().map(StmtGuard::new).ok_or(ResultCode::ERROR)
-    }
-    pub fn v1_sentinel_insert_alive(&mut self) -> Result<StmtGuard, ResultCode> {
-        self.v1_sentinel_insert_alive.as_mut().map(StmtGuard::new).ok_or(ResultCode::ERROR)
-    }
-    pub fn v1_sentinel_insert_dead(&mut self) -> Result<StmtGuard, ResultCode> {
-        self.v1_sentinel_insert_dead.as_mut().map(StmtGuard::new).ok_or(ResultCode::ERROR)
-    }
-    pub fn v1_clock_copy(&mut self) -> Result<StmtGuard, ResultCode> {
-        self.v1_clock_copy.as_mut().map(StmtGuard::new).ok_or(ResultCode::ERROR)
-    }
     pub fn hydrate_clock_copy(&mut self) -> Result<StmtGuard, ResultCode> {
         self.hydrate_clock_copy.as_mut().map(StmtGuard::new).ok_or(ResultCode::ERROR)
     }
@@ -624,13 +501,6 @@ impl V2Stmts {
     pub fn base_lookup_rowid(&mut self) -> Result<StmtGuard, ResultCode> {
         self.base_lookup_rowid.as_mut().map(StmtGuard::new).ok_or(ResultCode::ERROR)
     }
-    pub fn lookup_pks_tomb(&mut self) -> Result<StmtGuard, ResultCode> {
-        self.lookup_pks_tomb.as_mut().map(StmtGuard::new).ok_or(ResultCode::ERROR)
-    }
-    pub fn lookup_pks_alive(&mut self) -> Result<StmtGuard, ResultCode> {
-        self.lookup_pks_alive.as_mut().map(StmtGuard::new).ok_or(ResultCode::ERROR)
-    }
-
     /// The merge_equal value baked into these statements.
     pub fn merge_equal(&self) -> i32 {
         self.merge_equal
