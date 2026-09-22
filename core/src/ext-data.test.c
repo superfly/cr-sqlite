@@ -210,6 +210,13 @@ static void testFetchPragmaDataVersion() {
   rc = crsql_fetchPragmaDataVersion(db1, pExtData1);
   assert(rc == 2);
 
+  // A schema commit from another connection can invalidate the cached
+  // PRAGMA statement. The helper must reprepare it before retrying.
+  rc = sqlite3_exec(db1, "CREATE TABLE fpdv_schema_change (a)", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = crsql_fetchPragmaDataVersion(db2, pExtData2);
+  assert(rc == 2);
+
   // should not change after updating itself
   rc = crsql_fetchPragmaDataVersion(db1, pExtData1);
   assert(rc == 0);
