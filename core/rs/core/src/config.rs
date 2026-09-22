@@ -102,7 +102,17 @@ pub unsafe fn ensure_config_current(
         ];
         for (name, target) in config_values {
             let key = format!("config.{name}");
-            match crate::util::get_master_value(db, &key) {
+            let value = match crate::util::get_master_value(db, &key) {
+                Ok(value) => Ok(value),
+                Err(rc) if rc == ResultCode::SCHEMA => {
+                    // A schema change invalidates statements prepared against
+                    // the previous schema. Reprepare the config read and try
+                    // once more before surfacing the error.
+                    crate::util::get_master_value(db, &key)
+                }
+                Err(rc) => Err(rc),
+            };
+            match value {
                 Ok(Some(value)) => *target = value as c_int,
                 Ok(None) => {}
                 Err(_) => {

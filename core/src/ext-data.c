@@ -271,6 +271,16 @@ void crsql_finalize(crsql_ExtData *pExtData) {
 #define DB_VERSION_SCHEMA_VERSION 0
 #define TABLE_INFO_SCHEMA_VERSION 1
 
+static int crsql_reprepare_data_version_stmt(sqlite3 *db, crsql_ExtData *pExtData) {
+  if (pExtData->pPragmaDataVersionStmt != 0) {
+    sqlite3_finalize(pExtData->pPragmaDataVersionStmt);
+    pExtData->pPragmaDataVersionStmt = 0;
+  }
+  return sqlite3_prepare_v3(
+      db, "PRAGMA data_version", -1, SQLITE_PREPARE_PERSISTENT,
+      &(pExtData->pPragmaDataVersionStmt), 0);
+}
+
 int crsql_fetchPragmaSchemaVersion(sqlite3 *db, crsql_ExtData *pExtData,
                                    int which) {
   int rc = sqlite3_step(pExtData->pPragmaSchemaVersionStmt);
@@ -305,6 +315,13 @@ int crsql_fetchPragmaSchemaVersion(sqlite3 *db, crsql_ExtData *pExtData,
 //  -1  - error
 int crsql_fetchPragmaDataVersion(sqlite3 *db, crsql_ExtData *pExtData) {
   int rc = sqlite3_step(pExtData->pPragmaDataVersionStmt);
+  if (rc == SQLITE_SCHEMA) {
+    rc = crsql_reprepare_data_version_stmt(db, pExtData);
+    if (rc != SQLITE_OK) {
+      return -1;
+    }
+    rc = sqlite3_step(pExtData->pPragmaDataVersionStmt);
+  }
   if (rc != SQLITE_ROW) {
     int finalizeRc = sqlite3_reset(pExtData->pPragmaDataVersionStmt);
     if (rc == SQLITE_DONE) {

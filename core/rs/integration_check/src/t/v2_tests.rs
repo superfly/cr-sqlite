@@ -2115,19 +2115,31 @@ fn test_config_refreshes_between_connections() -> Result<(), ResultCode> {
     assert_eq!(before.column_int(0), 1);
     drop(before);
 
+    // Keep conn2 in a read transaction while conn1 changes the schema. The
+    // transaction retains its snapshot; the refresh must not fail with
+    // SQLITE_SCHEMA, and the next transaction must retry against the current
+    // schema/config state.
+    conn2.db.exec_safe("BEGIN")?;
+    let snapshot = conn2.db.prepare_v2("SELECT count(*) FROM foo")?;
+    snapshot.step()?;
+    drop(snapshot);
+    conn1.db.exec_safe("CREATE TABLE concurrent_schema_change (id PRIMARY KEY)")?;
+    let pinned = conn2.db.prepare_v2("SELECT crsql_config_get('metadata-write-version')")?;
+    pinned.step()?;
+    assert_eq!(pinned.column_int(0), 1);
+    drop(pinned);
+    conn2.db.exec_safe("COMMIT")?;
+
     conn1.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
 
     // The first operation on conn2 after the other connection commits must
-    // refresh its cached config from crsql_master, including when the refresh
-    // happens inside an explicit transaction.
-    conn2.db.exec_safe("BEGIN")?;
+    // continue to report the refreshed config.
     let after = conn2.db.prepare_v2("SELECT crsql_config_get('metadata-write-version')")?;
     after.step()?;
     assert_eq!(after.column_int(0), 2);
     let use_version = conn2.db.prepare_v2("SELECT crsql_config_get('metadata-use-version')")?;
     use_version.step()?;
     assert_eq!(use_version.column_int(0), 1, "write=2 should not change use mode");
-    conn2.db.exec_safe("COMMIT")?;
 
     // The refreshed write mode must affect real work, not only config_get.
     conn2.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
