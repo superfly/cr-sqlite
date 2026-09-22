@@ -54,6 +54,7 @@ struct crsql_ExtData {
   unsigned long long timestamp;
   unsigned long long defaultTimestamp;
   void *ordinalMap;
+  sqlite3_stmt *pConfigValueStmt;
   sqlite3_stmt *pVersionGuardStmt;
   int versionGuardEnlisted;
 };
