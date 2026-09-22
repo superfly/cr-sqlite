@@ -68,23 +68,31 @@ extern "C" fn best_index(vtab: *mut sqlite::vtab, index_info: *mut sqlite::index
         )
     };
 
+    let mut found_package = false;
     for (i, constraint) in constraints.iter().enumerate() {
         if constraint.usable == 0 {
             continue;
         }
-        if constraint.iColumn != Columns::PACKAGE as i32 {
-            unsafe {
-                (*vtab).zErrMsg = CString::new(format!(
-                    "no package column specified. Got {:?} instead",
-                    Columns::PACKAGE
-                ))
-                .map_or(core::ptr::null_mut(), |f| f.into_raw());
+        if constraint.iColumn == Columns::PACKAGE as i32 {
+            if constraint.op != sqlite::INDEX_CONSTRAINT_EQ as u8 {
+                // Only equality constraints on the package column are supported.
+                // Leave the constraint unaccepted so SQLite can handle or reject it.
+                continue;
             }
-            return ResultCode::MISUSE as c_int;
-        } else {
             constraint_usage[i].argvIndex = 1;
             constraint_usage[i].omit = 1;
+            found_package = true;
         }
+    }
+
+    if !found_package {
+        unsafe {
+            (*vtab).zErrMsg = CString::new(
+                "crsql_unpack_columns requires an equality constraint on the package column",
+            )
+            .map_or(core::ptr::null_mut(), |f| f.into_raw());
+        }
+        return ResultCode::CONSTRAINT as c_int;
     }
 
     ResultCode::OK as c_int
@@ -145,6 +153,8 @@ extern "C" fn filter(
             (*crsr).unpacked = Some(cols);
             (*crsr).crsr = 0;
         } else {
+            (*(*cursor).pVtab).zErrMsg = CString::new("failed to unpack columns from package blob")
+                .map_or(core::ptr::null_mut(), |f| f.into_raw());
             return ResultCode::ERROR as c_int;
         }
     }
@@ -189,10 +199,16 @@ extern "C" fn column(
     if col_num == Columns::CELL as i32 {
         unsafe {
             if let Some(cols) = &(*crsr).unpacked {
-                let col_value = &cols[(*crsr).crsr];
+                let crsr_idx = (*crsr).crsr;
+                if crsr_idx >= cols.len() {
+                    (*(*cursor).pVtab).zErrMsg = CString::new("column index out of bounds")
+                        .map_or(core::ptr::null_mut(), |f| f.into_raw());
+                    return ResultCode::ERROR as c_int;
+                }
+                let col_value = &cols[crsr_idx];
                 match col_value {
                     ColumnValue::Blob(b) => {
-                        ctx.result_blob_static(b);
+                        ctx.result_blob_transient(b);
                     }
                     ColumnValue::Float(f) => {
                         ctx.result_double(*f);
@@ -204,7 +220,7 @@ extern "C" fn column(
                         ctx.result_null();
                     }
                     ColumnValue::Text(t) => {
-                        ctx.result_text_static(t);
+                        ctx.result_text_transient(t);
                     }
                 }
                 ResultCode::OK as c_int

@@ -11,6 +11,7 @@ def sync_left_to_right(l, r, since):
     ret = 0
     for change in changes:
         ret = change[5]
+        r.execute("SELECT crsql_set_ts('1700000000')")
         r.execute(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
 
@@ -22,6 +23,7 @@ def test_sync():
     def setup():
         c = connect(":memory:")
         c.execute("CREATE TABLE item (id PRIMARY KEY NOT NULL, width INTEGER, height INTEGER, name TEXT, dscription TEXT, weight INTEGER)")
+        c.execute("SELECT crsql_set_ts('1700000000')")
         c.execute("SELECT crsql_as_crr('item')")
         c.commit()
         return c

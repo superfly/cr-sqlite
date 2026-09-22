@@ -9,6 +9,7 @@ def sync_left_to_right(l, r, since):
     changes = l.execute(
         "SELECT * FROM crsql_changes WHERE db_version > ? AND site_id IS NOT ?", (since, r_site_id))
     for change in changes:
+        r.execute("SELECT crsql_set_ts('1700000000')")
         r.execute(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
     r.commit()
@@ -47,6 +48,7 @@ def test_c3c4():
 def test_site_id_for_local_writes():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (id not null, x, y, primary key (id))")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
 
@@ -78,6 +80,7 @@ def test_site_id_from_merge():
         a = connect(":memory:")
         a.execute("create table foo (a primary key not null, b);")
         a.commit()
+        a.execute("SELECT crsql_set_ts('1700000000')")
         a.execute("SELECT crsql_as_crr('foo')")
         a.commit()
         return a

@@ -23,9 +23,6 @@ LIBSQL_EXTENSION_INIT1
 unsigned char __rust_no_alloc_shim_is_unstable;
 #endif
 
-int crsql_compact_post_alter(sqlite3 *db, const char *tblName,
-                             crsql_ExtData *pExtData, char **errmsg);
-
 int crsql_commit_hook(void *pUserData);
 void crsql_rollback_hook(void *pUserData);
 
@@ -62,20 +59,36 @@ __declspec(dllexport)
   // methods are not isntalled when we start calling rust
   crsql_ExtData *pExtData = sqlite3_crsqlrustbundle_init(db, pzErrMsg, pApi);
   if (pExtData == 0) {
+    if (pzErrMsg != 0 && *pzErrMsg == 0) {
+      *pzErrMsg = sqlite3_mprintf(
+          "crsqlrustbundle_init failed to initialize extension data");
+    }
     return SQLITE_ERROR;
   }
 
-  if (rc == SQLITE_OK) {
-    rc = sqlite3_create_module_v2(db, "crsql_changes", &crsql_changesModule,
-                                  pExtData, 0);
+  rc = sqlite3_create_module_v2(db, "crsql_changes", &crsql_changesModule,
+                                pExtData, 0);
+  if (rc != SQLITE_OK) {
+    // M32: On module creation failure, free the extension data so we do not
+    // leave a half-loaded extension state. SQL functions registered by the
+    // rust bundle init remain, but without a working module or commit/rollback
+    // hooks the CRDT version tracking would silently break, so we bail out
+    // rather than continuing with a partially initialized extension.
+    crsql_finalize(pExtData);
+    return rc;
   }
 
-  if (rc == SQLITE_OK) {
+  {
 #ifdef LIBSQL
     libsql_close_hook(db, closeHook, pExtData);
 #endif
     // TODO: get the prior callback so we can call it rather than replace
     // it?
+    // M33: crsqlite must be loaded before any other extension that installs
+    // commit/rollback hooks. sqlite3_commit_hook / sqlite3_rollback_hook
+    // unconditionally replace any pre-existing hooks, so loading crsqlite
+    // after another extension that relies on those hooks will silently drop
+    // the prior hooks and break that extension's behavior.
     sqlite3_commit_hook(db, crsql_commit_hook, pExtData);
     sqlite3_rollback_hook(db, crsql_rollback_hook, pExtData);
   }

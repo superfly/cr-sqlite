@@ -19,8 +19,11 @@ int crsql_close(sqlite3 *db) {
   if (close_rc != SQLITE_OK) {
     sqlite3_stmt *next = sqlite3_next_stmt(db, NULL);
     if (next != NULL) {
-      const char *sql = sqlite3_expanded_sql(next);
-      printf("unfinalized sql: %s\n", sql);
+      char *sql = sqlite3_expanded_sql(next);
+      if (sql != NULL) {
+        printf("unfinalized sql: %s\n", sql);
+        sqlite3_free(sql);
+      }
     }
   }
 
@@ -39,12 +42,16 @@ void crsqlIsCrrTestSuite();
 void rowsImpactedTestSuite();
 void crsqlChangesVtabRowidTestSuite();
 void crsqlSandboxSuite();
+void crsql_insertOrReplaceTestSuite();
 void crsql_integration_check();
 
 int main(int argc, char *argv[]) {
   char *suite = "all";
   if (argc == 2) {
     suite = argv[1];
+  } else if (argc > 2) {
+    printf("Usage: %s [suite]\n", argv[0]);
+    return 1;
   }
 
   SUITE("vtab") crsqlChangesVtabTestSuite();
@@ -57,7 +64,9 @@ int main(int argc, char *argv[]) {
   SUITE("rows_impacted") rowsImpactedTestSuite();
   SUITE("rowid") crsqlChangesVtabRowidTestSuite();
   SUITE("sandbox") crsqlSandboxSuite();
+  SUITE("insert_or_replace") crsql_insertOrReplaceTestSuite();
   SUITE("rust_integration") crsql_integration_check();
 
   sqlite3_shutdown();
+  return 0;
 }

@@ -15,6 +15,7 @@ def sync_left_to_right(l, r, since):
     changes = l.execute(
         "SELECT * FROM crsql_changes WHERE db_version > ?", (since,))
     for change in changes:
+        r.execute("SELECT crsql_set_ts('1700000000')")
         r.execute(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
     r.commit()
@@ -23,8 +24,10 @@ def sync_left_to_right(l, r, since):
 def simple_schema():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b TEXT)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo')")
     c.execute("CREATE TABLE bar (a NOT NULL, b NOT NULL, PRIMARY KEY(a, b))")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('bar')")
     c.commit()
     return c
