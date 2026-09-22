@@ -89,6 +89,7 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   pExtData->seq = 0;
   pExtData->pragmaSchemaVersion = -1;
   pExtData->pragmaDataVersion = -1;
+  pExtData->checkedConfigThisTx = 0;
   pExtData->pragmaSchemaVersionForTableInfos = -1;
   pExtData->pDbVersionStmt = 0;
   rc = sqlite3_prepare_v3(

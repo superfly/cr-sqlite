@@ -981,6 +981,10 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
     ext_data: *mut crsql_ExtData,
     err: *mut *mut c_char,
 ) -> c_int {
+    if unsafe { crate::config::ensure_config_current(db, ext_data) }.is_err() {
+        return ResultCode::ERROR as c_int;
+    }
+
     let schema_changed =
         unsafe { crsql_fetchPragmaSchemaVersion(db, ext_data, TABLE_INFO_SCHEMA_VERSION) };
 

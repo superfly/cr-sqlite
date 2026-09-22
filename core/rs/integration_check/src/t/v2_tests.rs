@@ -2077,6 +2077,71 @@ fn test_config_persists_across_reopen() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// An existing connection must refresh persisted config after another
+/// connection changes it. Config is cached in crsql_ExtData, so this guards
+/// against conn2 continuing to report/use the old metadata mode.
+fn test_config_refreshes_between_connections() -> Result<(), ResultCode> {
+    libc_println!("=== test_config_refreshes_between_connections START ===");
+
+    let path = "crsql_config_refresh_test.db\0";
+    let path_str = path.trim_end_matches('\0');
+
+    #[cfg(not(target_os = "windows"))]
+    extern "C" {
+        fn unlink(pathname: *const core::ffi::c_char) -> core::ffi::c_int;
+    }
+    #[cfg(target_os = "windows")]
+    extern "C" {
+        fn _unlink(pathname: *const core::ffi::c_char) -> core::ffi::c_int;
+    }
+
+    unsafe {
+        #[cfg(not(target_os = "windows"))]
+        unlink(path.as_ptr() as *const core::ffi::c_char);
+        #[cfg(target_os = "windows")]
+        _unlink(path.as_ptr() as *const core::ffi::c_char);
+    }
+
+    let conn1 = crate::opendb_file(path_str)?;
+    conn1.db.exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, value)")?;
+    conn1.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    conn1.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+
+    // conn2 snapshots the old V1 configuration before conn1 changes it.
+    let conn2 = crate::opendb_file(path_str)?;
+    let before = conn2.db.prepare_v2("SELECT crsql_config_get('metadata-write-version')")?;
+    before.step()?;
+    assert_eq!(before.column_int(0), 1);
+    drop(before);
+
+    conn1.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
+
+    // The first operation on conn2 after the other connection commits must
+    // refresh its cached config from crsql_master.
+    let after = conn2.db.prepare_v2("SELECT crsql_config_get('metadata-write-version')")?;
+    after.step()?;
+    assert_eq!(after.column_int(0), 2);
+    let use_version = conn2.db.prepare_v2("SELECT crsql_config_get('metadata-use-version')")?;
+    use_version.step()?;
+    assert_eq!(use_version.column_int(0), 1, "write=2 should not change use mode");
+
+    // The refreshed write mode must affect real work, not only config_get.
+    conn2.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
+    conn2.db.exec_safe("INSERT INTO foo VALUES (1, 'from conn2')")?;
+    let v2_rows = conn2.db.prepare_v2("SELECT count(*) FROM foo__crsql_v2_pks")?;
+    v2_rows.step()?;
+    assert_eq!(v2_rows.column_int(0), 1, "conn2 should use refreshed dual-write mode");
+
+    unsafe {
+        #[cfg(not(target_os = "windows"))]
+        unlink(path.as_ptr() as *const core::ffi::c_char);
+        #[cfg(target_os = "windows")]
+        _unlink(path.as_ptr() as *const core::ffi::c_char);
+    }
+    libc_println!("=== test_config_refreshes_between_connections PASS ===");
+    Ok(())
+}
+
 /// Setting metadata-write-version cascades metadata-use-version (and, when
 /// rolling back to v1, sync-log-version) in-memory. The cascade MUST also be
 /// persisted to crsql_master or a new connection loads the stale default.
@@ -2416,6 +2481,7 @@ pub fn run_suite() -> Result<(), ResultCode> {
     test_tombstone_conflict_resolution()?;
     test_ts_not_set_errors()?;
     test_config_persists_across_reopen()?;
+    test_config_refreshes_between_connections()?;
     test_config_cascade_persists_across_reopen()?;
     test_v2_update_uses_col_map_id_after_drop()?;
     test_default_ts_basic()?;

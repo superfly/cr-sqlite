@@ -60,6 +60,7 @@ pub struct crsql_ExtData {
     pub pPragmaSchemaVersionStmt: *mut sqlite::stmt,
     pub pPragmaDataVersionStmt: *mut sqlite::stmt,
     pub pragmaDataVersion: ::core::ffi::c_int,
+    pub checkedConfigThisTx: ::core::ffi::c_int,
     pub dbVersion: sqlite::int64,
     pub pendingDbVersion: sqlite::int64,
     pub pragmaSchemaVersion: ::core::ffi::c_int,
@@ -376,6 +377,16 @@ fn bindgen_test_layout_crsql_ExtData() {
             stringify!(crsql_ExtData),
             "::",
             stringify!(pragmaDataVersion)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).checkedConfigThisTx) as usize - ptr as usize },
+        20usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_ExtData),
+            "::",
+            stringify!(checkedConfigThisTx)
         )
     );
     assert_eq!(

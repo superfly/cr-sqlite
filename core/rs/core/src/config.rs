@@ -26,7 +26,53 @@ pub const SYNC_LOG_VERSION_DEFAULT: c_int = 1;
 // Migration order: 1 -> 2 -> 3 (forward only, except 2 -> 1 rollback)
 pub const METADATA_VERSION_V1: c_int = 1;
 pub const METADATA_VERSION_V2_AND_V1: c_int = 2;  // dual write, migration in progress
-pub const METADATA_VERSION_V2: c_int = 3;          // V2 only, V1 tables dropped
+pub const METADATA_VERSION_V2: c_int = 3; // V2 only, V1 tables dropped
+
+/// Refresh connection-local configuration after another connection commits.
+///
+/// Configuration is persisted in `crsql_master`, but the hot paths read the
+/// cached fields in `crsql_ExtData`. Check PRAGMA data_version once per
+/// transaction so an existing connection cannot continue using stale metadata
+/// mode or merge settings. The current transaction's snapshot remains pinned;
+/// the next transaction will perform the next check.
+pub unsafe fn ensure_config_current(
+    db: *mut sqlite_nostd::sqlite3,
+    ext_data: *mut crsql_ExtData,
+) -> Result<(), ResultCode> {
+    // Read-only/autocommit statements do not invoke the commit hook, so a
+    // transaction flag would otherwise remain set forever after the first
+    // SELECT. In autocommit mode each operation is its own transaction and
+    // must check data_version independently.
+    let autocommit = db.get_autocommit();
+    if (*ext_data).checkedConfigThisTx != 0 && !autocommit {
+        return Ok(());
+    }
+
+    let data_version_changed = crate::c::crsql_fetchPragmaDataVersion(db, ext_data);
+    if data_version_changed < 0 {
+        return Err(ResultCode::ERROR);
+    }
+
+    if data_version_changed != 0 {
+        let config_values = [
+            (MERGE_EQUAL_VALUES, &mut (*ext_data).mergeEqualValues),
+            (METADATA_WRITE_VERSION, &mut (*ext_data).metadataWriteVersion),
+            (METADATA_USE_VERSION, &mut (*ext_data).metadataUseVersion),
+            (SYNC_LOG_VERSION, &mut (*ext_data).syncLogVersion),
+        ];
+        for (name, target) in config_values {
+            if let Some(value) = crate::util::get_master_value(
+                db,
+                &format!("config.{name}"),
+            )? {
+                *target = value as c_int;
+            }
+        }
+    }
+
+    (*ext_data).checkedConfigThisTx = if autocommit { 0 } else { 1 };
+    Ok(())
+}
 
 pub extern "C" fn crsql_config_set(
     ctx: *mut sqlite::context,
@@ -53,6 +99,12 @@ pub extern "C" fn crsql_config_set(
     }
 
     let db = ctx.db_handle();
+
+    if unsafe { ensure_config_current(db, ext_data) }.is_err() {
+        ctx.result_error("Failed to refresh configuration");
+        ctx.result_error_code(ResultCode::ERROR);
+        return;
+    }
 
     // Wrap the entire transition in a savepoint so that schema changes
     // (V2 table creation, migration task queueing, cleanup task queueing)
@@ -392,6 +444,13 @@ pub extern "C" fn crsql_config_get(
     let args = sqlite::args!(argc, argv);
 
     let name = args[0].text();
+    let ext_data = ctx.user_data() as *mut crsql_ExtData;
+
+    if name != DEFAULT_TS && unsafe { ensure_config_current(ctx.db_handle(), ext_data) }.is_err() {
+        ctx.result_error("Failed to refresh configuration");
+        ctx.result_error_code(ResultCode::ERROR);
+        return;
+    }
 
     match name {
         MERGE_EQUAL_VALUES => {
