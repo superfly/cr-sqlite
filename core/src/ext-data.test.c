@@ -51,6 +51,8 @@ static void textNewExtData() {
 
   // data version should have been fetched
   assert(pExtData->pragmaDataVersion != -1);
+  // configuration has not yet been checked in a transaction
+  assert(pExtData->checkedConfigThisTx == 0);
 
   crsql_finalize(pExtData);
   crsql_freeExtData(pExtData);
