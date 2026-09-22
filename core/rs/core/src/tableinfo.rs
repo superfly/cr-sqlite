@@ -8,6 +8,7 @@ use crate::pack_columns::ColumnValue;
 use crate::stmt_cache::reset_cached_stmt;
 use crate::util::Countable;
 use alloc::boxed::Box;
+use alloc::ffi::CString;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
@@ -982,6 +983,13 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
     err: *mut *mut c_char,
 ) -> c_int {
     if unsafe { crate::config::ensure_config_current(db, ext_data) }.is_err() {
+        if !err.is_null() && unsafe { (*err).is_null() } {
+            unsafe {
+                *err = CString::new("Could not refresh persisted cr-sqlite configuration")
+                    .expect("static error has no NUL")
+                    .into_raw();
+            }
+        }
         return ResultCode::ERROR as c_int;
     }
 
@@ -989,6 +997,13 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
         unsafe { crsql_fetchPragmaSchemaVersion(db, ext_data, TABLE_INFO_SCHEMA_VERSION) };
 
     if schema_changed != 0 && schema_changed != 1 {
+        if !err.is_null() && unsafe { (*err).is_null() } {
+            unsafe {
+                *err = CString::new("Could not fetch SQLite schema version")
+                    .expect("static error has no NUL")
+                    .into_raw();
+            }
+        }
         return ResultCode::ERROR as c_int;
     }
 
@@ -997,12 +1012,15 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
         return ResultCode::OK as c_int;
     }
 
-    let mut table_infos: Box<Vec<TableInfo>> = if unsafe { (*ext_data).tableInfos.is_null() } {
-        // No tableInfos allocated yet — nothing to update. Return early
-        // rather than dereferencing a null pointer via Box::from_raw.
-        return ResultCode::ERROR as c_int;
-    } else {
-        unsafe { Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>) }
+    // Some embedding paths can invoke a CRR operation before the optional
+    // table-info vector has been allocated. Treat that as an empty cache and
+    // initialize it here; returning ERROR would turn a recoverable cache miss
+    // into a generic "Could not update table infos" sync failure.
+    if unsafe { (*ext_data).tableInfos.is_null() } {
+        crsql_init_table_info_vec(ext_data);
+    }
+    let mut table_infos: Box<Vec<TableInfo>> = unsafe {
+        Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>)
     };
 
     if schema_changed > 0 || table_infos.len() == 0 {

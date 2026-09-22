@@ -46,7 +46,15 @@ static int changesConnect(sqlite3 *db, void *pAux, int argc,
   rc = crsql_ensure_table_infos_are_up_to_date(db, pNew->pExtData,
                                                &(*ppVtab)->zErrMsg);
   if (rc != SQLITE_OK) {
-    *pzErr = sqlite3_mprintf("Could not update table infos");
+    // Preserve the detailed error produced by the Rust table-info/config
+    // refresh. Fall back to the historical generic message only when the
+    // lower layer did not provide one.
+    if (pNew->base.zErrMsg != 0) {
+      *pzErr = pNew->base.zErrMsg;
+      pNew->base.zErrMsg = 0;
+    } else {
+      *pzErr = sqlite3_mprintf("Could not update table infos");
+    }
     sqlite3_free(pNew);
     *ppVtab = 0;
     return rc;
