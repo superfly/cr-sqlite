@@ -128,6 +128,55 @@ fn test_ensure_table_infos_are_up_to_date() {
     };
 }
 
+fn test_reinitializes_null_table_info_cache() {
+    let db = crate::opendb().expect("Opened DB");
+    let c = &db.db;
+    let raw_db = db.db.db;
+    c.exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, value)")
+        .expect("made foo");
+    c.exec_safe(
+        "CREATE TABLE foo__crsql_clock (key, col_name, col_version, db_version, site_id, seq, ts)",
+    )
+    .expect("made foo clock");
+
+    let ext_data = unsafe { test_exports::c::crsql_newExtData(raw_db) };
+    assert!(!ext_data.is_null(), "crsql_newExtData returned null");
+    assert_eq!(
+        unsafe {
+            test_exports::c::crsql_initSiteIdExt(
+                raw_db,
+                ext_data,
+                make_site() as *mut core::ffi::c_uchar,
+            )
+        },
+        0
+    );
+
+    let err = make_err_ptr();
+    assert_eq!(
+        test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err),
+        ResultCode::OK as c_int
+    );
+    unsafe { test_exports::tableinfo::crsql_drop_table_info_vec(ext_data) };
+    assert!(unsafe { (*ext_data).tableInfos.is_null() });
+    unsafe { (*ext_data).updatedTableInfosThisTx = 0 };
+
+    // A remote merge can arrive through a connection whose cache has not been
+    // initialized. The refresh path must recreate the empty cache instead of
+    // returning a generic table-info error.
+    assert_eq!(
+        test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err),
+        ResultCode::OK as c_int
+    );
+    let table_infos = unsafe {
+        &*( (*ext_data).tableInfos as *const Vec<TableInfo>)
+    };
+    assert_eq!(table_infos.len(), 1);
+
+    drop_err_ptr(err);
+    unsafe { test_exports::c::crsql_freeExtData(ext_data) };
+}
+
 fn test_pull_table_info() {
     let db = crate::opendb().expect("Opened DB");
     let c = &db.db;
@@ -547,6 +596,7 @@ fn select_site_id(db: *mut sqlite::sqlite3) -> Result<Vec<u8>, ResultCode> {
 pub fn run_suite() {
     libc_print::libc_println!("Running tableinfo suite");
     test_ensure_table_infos_are_up_to_date();
+    test_reinitializes_null_table_info_cache();
     test_pull_table_info();
     test_is_table_compatible();
     test_create_clock_table_from_table_info();

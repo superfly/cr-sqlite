@@ -600,8 +600,13 @@ unsafe fn merge_insert(
 
     let rc = crsql_ensure_table_infos_are_up_to_date(db, (*tab).pExtData, errmsg);
     if rc != ResultCode::OK as i32 {
-        let err = CString::new("Failed to update CRR table information")?;
-        *errmsg = err.into_raw();
+        // Preserve the detailed error produced by table-info/config refresh.
+        // Only provide the generic message when the lower layer did not set
+        // one.
+        if !errmsg.is_null() && (*errmsg).is_null() {
+            let err = CString::new("Failed to update CRR table information")?;
+            *errmsg = err.into_raw();
+        }
         return Err(ResultCode::ERROR);
     }
 
