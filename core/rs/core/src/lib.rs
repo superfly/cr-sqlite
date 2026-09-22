@@ -1278,6 +1278,40 @@ unsafe extern "C" fn x_crsql_set_ts(
         }
     };
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+
+    // Refresh schema/table-info state while the caller's explicit transaction
+    // is open, before a later INSERT INTO crsql_changes enters the virtual
+    // table's xUpdate callback. xUpdate runs as a nested VDBE under the outer
+    // INSERT; if it discovers an invalidated schema there, SQLite may be unable
+    // to reprepare schema-dependent queries such as the persisted config read
+    // from crsql_master and return SQLITE_SCHEMA. Corrosion calls crsql_set_ts
+    // before applying remote changes, so this keeps the refresh at a safe point
+    // and lets the xUpdate path reuse the checked state. Do not run this from
+    // autocommit mode: the timestamp/config state will not survive the
+    // statement anyway, and crsql_set_ts itself may be executing inside a
+    // statement where schema-dependent refresh SQL would recreate the same
+    // nested-query limitation.
+    if !ctx.db_handle().get_autocommit() {
+        let mut err_msg: *mut c_char = null_mut();
+        let rc = crate::tableinfo::crsql_ensure_table_infos_are_up_to_date(
+            ctx.db_handle(),
+            ext_data,
+            &mut err_msg as *mut *mut c_char,
+        );
+        if rc != ResultCode::OK as c_int {
+            if !err_msg.is_null() {
+                let message = core::ffi::CStr::from_ptr(err_msg)
+                    .to_str()
+                    .unwrap_or("table info refresh failed");
+                ctx.result_error(message);
+                sqlite::free(err_msg as *mut core::ffi::c_void);
+            } else {
+                ctx.result_error("table info refresh failed");
+            }
+            return;
+        }
+    }
+
     (*ext_data).timestamp = ts_u64;
     ctx.result_text_static("OK");
 }

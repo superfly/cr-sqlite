@@ -1,6 +1,6 @@
 extern crate alloc;
 
-use crate::{alloc::string::ToString, tableinfo::ColumnInfo};
+use crate::{alloc::string::ToString, c::crsql_ExtData, tableinfo::ColumnInfo};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -8,7 +8,8 @@ use alloc::vec::Vec;
 use core::str::Utf8Error;
 use sqlite::{sqlite3, ColumnType, Connection, ResultCode};
 use sqlite_nostd as sqlite;
-use sqlite_nostd::Destructor;
+use num_traits::FromPrimitive;
+use sqlite_nostd::{Destructor, Stmt};
 
 pub fn get_dflt_value(
     db: *mut sqlite3,
@@ -178,6 +179,32 @@ impl Countable for *mut sqlite::sqlite3 {
         } else {
             // No row was produced; return 0 rather than reading an invalid column.
             Ok(0)
+        }
+    }
+}
+
+/// Get an integer value from the globally prepared crsql_master config
+/// statement. SQLite owns schema invalidation/repreparation for this statement.
+pub unsafe fn get_master_value_cached(
+    ext_data: *mut crsql_ExtData,
+    key: &str,
+) -> Result<Option<i64>, ResultCode> {
+    let stmt = (*ext_data).pConfigValueStmt;
+    if stmt.is_null() {
+        return Err(ResultCode::ERROR);
+    }
+    stmt.bind_text(1, key, Destructor::STATIC)?;
+    match stmt.step()? {
+        ResultCode::ROW => {
+            let value = stmt.column_int64(0);
+            stmt.reset()?;
+            stmt.clear_bindings()?;
+            Ok(Some(value))
+        }
+        _ => {
+            stmt.reset()?;
+            stmt.clear_bindings()?;
+            Ok(None)
         }
     }
 }
