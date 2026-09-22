@@ -982,11 +982,11 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
     ext_data: *mut crsql_ExtData,
     err: *mut *mut c_char,
 ) -> c_int {
-    if unsafe { crate::config::ensure_config_current(db, ext_data) }.is_err() {
+    if let Err(message) = unsafe { crate::config::ensure_config_current(db, ext_data) } {
         if !err.is_null() && unsafe { (*err).is_null() } {
             unsafe {
-                *err = CString::new("Could not refresh persisted cr-sqlite configuration")
-                    .expect("static error has no NUL")
+                *err = CString::new(message)
+                    .expect("config refresh error has no NUL")
                     .into_raw();
             }
         }
