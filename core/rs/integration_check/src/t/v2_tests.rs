@@ -2106,6 +2106,7 @@ fn test_config_refreshes_between_connections() -> Result<(), ResultCode> {
     conn1.db.exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, value)")?;
     conn1.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     conn1.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+    conn1.db.exec_safe("PRAGMA journal_mode=WAL")?;
 
     // conn2 snapshots the old V1 configuration before conn1 changes it.
     let conn2 = crate::opendb_file(path_str)?;
@@ -2117,13 +2118,16 @@ fn test_config_refreshes_between_connections() -> Result<(), ResultCode> {
     conn1.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
 
     // The first operation on conn2 after the other connection commits must
-    // refresh its cached config from crsql_master.
+    // refresh its cached config from crsql_master, including when the refresh
+    // happens inside an explicit transaction.
+    conn2.db.exec_safe("BEGIN")?;
     let after = conn2.db.prepare_v2("SELECT crsql_config_get('metadata-write-version')")?;
     after.step()?;
     assert_eq!(after.column_int(0), 2);
     let use_version = conn2.db.prepare_v2("SELECT crsql_config_get('metadata-use-version')")?;
     use_version.step()?;
     assert_eq!(use_version.column_int(0), 1, "write=2 should not change use mode");
+    conn2.db.exec_safe("COMMIT")?;
 
     // The refreshed write mode must affect real work, not only config_get.
     conn2.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
@@ -2132,6 +2136,21 @@ fn test_config_refreshes_between_connections() -> Result<(), ResultCode> {
     v2_rows.step()?;
     assert_eq!(v2_rows.column_int(0), 1, "conn2 should use refreshed dual-write mode");
 
+    // WAL commits from the other connection must also invalidate the cached
+    // config. Missing config rows are valid for older databases; retain the
+    // connection's established defaults when a row is absent.
+    conn1.db.exec_safe("DELETE FROM crsql_master WHERE key LIKE 'config.%'")?;
+    conn1.db.exec_safe("INSERT INTO foo VALUES (2, 'from conn1')")?;
+    let fallback = conn2.db.prepare_v2("SELECT crsql_config_get('metadata-write-version')")?;
+    fallback.step()?;
+    assert_eq!(fallback.column_int(0), 2, "missing config row should not break refresh");
+    drop(fallback);
+    drop(v2_rows);
+    drop(use_version);
+    drop(after);
+
+    drop(conn2);
+    drop(conn1);
     unsafe {
         #[cfg(not(target_os = "windows"))]
         unlink(path.as_ptr() as *const core::ffi::c_char);

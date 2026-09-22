@@ -46,10 +46,10 @@ fn main() {
     )
     .unwrap();
 
-    let mut trials = 100;
-    let mut batch_size = 1000;
+    let trials = 100;
+    let batch_size = 1000;
 
-    let mut count = 5;
+    let count = 5;
 
     // conn.trace(Some(|sql| println!("{sql}")));
 
@@ -76,7 +76,7 @@ fn main() {
         for i in 0..trials {
             let start = Instant::now();
             insert(&mut conn, "", batch_size, batch_size * ( i + (j * trials)), use_ts);
-            let elapsed = start.elapsed();
+            let _elapsed = start.elapsed();
             // println!("insert #{i} done in {elapsed:?}");
         }
         times.push(start.elapsed());
@@ -93,7 +93,7 @@ fn main() {
         for i in 0..trials {
             let start = Instant::now();
             update(&mut conn, "v", batch_size, batch_size * ( i + (j * trials)), use_ts);
-            let elapsed = start.elapsed();
+            let _elapsed = start.elapsed();
         }
         times.push(start.elapsed());
         // println!("update #{i} done in {elapsed:?}");
@@ -109,7 +109,7 @@ fn main() {
         for i in 0..trials {
             let start = Instant::now();
             update(&mut conn, "", batch_size, batch_size * ( i + (j * trials)), use_ts);
-            let elapsed = start.elapsed();
+            let _elapsed = start.elapsed();
         }
         times.push(start.elapsed());
         // println!("update #{i} done in {elapsed:?}");
@@ -244,6 +244,7 @@ fn create_crr(conn: &Connection) {
         .unwrap();
 }
 
+#[allow(dead_code)]
 fn create_merge_control(conn: &mut Connection) {
     conn.execute_batch(
         "
@@ -254,6 +255,7 @@ fn create_merge_control(conn: &mut Connection) {
     .unwrap();
 }
 
+#[allow(dead_code)]
 fn setup_merge_test_db() -> Connection {
     let mut conn = Connection::open_in_memory().unwrap();
     unsafe {
@@ -311,6 +313,7 @@ fn setup_merge_test_db() -> Connection {
     conn
 }
 
+#[allow(dead_code)]
 fn modify_rows(conn: &mut Connection) {
     for t in 0..100 {
         let offset = t * 100;
@@ -338,7 +341,8 @@ fn modify_rows(conn: &mut Connection) {
     }
 }
 
-fn merge(from: &Connection, to: &mut Connection, pfx: &str, count: usize, offset: usize) {
+#[allow(dead_code)]
+fn merge(from: &Connection, to: &mut Connection, _pfx: &str, count: usize, offset: usize) {
     let mut prepped = from
         .prepare_cached("SELECT * FROM crsql_changes WHERE db_version = ?")
         .unwrap();
@@ -371,7 +375,8 @@ fn merge(from: &Connection, to: &mut Connection, pfx: &str, count: usize, offset
     tx.commit().unwrap();
 }
 
-fn normal_insert(from: &Connection, to: &mut Connection, pfx: &str, count: usize, offset: usize) {
+#[allow(dead_code)]
+fn normal_insert(from: &Connection, to: &mut Connection, _pfx: &str, count: usize, offset: usize) {
     let mut prepped = from
         .prepare_cached("SELECT * FROM merge_control WHERE tx = ?")
         .unwrap();
@@ -481,6 +486,7 @@ fn update(conn: &mut Connection, pfx: &str, count: usize, offset: usize, use_ts:
     tx.commit().unwrap();
 }
 
+#[allow(dead_code)]
 fn single_stmt_insert(conn: &mut Connection, pfx: &str, count: usize, offset: usize) {
     let offset = offset + 1000000;
     let values = (0..count)
@@ -497,6 +503,7 @@ fn single_stmt_insert(conn: &mut Connection, pfx: &str, count: usize, offset: us
     tx.commit().unwrap();
 }
 
+#[allow(dead_code)]
 fn read_changes(conn: &Connection, pfx: &str, count: usize, offset: usize) {
     for i in 0..count {
         if pfx == "v" {

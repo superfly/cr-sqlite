@@ -1,4 +1,5 @@
 use alloc::format;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use core::ffi::c_int;
@@ -35,10 +36,49 @@ pub const METADATA_VERSION_V2: c_int = 3; // V2 only, V1 tables dropped
 /// transaction so an existing connection cannot continue using stale metadata
 /// mode or merge settings. The current transaction's snapshot remains pinned;
 /// the next transaction will perform the next check.
+unsafe fn config_refresh_error(
+    db: *mut sqlite_nostd::sqlite3,
+    ext_data: *mut crsql_ExtData,
+    operation: &str,
+    key: Option<&str>,
+) -> String {
+    let sqlite_rc = db.errcode();
+    let sqlite_error = db
+        .errmsg()
+        .map(|msg| msg.to_string())
+        .unwrap_or_else(|_| "<unavailable>".to_string());
+    let master_exists = match db.prepare_v2(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'crsql_master'",
+    ) {
+        Ok(stmt) => match stmt.step() {
+            Ok(ResultCode::ROW) => "yes",
+            Ok(_) => "no",
+            Err(_) => "error",
+        },
+        Err(_) => "error",
+    };
+    format!(
+        "cr-sqlite config refresh failed: operation={}, key={}, rc={}, sqlite_error={}, autocommit={}, data_version={}, checked_this_tx={}, crsql_master={}, table_infos={:p}, write_version={}, use_version={}, sync_log_version={}, merge_equal_values={}",
+        operation,
+        key.unwrap_or("<none>"),
+        sqlite_rc,
+        sqlite_error,
+        db.get_autocommit(),
+        (*ext_data).pragmaDataVersion,
+        (*ext_data).checkedConfigThisTx,
+        master_exists,
+        (*ext_data).tableInfos,
+        (*ext_data).metadataWriteVersion,
+        (*ext_data).metadataUseVersion,
+        (*ext_data).syncLogVersion,
+        (*ext_data).mergeEqualValues,
+    )
+}
+
 pub unsafe fn ensure_config_current(
     db: *mut sqlite_nostd::sqlite3,
     ext_data: *mut crsql_ExtData,
-) -> Result<(), ResultCode> {
+) -> Result<(), String> {
     // Read-only/autocommit statements do not invoke the commit hook, so a
     // transaction flag would otherwise remain set forever after the first
     // SELECT. In autocommit mode each operation is its own transaction and
@@ -50,7 +90,7 @@ pub unsafe fn ensure_config_current(
 
     let data_version_changed = crate::c::crsql_fetchPragmaDataVersion(db, ext_data);
     if data_version_changed < 0 {
-        return Err(ResultCode::ERROR);
+        return Err(config_refresh_error(db, ext_data, "PRAGMA data_version", None));
     }
 
     if data_version_changed != 0 {
@@ -61,11 +101,13 @@ pub unsafe fn ensure_config_current(
             (SYNC_LOG_VERSION, &mut (*ext_data).syncLogVersion),
         ];
         for (name, target) in config_values {
-            if let Some(value) = crate::util::get_master_value(
-                db,
-                &format!("config.{name}"),
-            )? {
-                *target = value as c_int;
+            let key = format!("config.{name}");
+            match crate::util::get_master_value(db, &key) {
+                Ok(Some(value)) => *target = value as c_int,
+                Ok(None) => {}
+                Err(_) => {
+                    return Err(config_refresh_error(db, ext_data, "read config", Some(name)));
+                }
             }
         }
     }
@@ -100,8 +142,8 @@ pub extern "C" fn crsql_config_set(
 
     let db = ctx.db_handle();
 
-    if unsafe { ensure_config_current(db, ext_data) }.is_err() {
-        ctx.result_error("Failed to refresh configuration");
+    if let Err(message) = unsafe { ensure_config_current(db, ext_data) } {
+        ctx.result_error(&message);
         ctx.result_error_code(ResultCode::ERROR);
         return;
     }
@@ -446,10 +488,12 @@ pub extern "C" fn crsql_config_get(
     let name = args[0].text();
     let ext_data = ctx.user_data() as *mut crsql_ExtData;
 
-    if name != DEFAULT_TS && unsafe { ensure_config_current(ctx.db_handle(), ext_data) }.is_err() {
-        ctx.result_error("Failed to refresh configuration");
-        ctx.result_error_code(ResultCode::ERROR);
-        return;
+    if name != DEFAULT_TS {
+        if let Err(message) = unsafe { ensure_config_current(ctx.db_handle(), ext_data) } {
+            ctx.result_error(&message);
+            ctx.result_error_code(ResultCode::ERROR);
+            return;
+        }
     }
 
     match name {
