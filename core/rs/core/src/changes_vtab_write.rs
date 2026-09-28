@@ -645,9 +645,9 @@ unsafe fn merge_insert(
     // Detect V2 wire packed row from the incoming data, not from local syncLogVersion config.
     // syncLogVersion controls what we emit, not what we accept. A node with sync-log-version=1
     // can receive V2 wire format changes from a peer with sync-log-version=2.
-    // V1 wire always has INTEGER col_vrsn (raw c.col_version).
-    // V2 wire always has BLOB col_vrsn (crsql_pack_varint_agg — varint count header + payload).
-    // So col_vrsn type alone distinguishes the two formats.
+    // V1 wire has INTEGER col_vrsn (raw c.col_version). V2 wire normally
+    // has a BLOB col_vrsn (crsql_pack_varint_agg), except PK-only rows,
+    // which use NULL because they have no column versions.
     // Tombstone rows (cid='-1' or cid='-2') are never packed regardless of wire format.
     let is_v2_hash_tombstone = insert_col == crate::consts::V2_HASH_TOMBSTONE_CID;
     let is_tombstone = insert_col == crate::c::DELETE_SENTINEL || is_v2_hash_tombstone;
@@ -814,13 +814,22 @@ unsafe fn merge_insert(
 
                 if insert_col == crate::c::INSERT_SENTINEL {
                     // Sentinel-only change (PK-only table insert, or sentinel-only row).
-                    // Pass col_version and seq through for the sentinel clock entry at col_id=0.
+                    // V2 PK-only rows omit col_version because the row lifecycle
+                    // version is already carried by cl. Keep the local synthetic
+                    // sentinel clock at its initial version for equal-CL tie-breaking.
+                    let sentinel_col_vrsn = if tbl_info.non_pks.is_empty()
+                        && col_vrsn_type == sqlite::ColumnType::Null
+                    {
+                        1
+                    } else {
+                        insert_col_vrsn
+                    };
                     (
                         Vec::new(),
                         Vec::new(),
                         Vec::new(),
                         Vec::new(),
-                        Some(insert_col_vrsn),
+                        Some(sentinel_col_vrsn),
                         Some(insert_seq),
                     )
                 } else {
