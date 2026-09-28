@@ -594,11 +594,13 @@ fn crsql_changes_query_for_table_v2_v2wire(
 
 /// PK-only table query: reads sentinel clock entries at col_id=0.
 /// No v2_col_map JOIN needed. Emits cid='-1', cval=NULL.
-/// Tombstone part is the same as the normal v1wire query.
+/// V2 wire mode omits col_version because PK-only rows have no column
+/// versions; their lifecycle version is already emitted as cl.
 fn crsql_changes_query_for_table_v2_pkonly(
     table_info: &TableInfo,
     pushed: &[PushedConstraint],
     need_seq_order: bool,
+    v2_wire: bool,
 ) -> Result<String, ResultCode> {
     if table_info.pks.is_empty() {
         return Err(ResultCode::ABORT);
@@ -612,11 +614,13 @@ fn crsql_changes_query_for_table_v2_pkonly(
     let (pk_expr, main_join) = build_pk_expr_and_join(table_info, &escaped)?;
 
     let seq_order_col = if need_seq_order { ", c.seq as _seq_order" } else { "" };
-    // PK-only clock arm has no cm join — cid is a literal sentinel,
-    // col_vrsn is c.col_version (scalar, non-aggregate).
+    // PK-only clock arm has no cm join — cid is a literal sentinel. In V2
+    // wire mode, col_version is NULL because only the row lifecycle version
+    // (cl) is meaningful for this table shape.
+    let col_vrsn_expr = if v2_wire { "NULL" } else { "c.col_version" };
     let tbl_expr = format!("'{}'", table_name_val);
     let pkonly_cid_expr = format!("'{}'", crate::c::INSERT_SENTINEL);
-    let cell_pushed_where = build_pushed_where(pushed, true, Some(&pkonly_cid_expr), Some("c.col_version"), Some(&tbl_expr));
+    let cell_pushed_where = build_pushed_where(pushed, true, Some(&pkonly_cid_expr), Some(col_vrsn_expr), Some(&tbl_expr));
     let cell_where = if cell_pushed_where.is_empty() {
         String::new()
     } else {
@@ -629,7 +633,7 @@ fn crsql_changes_query_for_table_v2_pkonly(
           '{table_name_val}' as tbl,
           crsql_pack_columns({pk_expr}) as pks,
           '{sentinel}' as cid,
-          c.col_version as col_vrsn,
+          {col_vrsn_expr} as col_vrsn,
           c.db_version as db_vrsn,
           site_tbl.site_id as site_id,
           c.cell_key >> {col_id_bits} as key,
@@ -644,6 +648,7 @@ fn crsql_changes_query_for_table_v2_pkonly(
         table_name_val = table_name_val,
         pk_expr = pk_expr,
         sentinel = crate::c::INSERT_SENTINEL,
+        col_vrsn_expr = col_vrsn_expr,
         main_join = main_join,
         seq_order_col = seq_order_col,
         cell_where = cell_where,
@@ -653,14 +658,15 @@ fn crsql_changes_query_for_table_v2_pkonly(
         col_id_bits = col_id_bits,
     );
 
-    // Tombstone rows (same pattern as v1wire — skip_hash reads PK directly)
-    // cid = DELETE_SENTINEL (-1), col_vrsn = t.cl for both tombstone types.
+    // Tombstone rows (same PK-compatible shape as v1wire). In V2 wire
+    // mode, col_version is omitted because cl is the row lifecycle version.
+    let tomb_col_vrsn_expr = if v2_wire { "NULL" } else { "t.cl" };
     let tomb_cid_expr = format!("'{}'", crate::c::DELETE_SENTINEL);
-    let tomb_pushed_where = build_pushed_where(pushed, false, Some(&tomb_cid_expr), Some("t.cl"), Some(&tbl_expr));
+    let tomb_pushed_where = build_pushed_where(pushed, false, Some(&tomb_cid_expr), Some(tomb_col_vrsn_expr), Some(&tbl_expr));
     let tombstone_rows = if table_info.skip_hash {
-        skip_hash_tombstone_query(table_info, &escaped, &table_name_val, "t.cl", &tomb_pushed_where, need_seq_order)
+        skip_hash_tombstone_query(table_info, &escaped, &table_name_val, tomb_col_vrsn_expr, &tomb_pushed_where, need_seq_order)
     } else {
-        hash_tombstone_query(table_info, &escaped, &table_name_val, &pk_list_tomb, "t.cl", &tomb_pushed_where, need_seq_order)
+        hash_tombstone_query(table_info, &escaped, &table_name_val, &pk_list_tomb, tomb_col_vrsn_expr, &tomb_pushed_where, need_seq_order)
     };
 
     Ok(format!(
@@ -700,7 +706,12 @@ fn query_for_table(
         SchemaVersion::V2 | SchemaVersion::V2AndV1 => {
             // PK-only tables use a dedicated query with sentinel at col_id=0
             if table_info.non_pks.is_empty() {
-                return crsql_changes_query_for_table_v2_pkonly(table_info, pushed, need_seq_order);
+                return crsql_changes_query_for_table_v2_pkonly(
+                    table_info,
+                    pushed,
+                    need_seq_order,
+                    sync_log_version == consts::SYNC_LOG_V2,
+                );
             }
             if sync_log_version == consts::SYNC_LOG_V2 {
                 crsql_changes_query_for_table_v2_v2wire(table_info, pushed, need_seq_order, scalar_mode)

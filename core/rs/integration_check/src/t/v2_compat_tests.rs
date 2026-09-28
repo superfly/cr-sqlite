@@ -860,6 +860,15 @@ fn v2_wire_pk_only_delete() -> Result<(), ResultCode> {
     sync_v2_wire(&db_a.db, &db_b.db, 0)?;
     assert!(tables_match(&db_a.db, &db_b.db, "foo", "id")?);
 
+    // PK-only V2-wire rows have no column version; cl is the row lifecycle version.
+    let changes = db_a.db.prepare_v2(
+        "SELECT cid, col_version FROM crsql_changes WHERE \"table\" = 'foo'",
+    )?;
+    while changes.step()? == ResultCode::ROW {
+        assert_eq!(changes.column_text(0)?, "-1");
+        assert_eq!(changes.column_type(1)?, sqlite::ColumnType::Null);
+    }
+
     // Delete and sync
     db_a.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db_a.db.exec_safe("DELETE FROM foo WHERE id = 1")?;
@@ -1471,21 +1480,19 @@ fn v2_wire_packed_generalized_pushdown() -> Result<(), ResultCode> {
     }
 
     // === col_version pushdown ===
-    // col_version >= 1 should return non-tombstone changes.
-    // Note: pk-only tombstones have col_version = t.cl (causal length), not NULL.
-    // Hash tombstones have col_version = NULL (pruned by NULL >= 1).
-    // So col_version >= 1 returns: all clock rows + pk-only tombstones with cl >= 1.
+    // col_version >= 1 should return regular clock changes. V2 tombstones,
+    // including PK-only tombstones, have no column version and are NULL.
     let stmt = db.db.prepare_v2("SELECT count(*) FROM crsql_changes WHERE col_version >= ?1")?;
     stmt.bind_int(1, 1)?;
     stmt.step()?;
     let count_colvrsn_ge1 = stmt.column_int(0);
     libc_println!("  col_version >= 1 count={}", count_colvrsn_ge1);
     assert!(count_colvrsn_ge1 > 0, "col_version >= 1 should return non-tombstone changes");
-    // Should exclude hash tombstones (col_version = NULL) but include pk-only tombstones (col_version = t.cl)
-    // hash_tbl tombstone is the only one with NULL col_version
-    assert_eq!(count_colvrsn_ge1, count_all - count_cid_del2,
-        "col_version >= 1 should return all except hash tombstones ({} - {} = {})",
-        count_all, count_cid_del2, count_all - count_cid_del2);
+    // Both hash and PK-only tombstones have NULL col_version in V2 wire mode.
+    let count_cid_del1 = count_where("SELECT count(*) FROM crsql_changes WHERE cid = '-1'");
+    assert_eq!(count_colvrsn_ge1, count_all - count_cid_del1 - count_cid_del2,
+        "col_version >= 1 should exclude all V2 tombstones ({} - {} - {} = {})",
+        count_all, count_cid_del1, count_cid_del2, count_all - count_cid_del1 - count_cid_del2);
 
     // col_version >= 100 should return nothing
     assert_eq!(count_where("SELECT count(*) FROM crsql_changes WHERE col_version >= 100"), 0,
