@@ -475,11 +475,19 @@ unsafe fn post_v2_merge(
     ext_data: *mut crsql_ExtData,
     insert_site_id: &[u8],
     insert_db_vrsn: sqlite::int64,
+    errmsg: *mut *mut c_char,
 ) -> Result<(), ResultCode> {
-    // Errors from insert_db_version are intentionally swallowed here because
-    // receiving our own change back with a higher db_version is legitimate.
     if !insert_site_id.is_empty() {
-        let _ = insert_db_version(ext_data, insert_site_id, insert_db_vrsn);
+        if let Err(rc) = insert_db_version(ext_data, insert_site_id, insert_db_vrsn) {
+            let err = CString::new(format!(
+                "Unable to insert db version {} for site id {:?}: {:?}",
+                insert_db_vrsn, insert_site_id, rc
+            ))?;
+            if !errmsg.is_null() {
+                *errmsg = err.into_raw();
+            }
+            return Err(rc);
+        }
     }
     Ok(())
 }
@@ -863,14 +871,18 @@ unsafe fn merge_insert(
             sentinel_seq,
             rowid,
             tbl_info_index,
+            errmsg,
         )
     };
 
     // Post-merge: db_version + dual-write V1 metadata.
-    // Errors are swallowed because post_v2_merge handles its own error cases
-    // gracefully (e.g., insert_db_version for self-originated changes).
     if result.is_ok() {
-        let _ = post_v2_merge((*tab).pExtData, insert_site_id, insert_db_vrsn);
+        post_v2_merge(
+            (*tab).pExtData,
+            insert_site_id,
+            insert_db_vrsn,
+            errmsg,
+        )?;
     }
 
     return result;
@@ -1278,7 +1290,11 @@ pub unsafe fn v1_to_v2_hydrate_row(
         let result = stmt.step();
         let v1_key = match result {
             Ok(ResultCode::ROW) => Some(stmt.column_int64(0)),
-            _ => None,
+            Ok(ResultCode::DONE) => None,
+            Ok(rc) | Err(rc) => {
+                reset_cached_stmt(stmt.stmt)?;
+                return Err(rc);
+            }
         };
         reset_cached_stmt(stmt.stmt)?;
         match v1_key {
@@ -1548,7 +1564,13 @@ unsafe fn v2_merge_insert_tombstone(
 
     // skip_hash + hash tombstone (cid=-2): cannot process — no hash→PK mapping exists.
     if tbl_info.skip_hash && is_v2_hash_tombstone {
-        return Ok(ResultCode::OK);
+        let err = CString::new(
+            "crsql - cannot apply V2 hash tombstone to a skip_hash table without PK values",
+        )?;
+        if !errmsg.is_null() {
+            *errmsg = err.into_raw();
+        }
+        return Err(ResultCode::ERROR);
     }
 
     // For skip_hash mode, we need unpacked PKs for lookups and tombstone insert.
@@ -1744,6 +1766,7 @@ unsafe fn v2_packed_merge(
     sentinel_seq: Option<i64>,
     rowid: *mut sqlite::int64,
     tbl_info_index: usize,
+    errmsg: *mut *mut c_char,
 ) -> Result<ResultCode, ResultCode> {
     // ts check is done at the top of merge_insert
     let escaped = crate::util::escape_ident(&tbl_info.tbl_name);
@@ -1789,10 +1812,33 @@ unsafe fn v2_packed_merge(
     // We use changes() after each statement to detect if rows were impacted.
     let mut impacted = false;
 
-    // Apply each column change.
-    // The upsert in v2_apply_value_change_colval handles conflict resolution:
+    // Resolve all column IDs before applying any column change. The upsert in
+    // v2_apply_value_change_colval handles conflict resolution:
     // - When CL won, local clocks are at col_version=0, so incoming always wins.
     // - When CL is equal, the WHERE clause compares col_version and values.
+    let mut col_ids = Vec::with_capacity(col_names.len());
+    for col_name in col_names {
+        let col_id = match tbl_info
+            .col_map
+            .iter()
+            .find(|(_, name)| name == col_name)
+            .map(|(id, _)| *id)
+        {
+            Some(col_id) => col_id,
+            None => {
+                let err = CString::new(format!(
+                    "crsql - received change for unknown column {} on table {}",
+                    col_name, tbl_info.tbl_name
+                ))?;
+                if !errmsg.is_null() {
+                    *errmsg = err.into_raw();
+                }
+                return Err(ResultCode::ERROR);
+            }
+        };
+        col_ids.push(col_id);
+    }
+
     for i in 0..col_names.len() {
         v2_apply_value_change_colval(
             db,
@@ -1801,6 +1847,7 @@ unsafe fn v2_packed_merge(
             &escaped,
             local_key,
             col_names[i],
+            col_ids[i],
             &unpacked_vals[i],
             col_vrsns[i],
             db_vrsn,
@@ -1982,6 +2029,7 @@ unsafe fn v2_apply_value_change_colval(
     escaped: &str,
     key: i64,
     col_name: &str,
+    col_id: i64,
     val: &ColumnValue,
     col_vrsn: i64,
     db_version: i64,
@@ -1994,17 +2042,7 @@ unsafe fn v2_apply_value_change_colval(
     // Get site ordinal
     let site_ordinal = get_site_ordinal_or_zero(ext_data, site_id)?;
 
-    // Get col_id from in-memory col_map (loaded at TableInfo creation)
-    let col_id = tbl_info
-        .col_map
-        .iter()
-        .find(|(_, name)| name == col_name)
-        .map(|(id, _)| *id);
-    if col_id.is_none() {
-        return Ok(());
-    }
-    let col_id = col_id.unwrap();
-    let cell_key = (key << col_id_bits) | (col_id as i64);
+    let cell_key = (key << col_id_bits) | col_id;
 
     // Build base table subquery for value comparison.
     // For rowid-key tables, use rowid alias directly (1 param).

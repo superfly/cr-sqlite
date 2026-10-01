@@ -33,8 +33,14 @@ fn sync_left_to_right(
         // re-preparing on every change row. Prepared inside the transaction so
         // the statement sees the correct schema/state.
         let stmt_r = r.prepare_v2("INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")?;
+        libc_println!("Sync start");
         while stmt_l.step()? == ResultCode::ROW {
             for x in 0..10 {
+                if x!=6 && x!=1 {
+                libc_println!("Value {}: {:?}", x+1, stmt_l.column_text(x));
+                } else {
+                    libc_println!("Value {}: {:?}", x+1, stmt_l.column_blob(x)?);
+                }
                 stmt_r.bind_value(x + 1, stmt_l.column_value(x)?)?;
             }
             match stmt_r.step() {
@@ -50,6 +56,8 @@ fn sync_left_to_right(
             let _ = stmt_r.reset();
             let _ = stmt_r.clear_bindings();
         }
+        libc_println!("Sync done");
+
         r.exec_safe("COMMIT")?;
         Ok(())
     })();
@@ -105,25 +113,17 @@ fn create_seed_db(path: &str) -> Result<(), ResultCode> {
     db.db.exec_safe("CREATE TABLE pk_only_tab (id INTEGER PRIMARY KEY NOT NULL)")?;
 
     // Register as CRRs (crsql_set_ts must be called before each crsql_as_crr)
-    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_config_set('default-ts', 1700000000)")?;
     db.db.exec_safe("SELECT crsql_as_crr('items')")?;
-    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('connections')")?;
-    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("SELECT crsql_as_crr('pk_only_tab')")?;
 
     // Insert data
-    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("INSERT INTO items VALUES (1, 'widget', 10)")?;
-    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("INSERT INTO items VALUES (2, 'gadget', 20)")?;
-    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("INSERT INTO items VALUES (3, 'gizmo', 30)")?;
-    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("INSERT INTO connections VALUES ('a', 'b', 5)")?;
-    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("INSERT INTO connections VALUES ('b', 'c', 10)")?;
-    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
     db.db.exec_safe("INSERT INTO pk_only_tab VALUES (42)")?;
 
     // Migrate to V2
@@ -131,7 +131,6 @@ fn create_seed_db(path: &str) -> Result<(), ResultCode> {
     let mut remaining = 1;
     let mut iterations = 0;
     while remaining > 0 && iterations < 100 {
-        db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
         let stmt = db.db.prepare_v2("SELECT crsql_incremental_maintenance(1000)")?;
         stmt.step()?;
         remaining = stmt.column_int(0) as i32;
@@ -193,6 +192,10 @@ fn create_seed_db(path: &str) -> Result<(), ResultCode> {
     let stmt = db.db.prepare_v2("SELECT count(*) FROM pk_only_tab")?;
     stmt.step()?;
     assert_eq!(stmt.column_int(0), 1, "pk_only_tab base data should be intact");
+
+    // Move site_id
+    let stmt = db.db.prepare_v2("UPDATE crsql_site_id SET ordinal=1337 WHERE ordinal=0")?;
+    stmt.step()?;
 
     Ok(())
 }
@@ -347,6 +350,19 @@ fn seeded_delete_propagates() -> Result<(), ResultCode> {
     let stmt = db_b.db.prepare_v2("SELECT count(*) FROM items WHERE id = 2")?;
     stmt.step()?;
     assert_eq!(stmt.column_int(0), 0, "B should have deleted id=2");
+
+    // The V2 tombstone should replace the seeded row metadata rather than
+    // leaving an alive V2 PK entry behind.
+    let stmt = db_b.db.prepare_v2(
+        "SELECT count(*) FROM items__crsql_v2_tombstones WHERE id = 2",
+    )?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int(0), 1, "B should retain the V2 tombstone for id=2");
+    let stmt = db_b.db.prepare_v2(
+        "SELECT count(*) FROM items__crsql_v2_pks WHERE id = 2",
+    )?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int(0), 0, "B should remove the alive V2 PK entry for id=2");
 
     // Other rows should be intact
     let stmt = db_b.db.prepare_v2("SELECT count(*) FROM items")?;

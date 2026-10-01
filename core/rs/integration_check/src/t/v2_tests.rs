@@ -1056,6 +1056,106 @@ fn test_dual_write_seq_consistency() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// Verify that all local changes in one transaction share a db_version and consume
+/// consecutive seq values across update and delete triggers.
+fn test_update_then_delete_seq_is_consecutive() -> Result<(), ResultCode> {
+    libc_println!("=== test_update_then_delete_seq_is_consecutive START ===");
+
+    let db = crate::opendb()?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+    db.db.exec_safe("SELECT crsql_config_set('sync-log-version', 2)")?;
+    db.db.exec_safe(
+        "CREATE TABLE consul_services (
+            id TEXT PRIMARY KEY NOT NULL,
+            address, meta, name, port, source, tags, updated_at
+        )",
+    )?;
+    db.db.exec_safe("CREATE TABLE machines (id TEXT PRIMARY KEY NOT NULL)")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('consul_services')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('machines')")?;
+
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe(
+        "INSERT INTO consul_services VALUES ('1', 'a', 'b', 'c', 1, 'd', 'e', 'f')",
+    )?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("INSERT INTO machines VALUES ('1')")?;
+
+    db.db.exec_safe("BEGIN")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
+    db.db.exec_safe(
+        "UPDATE consul_services
+         SET address = 'a2', meta = 'b2', name = 'c2', port = 2,
+             source = 'd2', tags = 'e2', updated_at = 'f2'
+         WHERE id = '1'",
+    )?;
+    db.db.exec_safe("DELETE FROM machines WHERE id = '1'")?;
+    db.db.exec_safe("COMMIT")?;
+
+    let stmt = db.db.prepare_v2(
+        "SELECT MAX(db_version) FROM consul_services__crsql_v2_clock",
+    )?;
+    stmt.step()?;
+    let db_version = stmt.column_int64(0);
+    let stmt = db.db.prepare_v2(
+        "SELECT MAX(db_version) FROM machines__crsql_v2_tombstones",
+    )?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int64(0), db_version, "changes should share one db_version");
+
+    let mut rows = Vec::new();
+    let stmt = db.db.prepare_v2(
+        "SELECT seq FROM consul_services__crsql_v2_clock WHERE db_version = ?",
+    )?;
+    stmt.bind_int64(1, db_version)?;
+    while stmt.step()? == ResultCode::ROW {
+        rows.push(("consul_services", stmt.column_int64(0)));
+    }
+    let stmt = db.db.prepare_v2(
+        "SELECT seq FROM machines__crsql_v2_tombstones WHERE db_version = ?",
+    )?;
+    stmt.bind_int64(1, db_version)?;
+    while stmt.step()? == ResultCode::ROW {
+        rows.push(("machines", stmt.column_int64(0)));
+    }
+    rows.sort_by_key(|row| row.1);
+
+    assert_eq!(rows.len(), 8, "update of 7 columns plus delete tombstone");
+    for (expected, row) in rows.iter().enumerate() {
+        assert_eq!(row.1, expected as i64, "non-consecutive seq at row {:?}", row);
+    }
+    assert_eq!(rows[7].0, "machines");
+
+    // Dual-write must preserve the same allocation in the V1 mirror.
+    let stmt = db.db.prepare_v2(
+        "SELECT MAX(db_version) FROM consul_services__crsql_clock",
+    )?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int64(0), db_version);
+    let stmt = db.db.prepare_v2("SELECT MAX(db_version) FROM machines__crsql_clock")?;
+    stmt.step()?;
+    assert_eq!(stmt.column_int64(0), db_version);
+
+    let mut v1_seqs = Vec::new();
+    for sql in [
+        "SELECT seq FROM consul_services__crsql_clock WHERE db_version = ?",
+        "SELECT seq FROM machines__crsql_clock WHERE db_version = ?",
+    ] {
+        let stmt = db.db.prepare_v2(sql)?;
+        stmt.bind_int64(1, db_version)?;
+        while stmt.step()? == ResultCode::ROW {
+            v1_seqs.push(stmt.column_int64(0));
+        }
+    }
+    v1_seqs.sort_unstable();
+    assert_eq!(v1_seqs, (0..8).collect::<Vec<_>>(), "V1 mirror seqs diverged");
+
+    libc_println!("=== test_update_then_delete_seq_is_consecutive PASS ===");
+    Ok(())
+}
+
 /// Test deletes and resurrections in dual-write mode.
 /// V1 and V2 have a known semantic difference: when a row is deleted then resurrected,
 /// V1 keeps the delete sentinel in __crsql_clock (cid=-1), but V2 removes the tombstone
@@ -1851,6 +1951,53 @@ fn test_tombstone_conflict_resolution() -> Result<(), ResultCode> {
     Ok(())
 }
 
+/// A V2 merge must report failures while recording the received db_version.
+/// The merge itself may have run, but the caller must not observe success when
+/// post-merge bookkeeping fails.
+fn test_v2_merge_propagates_db_version_error() -> Result<(), ResultCode> {
+    libc_println!("=== test_v2_merge_propagates_db_version_error START ===");
+
+    let db = crate::opendb()?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-use-version', 2)")?;
+    db.db.exec_safe("SELECT crsql_config_set('sync-log-version', 1)")?;
+    db.db.exec_safe("CREATE TABLE foo (id INTEGER PRIMARY KEY NOT NULL, value)")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+
+    let pk_stmt = db.db.prepare_v2("SELECT crsql_pack_columns(1)")?;
+    pk_stmt.step()?;
+    let pk = pk_stmt.column_blob(0)?.to_vec();
+
+    // Force the post-merge db_version write to fail while leaving the V2
+    // merge statements usable.
+    db.db.exec_safe("DROP TABLE crsql_db_versions")?;
+
+    let stmt = db.db.prepare_v2(
+        "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )?;
+    stmt.bind_text(1, "foo", Destructor::STATIC)?;
+    stmt.bind_blob(2, &pk, Destructor::STATIC)?;
+    stmt.bind_text(3, "value", Destructor::STATIC)?;
+    stmt.bind_text(4, "remote", Destructor::STATIC)?;
+    stmt.bind_int64(5, 1)?;
+    stmt.bind_int64(6, 1)?;
+    stmt.bind_blob(7, b"remote-site", Destructor::STATIC)?;
+    stmt.bind_int64(8, 1)?;
+    stmt.bind_int64(9, 1)?;
+    stmt.bind_int64(10, 1700000000)?;
+
+    assert!(stmt.step().is_err(), "db_version failure must reach INSERT INTO crsql_changes");
+    let errmsg = db.db.errmsg().unwrap_or_else(|_| "unknown".to_string());
+    assert!(
+        errmsg.contains("Unable to insert db version 1 for site id"),
+        "unexpected db_version error: {}",
+        errmsg
+    );
+    libc_println!("=== test_v2_merge_propagates_db_version_error PASS ===");
+    Ok(())
+}
+
 /// Test that all V2 write paths fail with descriptive errors when ts is not set.
 /// Each operation should return an error (not a SIGSEGV or silent corruption).
 fn test_ts_not_set_errors() -> Result<(), ResultCode> {
@@ -2501,6 +2648,7 @@ pub fn run_suite() -> Result<(), ResultCode> {
     test_migration_with_data()?;
     test_dual_write_multiple_rows()?;
     test_dual_write_seq_consistency()?;
+    test_update_then_delete_seq_is_consecutive()?;
     test_dual_write_delete_resurrect()?;
     test_dual_write_seq_fuzz()?;
     test_cross_mode_sync_roundtrip()?;
@@ -2510,6 +2658,7 @@ pub fn run_suite() -> Result<(), ResultCode> {
     test_v2_wire_packed_resurrection()?;
     test_dual_write_wire_convergence()?;
     test_tombstone_conflict_resolution()?;
+    test_v2_merge_propagates_db_version_error()?;
     test_ts_not_set_errors()?;
     test_config_persists_across_reopen()?;
     test_config_refreshes_between_connections()?;
