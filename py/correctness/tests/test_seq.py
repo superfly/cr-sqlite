@@ -5,6 +5,7 @@ from pprint import pprint
 def sync_left_to_right(l, r):
     changes = l.execute("SELECT * FROM crsql_changes")
     for change in changes:
+        r.execute("SELECT crsql_set_ts('1700000000')")
         r.execute(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
     r.commit()
@@ -13,6 +14,7 @@ def sync_left_to_right(l, r):
 def test_increments_by_one_in_tx():
     c = connect(":memory:")
     c.execute("create table foo (id primary key not null, a)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('foo')")
     c.commit()
 
@@ -27,6 +29,7 @@ def test_increments_by_one_in_tx():
 def test_resets_on_every_tx():
     c = connect(":memory:")
     c.execute("create table foo (id primary key not null, a)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('foo')")
     c.commit()
 
@@ -49,11 +52,13 @@ def test_preserved_on_merge():
     # the order we insert changes into crsql_changes should be the order they come back out when using seq
     c = connect(":memory:")
     c.execute("create table foo (id primary key not null, a)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('foo')")
     c.commit()
 
     c2 = connect(":memory:")
     c2.execute("create table foo (id primary key not null, a)")
+    c2.execute("SELECT crsql_set_ts('1700000000')")
     c2.execute("select crsql_as_crr('foo')")
     c2.commit()
 
@@ -78,6 +83,7 @@ def test_incr_by_one():
     # delete
     c = connect(":memory:")
     c.execute("create table foo (a primary key not null, b, c, d)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('foo')")
     c.commit()
 
@@ -115,6 +121,7 @@ def test_incr_by_one():
     assert (rows == [(0,), (1,), (2,)])
 
     c.execute("create table bar (a primary key not null, b);")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('bar')")
     c.commit()
 
@@ -133,6 +140,7 @@ def test_incr_by_one():
     # test update of pk vals with col vals
 
     c.execute("CREATE TABLE baz (a primary key not null)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('baz')")
     c.commit()
     c.execute("INSERT INTO baz VALUES (1)")
@@ -162,6 +170,7 @@ def test_incr_by_one():
 def test_seq_when_re_inserting():
     c = connect(":memory:")
     c.execute("create table foo (a primary key not null, b)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('foo')")
     c.commit()
 
@@ -190,6 +199,7 @@ def test_seq_when_re_inserting():
 def test_seq_when_updating_after_reinsert():
     c = connect(":memory:")
     c.execute("create table foo (a primary key not null, b)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('foo')")
     c.commit()
 
@@ -214,6 +224,7 @@ def test_seq_when_updating_after_reinsert():
 def test_seq_when_resinserting_from_merge():
     c = connect(":memory:")
     c.execute("create table foo (a primary key not null, b)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('foo')")
     c.commit()
 
@@ -227,6 +238,7 @@ def test_seq_when_resinserting_from_merge():
 
     c2 = connect(":memory:")
     c2.execute("create table foo (a primary key not null, b)")
+    c2.execute("SELECT crsql_set_ts('1700000000')")
     c2.execute("select crsql_as_crr('foo')")
     c2.commit()
 

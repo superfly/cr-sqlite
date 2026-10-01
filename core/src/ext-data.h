@@ -12,6 +12,7 @@ struct crsql_ExtData {
   sqlite3_stmt *pPragmaSchemaVersionStmt;
   sqlite3_stmt *pPragmaDataVersionStmt;
   int pragmaDataVersion;
+  int checkedConfigThisTx;
 
   // this gets set at the start of each transaction on the first invocation
   // to crsql_next_db_version()
@@ -47,8 +48,13 @@ struct crsql_ExtData {
   sqlite3_stmt *pSelectClockTablesStmt;
 
   int mergeEqualValues;
+  int metadataWriteVersion;
+  int metadataUseVersion;
+  int syncLogVersion;
   unsigned long long timestamp;
+  unsigned long long defaultTimestamp;
   void *ordinalMap;
+  sqlite3_stmt *pConfigValueStmt;
 };
 
 crsql_ExtData *crsql_newExtData(sqlite3 *db);

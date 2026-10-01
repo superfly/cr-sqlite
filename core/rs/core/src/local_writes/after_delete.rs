@@ -7,7 +7,7 @@ use sqlite::Context;
 use sqlite::ResultCode;
 use sqlite_nostd as sqlite;
 
-use crate::{c::crsql_ExtData, tableinfo::TableInfo};
+use crate::{c::crsql_ExtData, tableinfo::TableInfo, config};
 
 use super::bump_seq;
 use super::mark_locally_deleted;
@@ -41,6 +41,24 @@ fn after_delete(
     tbl_info: &mut TableInfo,
     pks_old: &[*mut value],
 ) -> Result<ResultCode, String> {
+    let mwv = unsafe { (*ext_data).metadataWriteVersion };
+
+    // Mode 3 (V2-only): write to V2 only
+    if mwv == config::METADATA_VERSION_V2 {
+        return super::v2::v2_after_delete(db, ext_data, tbl_info, pks_old);
+    }
+
+    if mwv == config::METADATA_VERSION_V2_AND_V1 {
+        // Mode 2 (Dual-write): hydrate V2 from V1 on-demand, then write to V2 first
+        let saved_seq = unsafe { (*ext_data).seq };
+        unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_old) }
+            .map_err(|_| "V1 to V2 hydration failed".to_string())?;
+        super::v2::v2_after_delete(db, ext_data, tbl_info, pks_old)?;
+        // Restore seq so V1 reuses the same values V2 just bumped.
+        unsafe { (*ext_data).seq = saved_seq; }
+    }
+
+    // V1 code path (write to V1)
     let ts = unsafe { (*ext_data).timestamp.to_string() };
     let db_version = crate::db_version::next_db_version(db, ext_data)?;
     let seq = bump_seq(ext_data);
