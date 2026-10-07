@@ -3,10 +3,18 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ffi::{c_char, c_void};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use crsql_bundle::test_exports::pack_columns::{unpack_columns, ColumnValue};
 use libc_print::libc_println;
 use sqlite::{Connection, Destructor, ManagedConnection, ResultCode};
 use sqlite_nostd as sqlite;
+
+static DEBUG_CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn test_debug_callback(_ctx: *mut c_void, _msg: *const u8, _len: usize) {
+    DEBUG_CALLBACK_COUNT.fetch_add(1, Ordering::SeqCst);
+}
 
 /// Test that crsql_pack_agg produces byte-identical output to crsql_pack_columns
 /// for the same values in the same order.
@@ -396,6 +404,48 @@ fn test_metadata_use_version_dispatch() -> Result<(), ResultCode> {
     assert!(v1_cids.contains(&"y".to_string()), "use-version=1 should have y column");
     assert!(v2_cids.contains(&"y".to_string()), "use-version=2 should have y column");
 
+    Ok(())
+}
+
+#[repr(C)]
+struct DebugCallbackRegistration {
+    callback: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize)>,
+    context: *mut c_void,
+}
+
+fn test_debug_callback_pointer_registration() -> Result<(), ResultCode> {
+    libc_println!("=== test_debug_callback_pointer_registration START ===");
+    let db = crate::opendb()?;
+    let registration = DebugCallbackRegistration {
+        callback: Some(test_debug_callback),
+        context: core::ptr::null_mut(),
+    };
+    let stmt = db.db.prepare_v2("SELECT crsql_set_debug_callback(?)")?;
+    let rc = sqlite::bind_pointer(
+        stmt.stmt,
+        1,
+        &registration as *const _ as *mut c_void,
+        b"crsql_debug_callback\0".as_ptr() as *const c_char,
+    );
+    assert_eq!(rc, ResultCode::OK as i32);
+    stmt.step()?;
+
+    let before = DEBUG_CALLBACK_COUNT.load(Ordering::SeqCst);
+    db.db.exec_safe("SELECT crsql_set_debug(1)")?;
+    db.db.exec_safe("CREATE TABLE debug_test (id INTEGER PRIMARY KEY NOT NULL)")?;
+    db.db.exec_safe("SELECT crsql_set_ts('1700000000')")?;
+    db.db.exec_safe("SELECT crsql_as_crr('debug_test')")?;
+    let maintenance = db.db.prepare_v2("SELECT crsql_incremental_maintenance(1000)")?;
+    maintenance.step()?;
+    assert!(
+        DEBUG_CALLBACK_COUNT.load(Ordering::SeqCst) > before,
+        "registered debug callback was not invoked"
+    );
+
+    let clear = db.db.prepare_v2("SELECT crsql_set_debug_callback(NULL)")?;
+    clear.step()?;
+    db.db.exec_safe("SELECT crsql_set_debug(0)")?;
+    libc_println!("=== test_debug_callback_pointer_registration PASS ===");
     Ok(())
 }
 
@@ -2643,6 +2693,7 @@ pub fn run_suite() -> Result<(), ResultCode> {
     test_hash_pk_different_types()?;
     test_varint_count_backward_compat()?;
     test_metadata_use_version_dispatch()?;
+    test_debug_callback_pointer_registration()?;
     test_packed_wire_format()?;
     test_v2_hash_tombstone()?;
     test_migration_with_data()?;
