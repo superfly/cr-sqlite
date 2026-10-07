@@ -18,16 +18,41 @@ static mut DEBUG_ENABLED: bool = false;
 static mut DEBUG_CALLBACK: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize)> = None;
 static mut DEBUG_CALLBACK_CONTEXT: *mut c_void = core::ptr::null_mut();
 
+#[inline]
+fn emit_debug(msg: &str) {
+    unsafe {
+        if let Some(callback) = DEBUG_CALLBACK {
+            callback(DEBUG_CALLBACK_CONTEXT, msg.as_ptr(), msg.len());
+        } else {
+            libc_print::libc_println!("[DEBUG] {}", msg);
+        }
+    }
+}
+
+#[inline]
 pub fn debug_log(msg: &str) {
     unsafe {
         if DEBUG_ENABLED {
-            if let Some(callback) = DEBUG_CALLBACK {
-                callback(DEBUG_CALLBACK_CONTEXT, msg.as_ptr(), msg.len());
-            } else {
-                libc_print::libc_println!("[DEBUG] {}", msg);
-            }
+            emit_debug(msg);
         }
     }
+}
+
+#[inline]
+pub fn debug_log_args(args: core::fmt::Arguments<'_>) {
+    unsafe {
+        if DEBUG_ENABLED {
+            let msg = alloc::format!("{}", args);
+            emit_debug(&msg);
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! crsql_debug {
+    ($($arg:tt)*) => {
+        $crate::debug::debug_log_args(core::format_args!($($arg)*))
+    };
 }
 
 pub unsafe extern "C" fn x_crsql_set_debug_callback(

@@ -95,7 +95,7 @@ unsafe fn incremental_maintenance(
 
     let table_infos =
         mem::ManuallyDrop::new(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>));
-    crate::debug::debug_log(&format!("incremental_maintenance: {} table infos", table_infos.len()));
+    crate::crsql_debug!("incremental_maintenance: {} table infos", table_infos.len());
 
     let mut total_remaining: i64 = 0;
 
@@ -162,7 +162,11 @@ unsafe fn incremental_maintenance(
             continue;
         }
 
-        crate::debug::debug_log(&format!("migration: checking table {} schema_version={:?}", tbl_info.tbl_name, tbl_info.schema_version));
+        crate::crsql_debug!(
+            "migration: checking table {} schema_version={:?}",
+            tbl_info.tbl_name,
+            tbl_info.schema_version
+        );
         // Only migrate tables that have V1 tables (V1 or V2AndV1 schema)
         if tbl_info.schema_version == SchemaVersion::V2 {
             continue;
@@ -186,13 +190,22 @@ unsafe fn incremental_maintenance(
 
         // Check if V2 tables already exist
         let has_v2 = crate::bootstrap_v2::has_v2_tables(db, &tbl_info.tbl_name)?;
-        crate::debug::debug_log(&format!("migration: {} has_v2={} queued={}", tbl_info.tbl_name, has_v2, migration_queued));
+        crate::crsql_debug!(
+            "migration: {} has_v2={} queued={}",
+            tbl_info.tbl_name,
+            has_v2,
+            migration_queued
+        );
         if !has_v2 && migration_queued {
             // First call for this table: create V2 tables
             match crate::bootstrap_v2::create_v2_tables(db, tbl_info) {
-                Ok(_) => crate::debug::debug_log(&format!("migration: created v2 tables for {}", tbl_info.tbl_name)),
+                Ok(_) => crate::crsql_debug!("migration: created v2 tables for {}", tbl_info.tbl_name),
                 Err(e) => {
-                    crate::debug::debug_log(&format!("migration: create_v2_tables failed for {}: {:?}", tbl_info.tbl_name, e));
+                    crate::crsql_debug!(
+                        "migration: create_v2_tables failed for {}: {:?}",
+                        tbl_info.tbl_name,
+                        e
+                    );
                     return Err(e);
                 }
             }
@@ -205,12 +218,17 @@ unsafe fn incremental_maintenance(
         // Migrate a chunk of rows from V1 to V2, using remaining budget
         match migrate_v1_to_v2_chunk(db, ext_data, tbl_info, budget) {
             Ok((processed, remaining)) => {
-                crate::debug::debug_log(&format!("migration: {} processed={} remaining={}", tbl_info.tbl_name, processed, remaining));
+                crate::crsql_debug!(
+                    "migration: {} processed={} remaining={}",
+                    tbl_info.tbl_name,
+                    processed,
+                    remaining
+                );
                 total_remaining += remaining;
                 budget -= processed;
             }
             Err(e) => {
-                crate::debug::debug_log(&format!("migration: FAILED for {}: {:?}", tbl_info.tbl_name, e));
+                crate::crsql_debug!("migration: FAILED for {}: {:?}", tbl_info.tbl_name, e);
                 // Propagate the error so the caller knows migration is stuck.
                 // Returning non-zero remaining would hide the real error.
                 return Err(e);
@@ -723,7 +741,11 @@ unsafe fn migrate_v1_to_v2_chunk(
     match result {
         Ok(processed) => {
             remaining_estimate -= processed;
-            crate::debug::debug_log(&format!("migrate_chunk: processed={} remaining_estimate={}", processed, remaining_estimate));
+            crate::crsql_debug!(
+                "migrate_chunk: processed={} remaining_estimate={}",
+                processed,
+                remaining_estimate
+            );
             if processed == 0 {
                 // Chunk was empty — migration complete for this table.
                 // Backfill v2_pks for untracked rows: base table rows that have no
@@ -766,7 +788,7 @@ unsafe fn migrate_v1_to_v2_chunk(
                 // Update cached estimate
                 crate::util::set_master_value(db, &total_key, remaining_estimate)?;
                 db.exec_safe("RELEASE migration_chunk")?;
-                crate::debug::debug_log(&format!("migrate_chunk: returning remaining={}", remaining_estimate));
+                crate::crsql_debug!("migrate_chunk: returning remaining={}", remaining_estimate);
                 Ok((processed, remaining_estimate))
             }
         }
@@ -775,7 +797,7 @@ unsafe fn migrate_v1_to_v2_chunk(
                 Ok(s) => s,
                 Err(_) => alloc::string::String::from("unknown"),
             };
-            crate::debug::debug_log(&format!("migrate_v1_to_v2_chunk FAILED: {:?} errmsg={}", e, errmsg));
+            crate::crsql_debug!("migrate_v1_to_v2_chunk FAILED: {:?} errmsg={}", e, errmsg);
             // Rollback the savepoint — ignore errors in case the savepoint is already gone
             let _ = db.exec_safe("ROLLBACK TO migration_chunk");
             let _ = db.exec_safe("RELEASE migration_chunk");
@@ -850,10 +872,11 @@ unsafe fn backfill_untracked_v2_pks(
     db.exec_safe(&sql)?;
     let inserted = db.changes64();
     if inserted > 0 {
-        crate::debug::debug_log(&format!(
+        crate::crsql_debug!(
             "backfill_untracked_v2_pks: {} inserted {} untracked rows",
-            tbl_info.tbl_name, inserted
-        ));
+            tbl_info.tbl_name,
+            inserted
+        );
     }
     Ok(())
 }
