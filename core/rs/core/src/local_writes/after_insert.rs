@@ -1,3 +1,4 @@
+use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
 use core::ffi::c_int;
@@ -6,14 +7,16 @@ use sqlite::value;
 use sqlite::Context;
 use sqlite::ResultCode;
 use sqlite_nostd as sqlite;
+use sqlite_nostd::Value;
 
-use crate::{c::crsql_ExtData, tableinfo::TableInfo};
+use crate::{c::crsql_ExtData, tableinfo::TableInfo, config, consts};
 
 use super::bump_seq;
 use super::trigger_fn_preamble;
 
 /**
- * crsql_after_insert("table", pk_values...)
+ * crsql_after_insert("table", pk_values..., [rowid_value])
+ * The rowid_value is appended when the table key_is_rowid.
  */
 pub unsafe extern "C" fn x_crsql_after_insert(
     ctx: *mut sqlite::context,
@@ -21,7 +24,13 @@ pub unsafe extern "C" fn x_crsql_after_insert(
     argv: *mut *mut sqlite::value,
 ) {
     let result = trigger_fn_preamble(ctx, argc, argv, |table_info, values, ext_data| {
-        after_insert(ctx.db_handle(), ext_data, table_info, &values[1..])
+        let (pks_new, rowid_val) = if table_info.key_is_rowid {
+            let len = values.len();
+            (&values[1..len - 1], Some(values[len - 1]))
+        } else {
+            (&values[1..], None)
+        };
+        after_insert(ctx.db_handle(), ext_data, table_info, pks_new, rowid_val)
     });
 
     match result {
@@ -39,7 +48,47 @@ fn after_insert(
     ext_data: *mut crsql_ExtData,
     tbl_info: &mut TableInfo,
     pks_new: &[*mut value],
+    rowid_val: Option<*mut value>,
 ) -> Result<ResultCode, String> {
+    // Enforce rowid range for rowid-key tables
+    if tbl_info.key_is_rowid {
+        let rowid = rowid_val.ok_or("rowid-key table missing rowid value")?.int64();
+        if rowid < 0 || rowid >= consts::MAX_ROWID_KEY {
+            return Err(format!(
+                "rowid out of cr-sqlite safe range [0, {})",
+                consts::MAX_ROWID_KEY
+            ));
+        }
+    }
+
+    let mwv = unsafe { (*ext_data).metadataWriteVersion };
+
+    // Mode 3 (V2-only): write to V2 only
+    if mwv == config::METADATA_VERSION_V2 {
+        let rowid = if tbl_info.key_is_rowid {
+            Some(rowid_val.ok_or("rowid-key table missing rowid value")?.int64())
+        } else {
+            None
+        };
+        return super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new, rowid);
+    }
+
+    if mwv == config::METADATA_VERSION_V2_AND_V1 {
+        // Mode 2 (Dual-write): hydrate V2 from V1 on-demand, then write to V2 first
+        let saved_seq = unsafe { (*ext_data).seq };
+        let rowid = if tbl_info.key_is_rowid {
+            Some(rowid_val.ok_or("rowid-key table missing rowid value")?.int64())
+        } else {
+            None
+        };
+        unsafe { crate::changes_vtab_write::v1_to_v2_hydrate_row_from_values(db, ext_data, tbl_info, pks_new) }
+            .map_err(|_| "V1 to V2 hydration failed".to_string())?;
+        super::v2::v2_after_insert(db, ext_data, tbl_info, pks_new, rowid)?;
+        // Restore seq so V1 reuses the same values V2 just bumped.
+        unsafe { (*ext_data).seq = saved_seq; }
+    }
+
+    // V1 code path (write to V1)
     let ts = unsafe { (*ext_data).timestamp.to_string() };
 
     let db_version = crate::db_version::next_db_version(db, ext_data)?;

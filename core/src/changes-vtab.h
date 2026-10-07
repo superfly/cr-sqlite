@@ -4,33 +4,36 @@
  *
  * To fetch a changeset:
  * ```sql
- * SELECT * FROM crsql_chages WHERE site_id IS NOT SITE_ID AND version > V
+ * SELECT * FROM crsql_changes WHERE site_id IS NOT crsql_site_id() AND db_version > V
  * ```
  *
  * The site id parameter is used to prevent a site from fetching its own
  * changes that were patched into the remote.
  *
- * The version parameter is used to get changes after a specific version.
+ * The db_version parameter is used to get changes after a specific version.
  * Sites should keep track of the latest version they've received from other
  * sites and use that number as a cursor to fetch future changes.
  *
  * The changes table has the following columns:
  * 1. table - the name of the table the patch is from
- * 2. pk - the primary key(s) that identify the row to be patched. If the
- *    table has many columns that comprise the primary key then
+ * 2. pk - the primary key(s) that identify the row to be patched, as a blob.
+ *    If the table has many columns that comprise the primary key then
  *    the values are quote concatenated in pk order.
- * 3. col_vals - the values to patch. quote concatenated in cid order.
- * 4. col_versions - the cids of the changed columns and the versions of those
- * columns
- * 5. version - the min version of the patch. Used for filtering and for sites
- * to update their "last seen" version from other sites
- * 6. site_id - the site_id that is responsible for the update. If this is 0
+ * 3. cid - the column id(s) of the changed column(s), as a blob.
+ * 4. val - the value(s) to patch, as a blob.
+ * 5. col_version - the version of the changed column(s).
+ * 6. db_version - the min db_version of the patch. Used for filtering and for
+ *    sites to update their "last seen" version from other sites.
+ * 7. site_id - the site_id that is responsible for the update. If this is 0
  *    then the update was made locally.
+ * 8. cl - the causality layer / change layer counter.
+ * 9. seq - the sequence blob, used to order changes within a db_version.
+ * 10. ts - the timestamp of the change as text.
  *
  * To apply a changeset:
  * ```sql
- * INSERT INTO changes (table, pk, col_vals, col_versions, site_id) VALUES
- * (...)
+ * INSERT INTO crsql_changes ([table], pk, cid, val, col_version, db_version,
+ * site_id, cl, seq, ts) VALUES (...)
  * ```
  */
 #ifndef CHANGES_VTAB_H
@@ -105,6 +108,16 @@ struct crsql_Changes_cursor {
 
   sqlite3_int64 changesRowid;
   int tblInfoIdx;
+
+  /* Cache for pChangesStmt reuse across xFilter calls.
+   * On DONE, pChangesStmt is reset and moved to cached_pChangesStmt;
+   * pChangesStmt is set to null so changes_eof sees EOF.
+   * On next xFilter, if cache key matches, we move it back. */
+  sqlite3_stmt *cached_pChangesStmt;
+  const char *cached_idx_str;
+  int cached_meta_use_version;
+  int cached_sync_log_version;
+  int cached_schema_version;
 };
 
 #endif

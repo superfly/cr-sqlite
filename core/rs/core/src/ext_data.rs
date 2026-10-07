@@ -24,6 +24,9 @@ pub fn recreate_db_version_stmt(
     db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
 ) -> Result<ResultCode, ResultCode> {
+    if ext_data.is_null() {
+        return Err(ResultCode::ERROR);
+    }
     let clock_tables_stmt = unsafe { (*ext_data).pSelectClockTablesStmt };
     let db_version_stmt = unsafe { (*ext_data).pDbVersionStmt };
 

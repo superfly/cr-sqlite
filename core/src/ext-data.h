@@ -2,16 +2,25 @@
 #define CRSQLITE_EXTDATA_H
 
 #include "sqlite3ext.h"
+#include <stddef.h>
 SQLITE_EXTENSION_INIT3
 
 // NOTE: any changes here must be updated in `c.rs` until we've finished porting
 // to rust.
 typedef struct crsql_ExtData crsql_ExtData;
+typedef void (*crsql_debug_callback_fn)(void *, const unsigned char *, size_t);
+typedef struct crsql_DebugCallback crsql_DebugCallback;
+struct crsql_DebugCallback {
+  crsql_debug_callback_fn callback;
+  void *context;
+};
+
 struct crsql_ExtData {
   // perma statement -- used to check db schema version
   sqlite3_stmt *pPragmaSchemaVersionStmt;
   sqlite3_stmt *pPragmaDataVersionStmt;
   int pragmaDataVersion;
+  int checkedConfigThisTx;
 
   // this gets set at the start of each transaction on the first invocation
   // to crsql_next_db_version()
@@ -47,8 +56,13 @@ struct crsql_ExtData {
   sqlite3_stmt *pSelectClockTablesStmt;
 
   int mergeEqualValues;
+  int metadataWriteVersion;
+  int metadataUseVersion;
+  int syncLogVersion;
   unsigned long long timestamp;
+  unsigned long long defaultTimestamp;
   void *ordinalMap;
+  sqlite3_stmt *pConfigValueStmt;
 };
 
 crsql_ExtData *crsql_newExtData(sqlite3 *db);

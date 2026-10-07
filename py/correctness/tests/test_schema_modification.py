@@ -12,16 +12,20 @@ def test_c1_4_no_primary_keys():
     c = connect(":memory:")
     c.execute("create table foo (a)")
     with pytest.raises(Exception) as e_info:
+        c.execute("SELECT crsql_set_ts('1700000000')")
         c.execute("select crsql_as_crr('foo')")
 
 
 def test_c1_3_quoted_identifiers():
     c = connect(":memory:")
     c.execute("create table \"foo\" (a primary key not null)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('foo')")
     c.execute("create table `bar` (a primary key not null)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('bar')")
     c.execute("create table [baz] (a primary key not null)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('baz')")
 
     def check_clock(t): return c.execute(
@@ -35,6 +39,7 @@ def test_c1_3_quoted_identifiers():
 def test_c1_c5_compound_primary_key():
     c = connect(":memory:")
     c.execute("create table foo (a not null, b not null, c, primary key (a, b))")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('foo')")
 
     c.execute(
@@ -48,6 +53,7 @@ def test_c1_c5_compound_primary_key():
 def test_c1_6_single_primary_key():
     c = connect(":memory:")
     c.execute("create table foo (a not null, b, c, primary key (a))")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('foo')")
     c.execute(
         "SELECT key, col_version, col_name, db_version, site_id FROM foo__crsql_clock").fetchall()
@@ -61,6 +67,7 @@ def test_c2_create_index():
 
     # TODO: create index is silent failing in some cases?
     c.execute("create index foo_idx on foo (b)")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("select crsql_as_crr('foo')")
     idx_info = c.execute(
         "select * from pragma_index_info('foo_idx')").fetchall()
@@ -71,6 +78,7 @@ def test_c2_create_index():
 def setup_alter_test():
     c = connect(":memory:")
     c.execute("CREATE TABLE todo (id PRIMARY KEY NOT NULL, name, complete, list);")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('todo');")
     c.execute("INSERT INTO todo VALUES (1, 'cook', 0, 'home');")
     c.commit()
@@ -89,9 +97,11 @@ def test_drop_clock_on_col_remove():
     assert (clock_entries == [(1, 1, 1, 'complete', 0),
             (1, 1, 1, 'list', 0), (1, 1, 1, 'name', 0)])
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('todo');")
     # Dropping a column should remove its entries from our replication logs.
     c.execute("ALTER TABLE todo DROP COLUMN list;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('todo');")
     c.commit()
 
@@ -115,9 +125,11 @@ def test_backfill_col_add():
     # Default value colums, by the same logic then, also
     # do not need a backfill.
     c = setup_alter_test()
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('todo');")
     c.execute("ALTER TABLE todo ADD COLUMN assignee;")
     c.execute("ALTER TABLE todo ADD COLUMN due_date DEFAULT '2018-01-01';")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('todo');")
     c.commit()
 
@@ -164,8 +176,10 @@ def test_backfill_clocks_on_rename():
     c = setup_alter_test()
     c.execute("INSERT INTO todo VALUES (2, 'clean', 0, 'home');")
     c.commit()
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('todo');")
     c.execute("ALTER TABLE todo RENAME name TO task;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('todo');")
     c.commit()
     changes = c.execute(changes_with_versions_query).fetchall()
@@ -185,8 +199,10 @@ def test_delete_sentinels_not_lost():
     # starting off correctly
     assert (changes == [('todo', b'\x01\t\x01', '-1', None, 2, 2)])
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('todo');")
     c.execute("ALTER TABLE todo RENAME name TO task;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('todo');")
     c.commit()
 
@@ -198,6 +214,7 @@ def test_pk_only_sentinels():
     c = connect(":memory:")
     c.execute(
         "CREATE TABLE assoc (id1 NOT NULL, id2 NOT NULL, PRIMARY KEY (id1, id2));")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('assoc');")
     c.execute("INSERT INTO assoc VALUES (1, 2);")
     c.commit()
@@ -206,8 +223,10 @@ def test_pk_only_sentinels():
     assert (
         changes == [('assoc', b'\x02\x09\x01\x09\x02', '-1', None)])
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('assoc');")
     c.execute("ALTER TABLE assoc ADD COLUMN data;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('assoc');")
     c.commit()
 
@@ -232,6 +251,7 @@ def test_backfill_existing_data():
     c.execute("INSERT INTO foo (id) VALUES (3);")
     c.commit()
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.commit()
 
@@ -253,6 +273,7 @@ def test_backfill_moves_dbversion():
     c.execute("INSERT INTO foo VALUES (2, 'baz');")
     c.commit()
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.commit()
 
@@ -261,6 +282,7 @@ def test_backfill_moves_dbversion():
     c.execute("INSERT INTO bar VALUES (1, 'bar');")
     c.execute("INSERT INTO bar (id) VALUES (3);")
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('bar');")
     c.commit()
 
@@ -280,6 +302,7 @@ def test_backfill_for_alter_does_not_move_dbversion():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (id PRIMARY KEY NOT NULL, name TEXT DEFAULT NULL);")
     c.execute("INSERT INTO foo VALUES (1, 'bar');")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.commit()
     site_id = get_site_id(c)
@@ -287,6 +310,7 @@ def test_backfill_for_alter_does_not_move_dbversion():
     # - change name to have a default value
     # - add an age column (nullable)
     # - add a row with a name and age
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('foo');")
     c.execute(
         "CREATE TABLE new_foo(id PRIMARY KEY NOT NULL, name TEXT DEFAULT 'none', age INTEGER DEFAULT NULL);")
@@ -296,6 +320,7 @@ def test_backfill_for_alter_does_not_move_dbversion():
     c.execute("INSERT INTO new_foo (id, name, age) VALUES (2, 'baz', 33);")
     c.execute("DROP TABLE foo;")
     c.execute("ALTER TABLE new_foo RENAME TO foo;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('foo');")
 
     # now:
@@ -317,11 +342,14 @@ def test_add_col_with_default():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (id PRIMARY KEY NOT NULL, name TEXT DEFAULT NULL);")
     c.execute("INSERT INTO foo VALUES (1, 'bar');")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.commit()
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('foo');")
     c.execute("ALTER TABLE foo ADD COLUMN age INTEGER DEFAULT 0;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('foo');")
 
     changes = c.execute(full_changes_query).fetchall()
@@ -337,11 +365,14 @@ def test_add_col_nullable():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (id PRIMARY KEY NOT NULL, name TEXT DEFAULT NULL);")
     c.execute("INSERT INTO foo VALUES (1, 'bar');")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.commit()
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('foo');")
     c.execute("ALTER TABLE foo ADD COLUMN age INTEGER DEFAULT NULL;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('foo');")
 
     changes = c.execute(full_changes_query).fetchall()
@@ -353,11 +384,14 @@ def test_add_col_implicit_nullable():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (id PRIMARY KEY NOT NULL, name TEXT DEFAULT NULL);")
     c.execute("INSERT INTO foo VALUES (1, 'bar');")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.commit()
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('foo');")
     c.execute("ALTER TABLE foo ADD COLUMN age INTEGER;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('foo');")
 
     changes = c.execute(full_changes_query).fetchall()
@@ -369,9 +403,11 @@ def test_add_col_through_12step():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (id PRIMARY KEY NOT NULL, name TEXT DEFAULT NULL);")
     c.execute("INSERT INTO foo (id) VALUES (3);")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.commit()
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('foo');")
     c.execute(
         "CREATE TABLE new_foo(id PRIMARY KEY NOT NULL, name TEXT DEFAULT NULL, age INTEGER DEFAULT NULL);")
@@ -382,6 +418,7 @@ def test_add_col_through_12step():
     c.execute("UPDATE new_foo SET age = 44 WHERE id = 3;")
     c.execute("DROP TABLE foo;")
     c.execute("ALTER TABLE new_foo RENAME TO foo;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('foo');")
 
     changes = c.execute(full_changes_query).fetchall()
@@ -397,6 +434,7 @@ def test_pk_only_table_backfill():
     c.execute("CREATE TABLE foo (id PRIMARY KEY NOT NULL);")
     c.execute("INSERT INTO foo VALUES (1);")
     c.execute("INSERT INTO foo VALUES (2);")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.commit()
 
@@ -418,6 +456,7 @@ def test_pk_and_default_backfill():
     c.execute("CREATE TABLE foo (id PRIMARY KEY NOT NULL, b);")
     c.execute("INSERT INTO foo (id) VALUES (1);")
     c.execute("INSERT INTO foo (id) VALUES (2);")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.commit()
 
@@ -431,9 +470,11 @@ def test_pk_and_default_backfill():
 def test_pk_and_default_backfill_post12step_with_new_rows():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (id PRIMARY KEY NOT NULL);")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.commit()
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('foo');")
     c.execute(
         "CREATE TABLE new_foo(id PRIMARY KEY NOT NULL, b);")
@@ -442,6 +483,7 @@ def test_pk_and_default_backfill_post12step_with_new_rows():
     c.execute("INSERT INTO new_foo (id) VALUES (2);")
     c.execute("DROP TABLE foo;")
     c.execute("ALTER TABLE new_foo RENAME TO foo;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('foo');")
     c.commit()
 
@@ -467,14 +509,17 @@ def test_add_column_and_set_column():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (id PRIMARY KEY NOT NULL);")
     c.execute("INSERT INTO foo (id) VALUES (3);")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.commit()
     changes = c.execute(full_changes_query).fetchall()
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('foo');")
     c.execute(
         "ALTER TABLE foo ADD COLUMN age INTEGER DEFAULT NULL;")
     c.execute("UPDATE foo SET age = 44 WHERE id = 3;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('foo');")
     c.commit()
 
@@ -489,16 +534,19 @@ def test_add_column_and_set_column():
 def test_remove_rows_on_alter():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b);")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.execute("INSERT INTO foo VALUES (1, 2);")
     c.execute("INSERT INTO foo VALUES (3, 4);")
     c.commit()
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('foo');")
     c.execute(
         "ALTER TABLE foo ADD COLUMN c INTEGER DEFAULT NULL;")
     c.execute("DELETE FROM foo WHERE a = 1;")
     c.execute("DELETE FROM foo WHERE a = 3;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('foo');")
     c.commit()
 
@@ -535,17 +583,20 @@ def test_change_existing_values_on_alter():
 def test_remove_col_from_pk():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a NOT NULL, b NOT NULL, c, PRIMARY KEY (a, b));")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.execute("INSERT INTO foo VALUES (1, 2, 3);")
     c.execute("INSERT INTO foo VALUES (4, 5, 6);")
     c.commit()
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('foo');")
     c.execute(
         "CREATE TABLE new_foo(a PRIMARY KEY NOT NULL, b, c);")
     c.execute("INSERT INTO new_foo SELECT * FROM foo;")
     c.execute("DROP TABLE foo;")
     c.execute("ALTER TABLE new_foo RENAME TO foo;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('foo');")
     c.commit()
 
@@ -564,6 +615,7 @@ def test_remove_col_from_pk():
 def test_remove_pk_column():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a NOT NULL, b NOT NULL, c, PRIMARY KEY (a, b));")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.commit()
 
@@ -571,12 +623,14 @@ def test_remove_pk_column():
     c.execute("INSERT INTO foo VALUES (4, 5, 6);")
     c.commit()
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('foo');")
     c.execute(
         "CREATE TABLE new_foo(b PRIMARY KEY NOT NULL, c);")
     c.execute("INSERT INTO new_foo SELECT b, c FROM foo;")
     c.execute("DROP TABLE foo;")
     c.execute("ALTER TABLE new_foo RENAME TO foo;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('foo');")
 
     changes = c.execute(full_changes_query).fetchall()
@@ -588,6 +642,7 @@ def test_remove_pk_column():
 def test_add_existing_col_to_pk():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b, c);")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.commit()
 
@@ -595,12 +650,14 @@ def test_add_existing_col_to_pk():
     c.execute("INSERT INTO foo VALUES (4, 5, 6);")
     c.commit()
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('foo');")
     c.execute(
         "CREATE TABLE new_foo(a NOT NULL, b NOT NULL, c, PRIMARY KEY (a, b));")
     c.execute("INSERT INTO new_foo SELECT * FROM foo;")
     c.execute("DROP TABLE foo;")
     c.execute("ALTER TABLE new_foo RENAME TO foo;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('foo');")
 
     changes = c.execute(full_changes_query).fetchall()
@@ -612,6 +669,7 @@ def test_add_existing_col_to_pk():
 def test_add_new_col_to_pk():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b);")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.commit()
 
@@ -619,12 +677,14 @@ def test_add_new_col_to_pk():
     c.execute("INSERT INTO foo VALUES (4, 5);")
     c.commit()
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('foo');")
     c.execute(
         "CREATE TABLE new_foo(a NOT NULL, b, c NOT NULL, PRIMARY KEY (a, c));")
     c.execute("INSERT INTO new_foo SELECT a, b, b + 1 FROM foo;")
     c.execute("DROP TABLE foo;")
     c.execute("ALTER TABLE new_foo RENAME TO foo;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('foo');")
 
     changes = c.execute(full_changes_query).fetchall()
@@ -643,6 +703,7 @@ def test_add_new_col_to_pk():
 def test_rename_pk_column():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b);")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.commit()
 
@@ -650,11 +711,13 @@ def test_rename_pk_column():
     c.execute("INSERT INTO foo VALUES (4, 5);")
     c.commit()
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('foo');")
     c.execute("CREATE TABLE new_foo(c PRIMARY KEY NOT NULL, b)")
     c.execute("INSERT INTO new_foo SELECT a, b FROM foo;")
     c.execute("DROP TABLE foo;")
     c.execute("ALTER TABLE new_foo RENAME TO foo;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('foo');")
     c.commit()
 
@@ -672,6 +735,7 @@ def test_pk_only_table_pk_membership():
 def test_changing_values_in_primary_key_columns():
     c = connect(":memory:")
     c.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b);")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('foo');")
     c.commit()
 
@@ -679,8 +743,10 @@ def test_changing_values_in_primary_key_columns():
     c.execute("INSERT INTO foo VALUES (4, 5);")
     c.commit()
 
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_begin_alter('foo');")
     c.execute("UPDATE foo SET a = 2 WHERE a = 1;")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_commit_alter('foo');")
     c.commit()
 

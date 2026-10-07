@@ -1,15 +1,85 @@
+use core::ffi::{c_char, c_void};
 use sqlite::{context, value};
 use sqlite_nostd as sqlite;
 
-// Global context for logging - will be set during initialization
-static mut DEBUG_ENABLED: bool = false;
+pub const DEBUG_CALLBACK_TYPE: &[u8] = b"crsql_debug_callback\0";
 
-pub fn debug_log(msg: &str) {
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CrsqlDebugCallback {
+    pub callback:
+        Option<unsafe extern "C" fn(*mut c_void, *const u8, usize)>,
+    pub context: *mut c_void,
+}
+
+// Debug state is process-global because debug_log is called from code paths that
+// do not have a connection-specific ExtData pointer available.
+static mut DEBUG_ENABLED: bool = false;
+static mut DEBUG_CALLBACK: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize)> = None;
+static mut DEBUG_CALLBACK_CONTEXT: *mut c_void = core::ptr::null_mut();
+
+#[inline]
+fn emit_debug(msg: &str) {
     unsafe {
-        if DEBUG_ENABLED {
+        if let Some(callback) = DEBUG_CALLBACK {
+            callback(DEBUG_CALLBACK_CONTEXT, msg.as_ptr(), msg.len());
+        } else {
             libc_print::libc_println!("[DEBUG] {}", msg);
         }
     }
+}
+
+#[inline]
+pub fn debug_log(msg: &str) {
+    unsafe {
+        if DEBUG_ENABLED {
+            emit_debug(msg);
+        }
+    }
+}
+
+#[inline]
+pub fn debug_log_args(args: core::fmt::Arguments<'_>) {
+    unsafe {
+        if DEBUG_ENABLED {
+            let msg = alloc::format!("{}", args);
+            emit_debug(&msg);
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! crsql_debug {
+    ($($arg:tt)*) => {
+        $crate::debug::debug_log_args(core::format_args!($($arg)*))
+    };
+}
+
+pub unsafe extern "C" fn x_crsql_set_debug_callback(
+    ctx: *mut context,
+    argc: i32,
+    argv: *mut *mut value,
+) {
+    if argc != 1 {
+        let msg = b"crsql_set_debug_callback expects one pointer argument";
+        sqlite::result_error(ctx, msg.as_ptr() as *mut c_char, msg.len() as i32);
+        return;
+    }
+
+    let registration = sqlite::value_pointer(
+        *argv,
+        DEBUG_CALLBACK_TYPE.as_ptr() as *mut c_char,
+    ) as *mut CrsqlDebugCallback;
+
+    if registration.is_null() {
+        DEBUG_CALLBACK = None;
+        DEBUG_CALLBACK_CONTEXT = core::ptr::null_mut();
+    } else {
+        DEBUG_CALLBACK = (*registration).callback;
+        DEBUG_CALLBACK_CONTEXT = (*registration).context;
+    }
+
+    sqlite::result_int(ctx, 1);
 }
 
 pub unsafe extern "C" fn x_crsql_set_debug(ctx: *mut context, argc: i32, argv: *mut *mut value) {

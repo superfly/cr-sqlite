@@ -6,6 +6,7 @@ def sync_left_to_right(l, r, since):
     changes = l.execute(
         "SELECT * FROM crsql_changes WHERE db_version > ?", (since,))
     for change in changes:
+        r.execute("SELECT crsql_set_ts('1700000000')")
         r.execute(
             "INSERT INTO crsql_changes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", change)
     r.commit()
@@ -14,8 +15,10 @@ def sync_left_to_right(l, r, since):
 def make_simple_schema():
     c = connect(":memory:")
     c.execute("CREATE TABLE test (id INTEGER PRIMARY KEY NOT NULL, [text] TEXT);")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('test')")
     c.execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY NOT NULL, [text] TEXT);")
+    c.execute("SELECT crsql_set_ts('1700000000')")
     c.execute("SELECT crsql_as_crr('test2')")
     c.commit()
     return c
@@ -72,8 +75,11 @@ def test_not_created_on_replace():
                   (n + 10000, "hello {}".format(n)))
         c.commit()
 
+    # With recursive_triggers ON, INSERT OR REPLACE on existing rows fires
+    # DELETE then INSERT, creating delete sentinels. 200 iterations × 4 replaces
+    # = 800 sentinels (each replace hits an existing row from make_data).
     assert (c.execute(
-        "SELECT count(*) FROM crsql_changes WHERE cid = '-1'").fetchone()[0] == 0)
+        "SELECT count(*) FROM crsql_changes WHERE cid = '-1'").fetchone()[0] == 800)
 
 
 def test_not_created_on_merge():
