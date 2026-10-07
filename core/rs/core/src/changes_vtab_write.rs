@@ -418,7 +418,9 @@ pub unsafe extern "C" fn crsql_merge_insert(
     rowid: *mut sqlite::int64,
     errmsg: *mut *mut c_char,
 ) -> c_int {
-    match merge_insert(vtab, argc, argv, rowid, errmsg) {
+    let result = merge_insert(vtab, argc, argv, rowid, errmsg);
+    crate::crsql_debug!("remote merge callback result={:?}", result);
+    match result {
         Err(rc) | Ok(rc) => rc as c_int,
     }
 }
@@ -514,6 +516,14 @@ unsafe fn mirror_v1_alive_transition(
     local_cl: i64,
 ) -> Result<(), ResultCode> {
     let v1_key = tbl_info.get_or_create_key(db, pks)?;
+    crate::crsql_debug!(
+        "v2->v1 lifecycle mirror table={} key={} incoming_cl={} local_cl={} seq={}",
+        tbl_info.tbl_name,
+        v1_key,
+        incoming_cl,
+        local_cl,
+        seq
+    );
     if incoming_cl > local_cl && incoming_cl > 1 {
         // Match the V1 resurrection semantics: old non-sentinel clocks are
         // retained at version zero until winning column changes replace them.
@@ -553,6 +563,15 @@ unsafe fn mirror_v1_value_change(
         return Ok(());
     }
     let key = tbl_info.get_or_create_key(db, pks)?;
+    crate::crsql_debug!(
+        "v2->v1 value mirror table={} key={} column={} col_version={} db_version={} seq={}",
+        tbl_info.tbl_name,
+        key,
+        col_name,
+        col_vrsn,
+        db_version,
+        seq
+    );
     set_winner_clock(
         db, ext_data, tbl_info, key, col_name, col_vrsn, db_version, site_id, seq, ts,
     )?;
@@ -576,6 +595,14 @@ unsafe fn mirror_v1_delete(
         return Ok(());
     }
     let key = tbl_info.get_or_create_key(db, pks)?;
+    crate::crsql_debug!(
+        "v2->v1 delete mirror table={} key={} cl={} db_version={} seq={}",
+        tbl_info.tbl_name,
+        key,
+        col_vrsn,
+        db_version,
+        seq
+    );
     set_winner_clock(
         db,
         ext_data,
@@ -661,6 +688,25 @@ unsafe fn merge_insert(
     let is_tombstone = insert_col == crate::c::DELETE_SENTINEL || is_v2_hash_tombstone;
     let is_v2_wire_packed = !is_tombstone
         && (col_vrsn_type == sqlite::ColumnType::Text || col_vrsn_type == sqlite::ColumnType::Blob);
+
+    let incoming_column_count = if is_v2_wire_packed {
+        insert_col.split('\0').count()
+    } else if is_tombstone {
+        0
+    } else {
+        1
+    };
+    crate::crsql_debug!(
+        "remote merge start table={} columns={} cl={} db_version={} packed={} tombstone={} site_id={:?} ts={}",
+        insert_tbl,
+        incoming_column_count,
+        insert_cl,
+        insert_db_vrsn,
+        is_v2_wire_packed,
+        is_tombstone,
+        insert_site_id,
+        insert_ts_raw
+    );
 
     // Skip column name length check for V2 packed rows (col names are null-separated)
     if !is_v2_wire_packed && insert_col.len() > crate::consts::MAX_TBL_NAME_LEN as usize {
@@ -918,10 +964,28 @@ unsafe fn v1_merge_insert(
 
     let local_cl = get_local_cl(db, tbl_info, key)?;
 
+    crate::crsql_debug!(
+        "v1 merge table={} cid={} key={} incoming_cl={} local_cl={} db_version={} seq={} ",
+        insert_tbl,
+        insert_col,
+        key,
+        insert_cl,
+        local_cl,
+        insert_db_vrsn,
+        insert_seq
+    );
+
     // We can ignore all updates from older causal lengths.
     // They won't win at anything.
     let res = (|| {
         if insert_cl < local_cl {
+            crate::crsql_debug!(
+                "v1 merge stale table={} cid={} incoming_cl={} local_cl={}",
+                insert_tbl,
+                insert_col,
+                insert_cl,
+                local_cl
+            );
             return Ok(ResultCode::OK);
         }
 
@@ -1071,6 +1135,15 @@ unsafe fn v1_merge_insert(
                 errmsg,
             )?;
 
+        crate::crsql_debug!(
+            "v1 merge column decision table={} cid={} key={} wins={} incoming_col_version={}",
+            insert_tbl,
+            insert_col,
+            key,
+            does_cid_win,
+            insert_col_vrsn
+        );
+
         if !does_cid_win {
             // doesCidWin == 0? compared against our clocks, nothing wins. OK and
             // Done.
@@ -1168,11 +1241,32 @@ unsafe fn v2_ensure_alive_row_at_cl(
     let (local_key_opt, local_cl) =
         v2_lookup_key_and_cl(db, &escaped, tbl_info, hashed_pk, unpacked_pks, ext_data)?;
 
+    crate::crsql_debug!(
+        "v2 row state table={} incoming_cl={} local_cl={} local_key={:?}",
+        tbl_info.tbl_name,
+        incoming_cl,
+        local_cl,
+        local_key_opt
+    );
+
     if incoming_cl < local_cl {
+        crate::crsql_debug!(
+            "v2 merge stale table={} incoming_cl={} local_cl={}",
+            tbl_info.tbl_name,
+            incoming_cl,
+            local_cl
+        );
         return Ok(None);
     }
 
     let local_key = if incoming_cl > local_cl {
+        crate::crsql_debug!(
+            "v2 row transition table={} local_cl={} incoming_cl={} action={}",
+            tbl_info.tbl_name,
+            local_cl,
+            incoming_cl,
+            if local_key_opt.is_some() { "replace-alive" } else if local_cl > 0 { "resurrect" } else { "create" }
+        );
         if let Some(key) = local_key_opt {
             v2_nuke_local_row(db, ext_data, &escaped, key, unpacked_pks, tbl_info)?;
         } else if local_cl > 0 {
@@ -1274,11 +1368,24 @@ pub unsafe fn v1_to_v2_hydrate_row(
     let col_id_bits = consts::CRSQL_COL_ID_BITS as i64;
     let ts_fallback = unsafe { (*ext_data).timestamp as i64 };
 
+    crate::crsql_debug!(
+        "v1->v2 hydrate start table={} pk_count={} hash_len={}",
+        tbl_info.tbl_name,
+        unpacked_pks.len(),
+        hashed_pk.len()
+    );
+
     // Guard: if V2 already has an entry for this row, skip hydration.
     // The row was either already migrated or written via dual-write triggers.
     let (existing_v2_key, existing_v2_cl) =
         v2_lookup_key_and_cl(db, &escaped, tbl_info, hashed_pk, unpacked_pks, ext_data)?;
     if existing_v2_key.is_some() || existing_v2_cl != 0 {
+        crate::crsql_debug!(
+            "v1->v2 hydrate skip table={} existing_v2_key={:?} existing_v2_cl={}",
+            tbl_info.tbl_name,
+            existing_v2_key,
+            existing_v2_cl
+        );
         return Ok(());
     }
 
@@ -1298,8 +1405,21 @@ pub unsafe fn v1_to_v2_hydrate_row(
         };
         reset_cached_stmt(stmt.stmt)?;
         match v1_key {
-            Some(k) => k,
-            None => return Ok(()), // No V1 entry — nothing to hydrate
+            Some(k) => {
+                crate::crsql_debug!(
+                    "v1->v2 hydrate found_v1_key table={} key={}",
+                    tbl_info.tbl_name,
+                    k
+                );
+                k
+            }
+            None => {
+                crate::crsql_debug!(
+                    "v1->v2 hydrate no_v1_key table={} action=skip",
+                    tbl_info.tbl_name
+                );
+                return Ok(());
+            }
         }
     };
 
@@ -1326,11 +1446,24 @@ pub unsafe fn v1_to_v2_hydrate_row(
         if stmt.step()? == ResultCode::ROW {
             (1, false) // Alive with no explicit sentinel → CL=1
         } else {
+            crate::crsql_debug!(
+                "v1->v2 hydrate no_v1_clock table={} key={} action=skip",
+                tbl_info.tbl_name,
+                v1_key
+            );
             return Ok(()); // No V1 metadata at all — nothing to hydrate
         }
     } else {
         (v1_cl, is_dead)
     };
+
+    crate::crsql_debug!(
+        "v1->v2 hydrate state table={} key={} cl={} dead={}",
+        tbl_info.tbl_name,
+        v1_key,
+        v1_cl,
+        is_dead
+    );
 
     if is_dead {
         // 3a. Row is dead — insert into v2_tombstones (+ v2_tombstone_pks in hash mode)
@@ -1433,6 +1566,13 @@ pub unsafe fn v1_to_v2_hydrate_row(
         stmt.step()?;
     }
 
+    crate::crsql_debug!(
+        "v1->v2 hydrate complete table={} key={} cl={} dead={}",
+        tbl_info.tbl_name,
+        v1_key,
+        v1_cl,
+        is_dead
+    );
     Ok(())
 }
 
@@ -1585,8 +1725,23 @@ unsafe fn v2_merge_insert_tombstone(
     let (local_key, local_cl) =
         v2_lookup_key_and_cl(db, &escaped, tbl_info, hashed_pk, &unpacked_pks, ext_data)?;
 
+    crate::crsql_debug!(
+        "v2 tombstone candidate table={} cl={} local_cl={} local_key={:?} cid={}",
+        insert_tbl,
+        insert_cl,
+        local_cl,
+        local_key,
+        insert_col
+    );
+
     // Bail early if incoming CL can't beat local CL
     if insert_cl < local_cl {
+        crate::crsql_debug!(
+            "v2 tombstone stale table={} incoming_cl={} local_cl={} action=ignore",
+            insert_tbl,
+            insert_cl,
+            local_cl
+        );
         return Ok(ResultCode::OK);
     }
 
@@ -1653,6 +1808,13 @@ unsafe fn v2_merge_insert_tombstone(
         if ch > 0 {
             impacted = true;
         }
+        crate::crsql_debug!(
+            "v2 tombstone upsert table={} cl={} changed={} won={}",
+            insert_tbl,
+            insert_cl,
+            ch,
+            impacted
+        );
     }
     drop(v2_ref);
 
@@ -1722,6 +1884,13 @@ unsafe fn v2_merge_insert_tombstone(
         }
     }
 
+    crate::crsql_debug!(
+        "v2 tombstone complete table={} cl={} impacted={} local_key={:?}",
+        insert_tbl,
+        insert_cl,
+        impacted,
+        local_key
+    );
     Ok(ResultCode::OK)
 }
 
@@ -1786,8 +1955,24 @@ unsafe fn v2_packed_merge(
         site_ordinal,
     )? {
         Some(result) => result,
-        None => return Ok(ResultCode::OK), // stale CL — no-op, *rowid stays 0
+        None => {
+            crate::crsql_debug!(
+                "v2 packed merge stale table={} incoming_cl={}",
+                tbl_info.tbl_name,
+                incoming_cl
+            );
+            return Ok(ResultCode::OK);
+        }
     };
+
+    crate::crsql_debug!(
+        "v2 packed merge table={} key={} incoming_cl={} local_cl={} columns={}",
+        tbl_info.tbl_name,
+        local_key,
+        incoming_cl,
+        local_cl,
+        col_names.len()
+    );
 
     // V2 has created or resurrected the row. Mirror only this lifecycle
     // transition into V1; later value clocks are mirrored individually after
@@ -1896,6 +2081,15 @@ unsafe fn v2_packed_merge(
         }
         stmt.step()?;
         let ch = db.changes64();
+        crate::crsql_debug!(
+            "v2 sentinel decision table={} key={} cl={} col_version={} seq={} won={}",
+            tbl_info.tbl_name,
+            local_key,
+            incoming_cl,
+            incoming_col_vrsn,
+            seq,
+            ch > 0
+        );
         if ch > 0 {
             impacted = true;
             if dual_write_enabled(ext_data) {
@@ -2099,6 +2293,17 @@ unsafe fn v2_apply_value_change_colval(
     let won = stmt.step()? == ResultCode::ROW;
     drop(stmt); // Release borrow on v2 before getting base_update
 
+    crate::crsql_debug!(
+        "v2 column decision table={} key={} column={} col_id={} incoming_col_version={} seq={} won={}",
+        tbl_info.tbl_name,
+        key,
+        col_name,
+        col_id,
+        col_vrsn,
+        seq,
+        won
+    );
+
     if !won {
         return Ok(());
     }
@@ -2157,6 +2362,15 @@ unsafe fn v2_apply_value_change_colval(
             bind_package_to_stmt(update_stmt.stmt, unpacked_pks, 1)?;
         }
         update_stmt.step()?;
+        let base_rows = db.changes64();
+        crate::crsql_debug!(
+            "v2 base update table={} key={} column={} rows={} applied={}",
+            tbl_info.tbl_name,
+            key,
+            col_name,
+            base_rows,
+            base_rows > 0
+        );
         Ok(())
     })
 }
