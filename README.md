@@ -113,7 +113,6 @@ Local writes (insert/update/delete triggers) have been significantly reworked:
 
 ### Other Changes
 
-- **Debug logging**: A `crsql_set_debug(1)` function enables `libc_print`-based debug output.
 - **ASAN support**: Added `make asan` target with proper Rust sanitizer flags.
 - **Config lifetime fix**: `crsql_config_set` now properly manages the statement lifetime to prevent use-after-free of returned values.
 - **`crsql_changes` schema**: The `crsql_changes` virtual table now includes a `ts` column (column index 9).
@@ -488,6 +487,7 @@ cargo run -- ../core/dist/crsqlite
 | `crsql_version()` | Return the cr-sqlite version integer |
 | `crsql_config_set(name, value)` | Set a configuration option |
 | `crsql_set_debug(enabled)` | Enable/disable debug logging |
+| `crsql_set_debug_callback(pointer)` | (0.18+) Register/clear a typed SQLite pointer debug callback; if unset, debug output goes to stdout |
 
 ### Schema Alter Functions
 

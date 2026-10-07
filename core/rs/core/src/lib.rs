@@ -226,6 +226,23 @@ pub extern "C" fn sqlite3_crsqlcore_init(
 
     let rc = db
         .create_function_v2(
+            "crsql_set_debug_callback",
+            1,
+            sqlite::UTF8 | sqlite::DIRECTONLY,
+            None,
+            Some(debug::x_crsql_set_debug_callback),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(sqlite::ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        set_err_msg("cr-sqlite: failed to create crsql_set_debug_callback function");
+        return null_mut();
+    }
+
+    let rc = db
+        .create_function_v2(
             "crsql_pack_columns",
             -1,
             sqlite::UTF8,
