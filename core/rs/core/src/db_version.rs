@@ -1,7 +1,6 @@
 use core::ffi::c_void;
 use core::mem;
 
-use crate::alloc::string::ToString;
 use crate::alloc::{boxed::Box, vec::Vec};
 use alloc::collections::btree_map::Entry;
 use alloc::collections::BTreeMap;
@@ -14,7 +13,6 @@ use sqlite::{sqlite3, Stmt};
 use sqlite_nostd as sqlite;
 
 use crate::c::crsql_ExtData;
-use crate::c::crsql_fetchPragmaDataVersion;
 use crate::consts::MIN_POSSIBLE_DB_VERSION;
 use crate::consts::SITE_ID_LEN;
 use crate::stmt_cache::reset_cached_stmt;
@@ -121,19 +119,11 @@ pub fn fill_db_version_if_needed(
     db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
 ) -> Result<ResultCode, String> {
-    unsafe {
-        let rc = crsql_fetchPragmaDataVersion(db, ext_data);
-        if rc == -1 {
-            return Err("failed to fetch PRAGMA data_version".to_string());
-        }
-        if (*ext_data).dbVersion != -1 && rc == 0 {
-            return Ok(ResultCode::OK);
-        }
-        fetch_db_version_from_storage(db, ext_data)
-    }
+    crate::ext_data::refresh_connection_state_if_needed(db, ext_data)?;
+    Ok(ResultCode::OK)
 }
 
-pub fn fetch_db_version_from_storage(
+pub fn reload_db_version(
     _db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
 ) -> Result<ResultCode, String> {

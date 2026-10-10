@@ -431,6 +431,12 @@ unsafe fn merge_insert(
     let tab = vtab.cast::<crsql_Changes_vtab>();
     let db = (*tab).db;
 
+    if let Err(msg) = crate::ext_data::refresh_connection_state_if_needed(db, (*tab).pExtData) {
+        let err = CString::new(format!("failed to refresh connection state: {}", msg))?;
+        *errmsg = err.into_raw();
+        return Err(ResultCode::ERROR);
+    }
+
     let rc = crsql_ensure_table_infos_are_up_to_date(db, (*tab).pExtData, errmsg);
     if rc != ResultCode::OK as i32 {
         let err = CString::new("Failed to update CRR table information")?;

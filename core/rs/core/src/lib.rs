@@ -972,6 +972,12 @@ unsafe extern "C" fn x_crsql_set_ts(
         }
     };
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+    if let Err(message) =
+        ext_data::refresh_connection_state_if_needed(ctx.db_handle(), ext_data)
+    {
+        ctx.result_error(&message);
+        return;
+    }
     (*ext_data).timestamp = ts_u64;
     ctx.result_text_static("OK");
 }

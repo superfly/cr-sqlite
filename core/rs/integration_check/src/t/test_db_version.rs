@@ -35,13 +35,13 @@ fn test_fetch_db_version_from_storage() -> Result<ResultCode, String> {
     let rc = unsafe { test_exports::c::crsql_initSiteIdExt(raw_db, ext_data, site_id) };
     assert_eq!(rc, 0);
 
-    test_exports::db_version::fetch_db_version_from_storage(raw_db, ext_data)?;
+    test_exports::db_version::reload_db_version(raw_db, ext_data)?;
     // no clock tables, no version.
     assert_eq!(0, unsafe { (*ext_data).dbVersion });
 
     // this was a bug where calling twice on a fresh db would fail the second
     // time.
-    test_exports::db_version::fetch_db_version_from_storage(raw_db, ext_data)?;
+    test_exports::db_version::reload_db_version(raw_db, ext_data)?;
     // should still return same data on a subsequent call with no schema
     assert_eq!(0, unsafe { (*ext_data).dbVersion });
 
@@ -50,14 +50,14 @@ fn test_fetch_db_version_from_storage() -> Result<ResultCode, String> {
         .expect("made foo");
     db.exec_safe("SELECT crsql_as_crr('foo');")
         .expect("made foo crr");
-    test_exports::db_version::fetch_db_version_from_storage(raw_db, ext_data)?;
+    test_exports::db_version::reload_db_version(raw_db, ext_data)?;
     // still v0 since no rows are inserted
     assert_eq!(0, unsafe { (*ext_data).dbVersion });
 
     // version is bumped due to insert
     db.exec_safe("INSERT INTO foo (a, b) VALUES (1, 2);")
         .expect("inserted");
-    test_exports::db_version::fetch_db_version_from_storage(raw_db, ext_data)?;
+    test_exports::db_version::reload_db_version(raw_db, ext_data)?;
     assert_eq!(1, unsafe { (*ext_data).dbVersion });
 
     db.exec_safe("CREATE TABLE bar (a primary key not null, b);")
@@ -67,10 +67,10 @@ fn test_fetch_db_version_from_storage() -> Result<ResultCode, String> {
     db.exec_safe("INSERT INTO bar VALUES (1, 2)")
         .expect("inserted into bar");
 
-    test_exports::db_version::fetch_db_version_from_storage(raw_db, ext_data)?;
+    test_exports::db_version::reload_db_version(raw_db, ext_data)?;
     assert_eq!(2, unsafe { (*ext_data).dbVersion });
 
-    test_exports::db_version::fetch_db_version_from_storage(raw_db, ext_data)?;
+    test_exports::db_version::reload_db_version(raw_db, ext_data)?;
     assert_eq!(2, unsafe { (*ext_data).dbVersion });
 
     unsafe {
@@ -447,7 +447,57 @@ fn test_insert_db_version_cache() -> Result<(), ResultCode> {
     Ok(())
 }
 
+fn scalar(db: &sqlite::ManagedConnection, sql: &str) -> Result<i64, String> {
+    let stmt = db.prepare_v2(sql).map_err(|e| format!("prepare {sql}: {e:?}"))?;
+    match stmt.step() {
+        Ok(ResultCode::ROW) => {}
+        rc => {
+            return Err(format!(
+                "step {sql}: {rc:?} errmsg={:?}",
+                db.errmsg()
+            ))
+        }
+    }
+    Ok(stmt.column_int64(0))
+}
+
+fn test_connection_state_refresh() -> Result<(), String> {
+    let a = crate::opendb_file("test_connection_state_refresh.db")
+        .map_err(|e| format!("open a: {e:?}"))?;
+    let b = crate::opendb_file("test_connection_state_refresh.db")
+        .map_err(|e| format!("open b: {e:?}"))?;
+    a.db.exec_safe(
+        "DROP TABLE IF EXISTS foo;
+        DROP TABLE IF EXISTS foo__crsql_clock;
+        DELETE FROM crsql_master WHERE key = 'config.merge-equal-values';
+        DELETE FROM crsql_db_versions;
+        VACUUM;",
+    )
+    .map_err(|e| format!("reset db: {e:?}"))?;
+    a.db.exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, v)")
+        .map_err(|e| format!("create foo: {e:?}"))?;
+    a.db.exec_safe("SELECT crsql_as_crr('foo')")
+        .map_err(|e| format!("as_crr: {e:?}"))?;
+    assert_eq!(scalar(&a.db, "SELECT crsql_db_version()")?, 0);
+
+    b.db.exec_safe("SELECT crsql_config_set('merge-equal-values', 1)")
+        .map_err(|e| format!("b set config 1: {e:?}"))?;
+    b.db.exec_safe("INSERT INTO foo VALUES (1, 'first')")
+        .map_err(|e| format!("b insert 1: {e:?}"))?;
+    assert_eq!(scalar(&a.db, "SELECT crsql_config_get('merge-equal-values')")?, 1);
+    assert_eq!(scalar(&a.db, "SELECT crsql_peek_next_db_version()")?, 2);
+
+    b.db.exec_safe("SELECT crsql_config_set('merge-equal-values', 0)")
+        .map_err(|e| format!("b set config 0: {e:?}"))?;
+    b.db.exec_safe("INSERT INTO foo VALUES (2, 'second')")
+        .map_err(|e| format!("b insert 2: {e:?}"))?;
+    assert_eq!(scalar(&a.db, "SELECT crsql_peek_next_db_version()")?, 3);
+    assert_eq!(scalar(&a.db, "SELECT crsql_config_get('merge-equal-values')")?, 0);
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), String> {
+    test_connection_state_refresh().map_err(|e| format!("test_connection_state_refresh failed: {:?}", e))?;
     test_fetch_db_version_from_storage()?;
     test_next_db_version()?;
     test_get_or_set_site_ordinal()

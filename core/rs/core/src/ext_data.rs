@@ -4,10 +4,40 @@ use alloc::vec;
 use core::ffi::c_int;
 use core::ptr::null_mut;
 
+use alloc::string::String;
 use sqlite::{sqlite3, Connection, ResultCode, Stmt};
 use sqlite_nostd as sqlite;
 
-use crate::{c::crsql_ExtData, util::get_db_version_union_query};
+use crate::{
+    c::{crsql_ExtData, crsql_fetchPragmaDataVersion},
+    util::get_db_version_union_query,
+};
+
+/**
+ * Refresh connection-local state cached in `crsql_ExtData` after another
+ * connection committed changes to the database.
+ *
+ * `PRAGMA data_version` only changes for commits made by other connections
+ * and is pinned while this connection holds a transaction open, so this is a
+ * cheap no-op in the common case. When the data version did change, every
+ * cached value is reloaded through its own reload_* function so independent
+ * caches cannot observe the same change inconsistently.
+ */
+pub fn refresh_connection_state_if_needed(
+    db: *mut sqlite3,
+    ext_data: *mut crsql_ExtData,
+) -> Result<(), String> {
+    let rc = unsafe { crsql_fetchPragmaDataVersion(db, ext_data) };
+    if rc == -1 {
+        return Err("failed to fetch PRAGMA data_version".to_string());
+    }
+    if rc == 0 && unsafe { (*ext_data).dbVersion } != -1 {
+        return Ok(());
+    }
+    crate::db_version::reload_db_version(db, ext_data)?;
+    crate::config::reload_connection_config(db, ext_data)?;
+    Ok(())
+}
 
 #[no_mangle]
 pub extern "C" fn crsql_recreate_db_version_stmt(
