@@ -13,6 +13,7 @@ use sqlite::{sqlite3, Stmt};
 use sqlite_nostd as sqlite;
 
 use crate::c::crsql_ExtData;
+use crate::c::crsql_enlist_db_version;
 use crate::consts::MIN_POSSIBLE_DB_VERSION;
 use crate::consts::SITE_ID_LEN;
 use crate::stmt_cache::reset_cached_stmt;
@@ -63,37 +64,29 @@ pub fn peek_next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> R
  * Need to save some bit that states we checked the pragma already and reset on tx commit or rollback.
  */
 pub fn next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> Result<i64, String> {
-    crate::ext_data::refresh_connection_state_if_needed(db, ext_data)?;
+    if unsafe { (*ext_data).pendingDbVersion } < 0 {
+        reload_db_version(db, ext_data)?;
+    } else {
+        crate::ext_data::refresh_connection_state_if_needed(db, ext_data)?;
+    }
 
     let mut ret = unsafe { (*ext_data).dbVersion + 1 };
     if ret < unsafe { (*ext_data).pendingDbVersion } {
         ret = unsafe { (*ext_data).pendingDbVersion };
     }
 
-    // update db_version in db if it changed
-    if ret != unsafe { (*ext_data).pendingDbVersion } {
+    if ret != unsafe { (*ext_data).pendingDbVersion }
+        || unsafe { (*ext_data).versionGuardEnlisted == 0 }
+    {
         unsafe {
-            let site_id_slice =
-                core::slice::from_raw_parts((*ext_data).siteId, SITE_ID_LEN as usize);
-
-            let bind_result = (*ext_data)
-                .pSetDbVersionStmt
-                .bind_blob(1, site_id_slice, sqlite_nostd::Destructor::STATIC)
-                .and_then(|_| (*ext_data).pSetDbVersionStmt.bind_int64(2, ret));
-
-            if bind_result.is_err() {
-                return Err("failed binding to pSetDbVersionStmt".into());
-            }
-
-            let res = (*ext_data).pSetDbVersionStmt.step();
-
-            reset_cached_stmt((*ext_data).pSetDbVersionStmt)
-                .map_err(|_| "failed to reset cached pSetDbVersionStmt")?;
-
-            if res.is_err() {
-                return Err("failed to insert db_version for current site ID".into());
-            }
+            let previous = (*ext_data).pendingDbVersion;
             (*ext_data).pendingDbVersion = ret;
+            if crsql_enlist_db_version(db, ext_data) != ResultCode::OK as c_int {
+                if (*ext_data).pendingDbVersion == ret {
+                    (*ext_data).pendingDbVersion = previous;
+                }
+                return Err("failed to enlist db_version guard".into());
+            }
         }
     }
 

@@ -88,10 +88,12 @@ TARGET_TEST_ASAN=$(prefix)/test-asan
 # js/browser/wa-sqlite/Makefile, deps/sqlite/GNUMakefile, core/binding.gyp, core/Makefile
 ext_files=src/crsqlite.c \
 	src/changes-vtab.c \
-	src/ext-data.c
+	src/ext-data.c \
+	src/version-guard.c
 ext_headers=src/crsqlite.h \
 	src/util.h \
 	src/changes-vtab.h \
+	src/version-guard.h \
 	src/ext-data.h
 
 $(prefix):

@@ -49,6 +49,8 @@ struct crsql_ExtData {
   int mergeEqualValues;
   unsigned long long timestamp;
   void *ordinalMap;
+  sqlite3_stmt *pVersionGuardStmt;
+  int versionGuardEnlisted;
 };
 
 crsql_ExtData *crsql_newExtData(sqlite3 *db);

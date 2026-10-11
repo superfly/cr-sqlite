@@ -11,9 +11,8 @@ LIBSQL_EXTENSION_INIT1
 #include <string.h>
 
 #include "changes-vtab.h"
-#include "consts.h"
 #include "ext-data.h"
-#include "rust.h"
+#include "version-guard.h"
 
 // see
 // https://github.com/chromium/chromium/commit/579b3dd0ea41a40da8a61ab87a8b0bc39e158998
@@ -68,6 +67,14 @@ __declspec(dllexport)
   if (rc == SQLITE_OK) {
     rc = sqlite3_create_module_v2(db, "crsql_changes", &crsql_changesModule,
                                   pExtData, 0);
+  }
+  if (rc == SQLITE_OK) {
+    rc = sqlite3_create_module_v2(db, "crsql_version_guard",
+                                  &crsql_versionGuardModule, pExtData, 0);
+  }
+  if (rc != SQLITE_OK) {
+    crsql_finalize(pExtData);
+    return rc;
   }
 
   if (rc == SQLITE_OK) {
