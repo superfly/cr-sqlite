@@ -1,5 +1,5 @@
 extern crate alloc;
-use alloc::{format, string::String};
+use alloc::{ffi::CString, format, string::String};
 use core::ffi::c_char;
 use crsql_bundle::test_exports;
 use sqlite::{Connection, ResultCode};
@@ -506,6 +506,7 @@ fn remove_rollback_test_db(path: &str) {
 
 fn open_rollback_test_db(path: &str) -> Result<crate::CRConnection, ResultCode> {
     let db = crate::opendb_file(path)?;
+    db.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 2)")?;
     db.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
     db.db.exec_safe("SELECT crsql_as_crr('t')")?;
     Ok(db)
@@ -586,7 +587,7 @@ fn test_savepoint_rollback_after_first_write() -> Result<(), ResultCode> {
         db.db.exec_safe("COMMIT")?;
         assert_eq!(scalar(db.db.db, "SELECT count(*) FROM t")?, 2);
         assert_eq!(
-            scalar(db.db.db, "SELECT count(*) FROM t__crsql_clock WHERE db_version = 1")?,
+            scalar(db.db.db, "SELECT count(*) FROM t__crsql_v2_clock WHERE db_version = 1")?,
             2
         );
     }
@@ -597,7 +598,7 @@ fn test_savepoint_rollback_after_first_write() -> Result<(), ResultCode> {
         db.db.exec_safe("SELECT crsql_set_ts('1700000002')")?;
         db.db.exec_safe("INSERT INTO t VALUES (4, 'next')")?;
         db.db.exec_safe("COMMIT")?;
-        assert_eq!(scalar(db.db.db, "SELECT MAX(db_version) FROM t__crsql_clock")?, 2);
+        assert_eq!(scalar(db.db.db, "SELECT MAX(db_version) FROM t__crsql_v2_clock")?, 2);
     }
     remove_rollback_test_db(&path);
     Ok(())
@@ -614,7 +615,7 @@ fn test_savepoint_rollback_without_surviving_writes() -> Result<(), ResultCode> 
         db.db.exec_safe("ROLLBACK TO s")?;
         db.db.exec_safe("RELEASE s")?;
         db.db.exec_safe("COMMIT")?;
-        assert_eq!(scalar(db.db.db, "SELECT count(*) FROM t__crsql_clock")?, 0);
+        assert_eq!(scalar(db.db.db, "SELECT count(*) FROM t__crsql_v2_clock")?, 0);
         assert_eq!(scalar(db.db.db, "SELECT MAX(db_version) FROM crsql_db_versions")?, 1);
     }
     {
@@ -624,7 +625,7 @@ fn test_savepoint_rollback_without_surviving_writes() -> Result<(), ResultCode> 
         db.db.exec_safe("SELECT crsql_set_ts('1700000002')")?;
         db.db.exec_safe("INSERT INTO t VALUES (2, 'first committed')")?;
         db.db.exec_safe("COMMIT")?;
-        assert_eq!(scalar(db.db.db, "SELECT MAX(db_version) FROM t__crsql_clock")?, 2);
+        assert_eq!(scalar(db.db.db, "SELECT MAX(db_version) FROM t__crsql_v2_clock")?, 2);
     }
     remove_rollback_test_db(&path);
     Ok(())
@@ -683,7 +684,7 @@ fn test_savepoint_rollback_first_write_then_commit() -> Result<(), ResultCode> {
         db.db.exec_safe("RELEASE s")?;
         db.db.exec_safe("INSERT INTO t VALUES (2, 'kept')")?;
         db.db.exec_safe("COMMIT")?;
-        assert_eq!(scalar(db.db.db, "SELECT MAX(db_version) FROM t__crsql_clock")?, 1);
+        assert_eq!(scalar(db.db.db, "SELECT MAX(db_version) FROM t__crsql_v2_clock")?, 1);
         scalar(
             db.db.db,
             "SELECT COALESCE((SELECT db_version FROM crsql_db_versions WHERE site_id = crsql_site_id()), 0)",
@@ -698,10 +699,10 @@ fn test_savepoint_rollback_first_write_then_commit() -> Result<(), ResultCode> {
         db.db.exec_safe("COMMIT")?;
         (
             next_version,
-            scalar(db.db.db, "SELECT MAX(db_version) FROM t__crsql_clock")?,
+            scalar(db.db.db, "SELECT MAX(db_version) FROM t__crsql_v2_clock")?,
             scalar(
                 db.db.db,
-                "SELECT COUNT(DISTINCT ts) FROM t__crsql_clock WHERE db_version = 1",
+                "SELECT COUNT(DISTINCT ts) FROM t__crsql_v2_clock WHERE db_version = 1",
             )?,
         )
     };
@@ -726,7 +727,7 @@ fn test_failed_statement_then_commit_does_not_reuse_version() -> Result<(), Resu
         assert_eq!(scalar(db.db.db, "SELECT count(*) FROM t")?, 0);
         db.db.exec_safe("INSERT INTO t VALUES (2, 'kept')")?;
         db.db.exec_safe("COMMIT")?;
-        assert_eq!(scalar(db.db.db, "SELECT count(*) FROM t__crsql_clock")?, 1);
+        assert_eq!(scalar(db.db.db, "SELECT count(*) FROM t__crsql_v2_clock")?, 1);
         scalar(
             db.db.db,
             "SELECT COALESCE((SELECT db_version FROM crsql_db_versions WHERE site_id = crsql_site_id()), 0)",
@@ -741,10 +742,10 @@ fn test_failed_statement_then_commit_does_not_reuse_version() -> Result<(), Resu
         db.db.exec_safe("COMMIT")?;
         (
             next_version,
-            scalar(db.db.db, "SELECT MAX(db_version) FROM t__crsql_clock")?,
+            scalar(db.db.db, "SELECT MAX(db_version) FROM t__crsql_v2_clock")?,
             scalar(
                 db.db.db,
-                "SELECT COUNT(DISTINCT ts) FROM t__crsql_clock WHERE db_version = 1",
+                "SELECT COUNT(DISTINCT ts) FROM t__crsql_v2_clock WHERE db_version = 1",
             )?,
         )
     };
