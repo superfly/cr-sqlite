@@ -80,11 +80,7 @@ static int versionGuardRowid(sqlite3_vtab_cursor *cursor, sqlite3_int64 *rowid) 
   return SQLITE_OK;
 }
 
-static int versionGuardBegin(sqlite3_vtab *vtab) {
-  crsql_VersionGuard *guard = (crsql_VersionGuard *)vtab;
-  guard->extData->versionGuardEnlisted = 1;
-  return SQLITE_OK;
-}
+static int versionGuardBegin(sqlite3_vtab *vtab) { return SQLITE_OK; }
 
 static int versionGuardUpdate(sqlite3_vtab *vtab, int argc,
                               sqlite3_value **argv, sqlite3_int64 *rowid) {
@@ -96,6 +92,7 @@ static int versionGuardUpdate(sqlite3_vtab *vtab, int argc,
 static int versionGuardSync(sqlite3_vtab *vtab) {
   crsql_VersionGuard *guard = (crsql_VersionGuard *)vtab;
   crsql_ExtData *extData = guard->extData;
+  if (!extData->versionGuardEnlisted) return SQLITE_OK;
   sqlite3_int64 version = extData->pendingDbVersion;
   sqlite3_stmt *stmt = extData->pSetDbVersionStmt;
   int rc = sqlite3_bind_blob(stmt, 1, extData->siteId, SITE_ID_LEN,
@@ -158,5 +155,8 @@ int crsql_enlist_db_version(sqlite3 *db, crsql_ExtData *extData) {
   int rc = sqlite3_step(stmt);
   int result = rc == SQLITE_DONE ? SQLITE_OK : rc;
   rc = sqlite3_reset(stmt);
-  return result == SQLITE_OK ? rc : result;
+  if (result != SQLITE_OK) return result;
+  if (rc != SQLITE_OK) return rc;
+  extData->versionGuardEnlisted = 1;
+  return SQLITE_OK;
 }

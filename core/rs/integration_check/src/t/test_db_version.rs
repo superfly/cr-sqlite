@@ -506,6 +506,34 @@ fn test_connection_state_refresh() -> Result<(), ResultCode> {
     Ok(())
 }
 
+fn test_refresh_retries_after_reload_failure() -> Result<(), ResultCode> {
+    let path = rollback_test_path();
+    {
+        let a = open_rollback_test_db(&path)?;
+        let b = crate::opendb_file(&path)?;
+        assert_eq!(scalar(b.db.db, "SELECT crsql_db_version()")?, 0);
+
+        b.db.exec_safe("BEGIN")?;
+        b.db.exec_safe("SELECT crsql_config_set('merge-equal-values', 1)")?;
+        b.db.exec_safe(
+            "UPDATE crsql_master SET value = 'invalid' WHERE key = 'config.merge-equal-values'",
+        )?;
+        b.db.exec_safe("INSERT INTO t VALUES (1, 'external')")?;
+        b.db.exec_safe("COMMIT")?;
+
+        assert!(scalar(a.db.db, "SELECT crsql_config_get('merge-equal-values')").is_err());
+        a.db.exec_safe(
+            "UPDATE crsql_master SET value = 1 WHERE key = 'config.merge-equal-values'",
+        )?;
+        assert_eq!(
+            scalar(a.db.db, "SELECT crsql_config_get('merge-equal-values')")?,
+            1
+        );
+    }
+    remove_rollback_test_db(&path);
+    Ok(())
+}
+
 fn scalar(db: *mut sqlite::sqlite3, sql: &str) -> Result<i64, ResultCode> {
     let stmt = db.prepare_v2(sql)?;
     assert_eq!(stmt.step()?, ResultCode::ROW, "{sql}");
@@ -698,6 +726,8 @@ fn test_failed_statement_then_commit_does_not_reuse_version() -> Result<(), Resu
 }
 
 pub fn run_suite() -> Result<(), String> {
+    test_refresh_retries_after_reload_failure()
+        .map_err(|e| format!("test_refresh_retries_after_reload_failure failed: {e:?}"))?;
     test_connection_state_refresh().map_err(|e| format!("test_connection_state_refresh failed: {:?}", e))?;
     test_fetch_db_version_from_storage()?;
     test_next_db_version()?;

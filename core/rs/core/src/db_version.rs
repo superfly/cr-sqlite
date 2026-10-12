@@ -49,48 +49,35 @@ pub extern "C" fn crsql_peek_next_db_version(
 }
 
 pub fn peek_next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> Result<i64, String> {
-    crate::ext_data::refresh_connection_state_if_needed(db, ext_data)?;
-
-    let mut ret = unsafe { (*ext_data).dbVersion + 1 };
-    if ret < unsafe { (*ext_data).pendingDbVersion } {
-        ret = unsafe { (*ext_data).pendingDbVersion };
+    if unsafe { (*ext_data).versionGuardEnlisted } != 0 {
+        return Ok(unsafe { (*ext_data).pendingDbVersion });
     }
-    Ok(ret)
+    crate::ext_data::refresh_connection_state_if_needed(db, ext_data)?;
+    Ok(unsafe { (*ext_data).dbVersion + 1 })
 }
 
 /**
- * Given this needs to do a pragma check, invoke it as little as possible.
- * TODO: We could optimize to only do a pragma check once per transaction.
- * Need to save some bit that states we checked the pragma already and reset on tx commit or rollback.
+ * Returns the db_version local writes of the current transaction must use.
+ *
+ * Once the version guard is enlisted the transaction's version is fixed:
+ * every subsequent call just returns pendingDbVersion. Otherwise we allocate
+ * one and enlist the guard so xSync persists it atomically at commit.
  */
 pub fn next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> Result<i64, String> {
-    if unsafe { (*ext_data).pendingDbVersion } < 0 {
-        reload_db_version(db, ext_data)?;
-    } else {
-        crate::ext_data::refresh_connection_state_if_needed(db, ext_data)?;
+    if unsafe { (*ext_data).versionGuardEnlisted } != 0 {
+        return Ok(unsafe { (*ext_data).pendingDbVersion });
     }
-
-    let mut ret = unsafe { (*ext_data).dbVersion + 1 };
-    if ret < unsafe { (*ext_data).pendingDbVersion } {
-        ret = unsafe { (*ext_data).pendingDbVersion };
-    }
-
-    if ret != unsafe { (*ext_data).pendingDbVersion }
-        || unsafe { (*ext_data).versionGuardEnlisted == 0 }
-    {
-        unsafe {
-            let previous = (*ext_data).pendingDbVersion;
-            (*ext_data).pendingDbVersion = ret;
-            if crsql_enlist_db_version(db, ext_data) != ResultCode::OK as c_int {
-                if (*ext_data).pendingDbVersion == ret {
-                    (*ext_data).pendingDbVersion = previous;
-                }
-                return Err("failed to enlist db_version guard".into());
-            }
+    crate::ext_data::refresh_connection_state_if_needed(db, ext_data)?;
+    unsafe {
+        let ret = (*ext_data).dbVersion + 1;
+        (*ext_data).pendingDbVersion = ret;
+        if crsql_enlist_db_version(db, ext_data) != ResultCode::OK as c_int {
+            // xSync must not persist a version when enlistment failed.
+            (*ext_data).versionGuardEnlisted = 0;
+            return Err("failed to enlist db_version guard".into());
         }
+        Ok(ret)
     }
-
-    Ok(ret)
 }
 
 pub fn reload_db_version(
