@@ -2,11 +2,32 @@ use alloc::format;
 
 use sqlite::{Connection, Context};
 use sqlite_nostd as sqlite;
-use sqlite_nostd::{ManagedStmt, ResultCode, Value};
+use sqlite_nostd::{ColumnType, ManagedStmt, ResultCode, Value};
 
 use crate::c::crsql_ExtData;
 
 pub const MERGE_EQUAL_VALUES: &str = "merge-equal-values";
+
+pub fn reload_connection_config(
+    db: *mut sqlite::sqlite3,
+    ext_data: *mut crsql_ExtData,
+) -> Result<(), alloc::string::String> {
+    let stmt = db
+        .prepare_v2("SELECT value FROM crsql_master WHERE key = 'config.merge-equal-values'")
+        .map_err(|rc| format!("failed to prepare config refresh: {rc}"))?;
+    let value = match stmt.step() {
+        Ok(ResultCode::ROW) => {
+            if stmt.column_type(0) != Ok(ColumnType::Integer) {
+                return Err("invalid merge-equal-values setting".into());
+            }
+            stmt.column_int(0)
+        }
+        Ok(ResultCode::DONE) => 0,
+        Ok(rc) | Err(rc) => return Err(format!("failed to read config: {rc}")),
+    };
+    unsafe { (*ext_data).mergeEqualValues = value };
+    Ok(())
+}
 
 pub extern "C" fn crsql_config_set(
     ctx: *mut sqlite::context,
@@ -73,10 +94,14 @@ pub extern "C" fn crsql_config_get(
     let args = sqlite::args!(argc, argv);
 
     let name = args[0].text();
+    let ext_data = ctx.user_data() as *mut crsql_ExtData;
+    if let Err(message) = crate::ext_data::refresh_connection_state_if_needed(ctx.db_handle(), ext_data) {
+        ctx.result_error(&message);
+        return;
+    }
 
     match name {
         MERGE_EQUAL_VALUES => {
-            let ext_data = ctx.user_data() as *mut crsql_ExtData;
             ctx.result_int(unsafe { (*ext_data).mergeEqualValues });
         }
         _ => {
