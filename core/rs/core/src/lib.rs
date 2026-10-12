@@ -62,10 +62,7 @@ use c::{crsql_freeExtData, crsql_initSiteIdExt, crsql_newExtData};
 use config::{crsql_config_get, crsql_config_set};
 use core::ffi::{c_int, c_void, CStr};
 use create_crr::create_crr;
-use db_version::{
-    crsql_fill_db_version_if_needed, crsql_next_db_version, crsql_peek_next_db_version,
-    insert_db_version,
-};
+use db_version::{crsql_next_db_version, crsql_peek_next_db_version, insert_db_version};
 use is_crr::*;
 use local_writes::after_delete::x_crsql_after_delete;
 use local_writes::after_insert::x_crsql_after_insert;
@@ -1097,11 +1094,8 @@ unsafe extern "C" fn x_crsql_db_version(
 ) {
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
     let db = ctx.db_handle();
-    let mut err_msg = null_mut();
-    let rc = crsql_fill_db_version_if_needed(db, ext_data, &mut err_msg as *mut _);
-    if rc != ResultCode::OK as c_int {
-        // TODO: pass err_msg!
-        ctx.result_error("failed to fill db version");
+    if let Err(message) = ext_data::refresh_connection_state_if_needed(db, ext_data) {
+        ctx.result_error(&message);
         return;
     }
     sqlite::result_int64(ctx, (*ext_data).dbVersion);

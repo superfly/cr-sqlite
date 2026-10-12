@@ -11,7 +11,7 @@ use num_traits::FromPrimitive;
 use sqlite_nostd::{sqlite3, Connection, ResultCode, StrRef};
 
 use crate::c::crsql_ExtData;
-use crate::db_version::fill_db_version_if_needed;
+use crate::ext_data::refresh_connection_state_if_needed;
 use crate::tableinfo::{crsql_ensure_table_infos_are_up_to_date, TableInfo};
 
 #[no_mangle]
@@ -33,7 +33,7 @@ unsafe fn compact_post_alter(
     errmsg: *mut *mut c_char,
 ) -> Result<ResultCode, ResultCode> {
     let tbl_name_str = CStr::from_ptr(tbl_name).to_str()?;
-    fill_db_version_if_needed(db, ext_data).or_else(|msg| {
+    refresh_connection_state_if_needed(db, ext_data).or_else(|msg| {
         errmsg.set(&msg);
         Err(ResultCode::ERROR)
     })?;

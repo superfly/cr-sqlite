@@ -18,21 +18,6 @@ use crate::consts::SITE_ID_LEN;
 use crate::stmt_cache::reset_cached_stmt;
 
 #[no_mangle]
-pub extern "C" fn crsql_fill_db_version_if_needed(
-    db: *mut sqlite3,
-    ext_data: *mut crsql_ExtData,
-    errmsg: *mut *mut c_char,
-) -> c_int {
-    match fill_db_version_if_needed(db, ext_data) {
-        Ok(rc) => rc as c_int,
-        Err(msg) => {
-            errmsg.set(&msg);
-            ResultCode::ERROR as c_int
-        }
-    }
-}
-
-#[no_mangle]
 pub extern "C" fn crsql_next_db_version(
     db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
@@ -63,7 +48,7 @@ pub extern "C" fn crsql_peek_next_db_version(
 }
 
 pub fn peek_next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> Result<i64, String> {
-    fill_db_version_if_needed(db, ext_data)?;
+    crate::ext_data::refresh_connection_state_if_needed(db, ext_data)?;
 
     let mut ret = unsafe { (*ext_data).dbVersion + 1 };
     if ret < unsafe { (*ext_data).pendingDbVersion } {
@@ -78,7 +63,7 @@ pub fn peek_next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> R
  * Need to save some bit that states we checked the pragma already and reset on tx commit or rollback.
  */
 pub fn next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> Result<i64, String> {
-    fill_db_version_if_needed(db, ext_data)?;
+    crate::ext_data::refresh_connection_state_if_needed(db, ext_data)?;
 
     let mut ret = unsafe { (*ext_data).dbVersion + 1 };
     if ret < unsafe { (*ext_data).pendingDbVersion } {
@@ -113,14 +98,6 @@ pub fn next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> Result
     }
 
     Ok(ret)
-}
-
-pub fn fill_db_version_if_needed(
-    db: *mut sqlite3,
-    ext_data: *mut crsql_ExtData,
-) -> Result<ResultCode, String> {
-    crate::ext_data::refresh_connection_state_if_needed(db, ext_data)?;
-    Ok(ResultCode::OK)
 }
 
 pub fn reload_db_version(
