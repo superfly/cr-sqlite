@@ -74,6 +74,8 @@ pub struct crsql_ExtData {
     pub mergeEqualValues: ::core::ffi::c_int,
     pub timestamp: ::core::ffi::c_ulonglong,
     pub ordinalMap: *mut ::core::ffi::c_void,
+    pub pVersionGuardStmt: *mut sqlite::stmt,
+    pub versionGuardEnlisted: ::core::ffi::c_int,
 }
 
 #[repr(C)]
@@ -117,6 +119,10 @@ extern "C" {
     ) -> c_int;
     pub fn crsql_freeExtData(pExtData: *mut crsql_ExtData);
     pub fn crsql_finalize(pExtData: *mut crsql_ExtData);
+    pub fn crsql_enlist_db_version(
+        db: *mut sqlite::sqlite3,
+        pExtData: *mut crsql_ExtData,
+    ) -> c_int;
 }
 
 #[test]
@@ -271,7 +277,7 @@ fn bindgen_test_layout_crsql_ExtData() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::core::mem::size_of::<crsql_ExtData>(),
-        168usize,
+        184usize,
         concat!("Size of: ", stringify!(crsql_ExtData))
     );
     assert_eq!(
@@ -510,5 +516,15 @@ fn bindgen_test_layout_crsql_ExtData() {
             "::",
             stringify!(ordinalMap)
         )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).pVersionGuardStmt) as usize - ptr as usize },
+        168usize,
+        "Offset of pVersionGuardStmt"
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).versionGuardEnlisted) as usize - ptr as usize },
+        176usize,
+        "Offset of versionGuardEnlisted"
     );
 }

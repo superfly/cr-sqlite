@@ -88,6 +88,7 @@ fn test_next_db_version() -> Result<(), String> {
     let rc = unsafe { test_exports::c::crsql_initSiteIdExt(raw_db, ext_data, make_site()) };
     assert_eq!(rc, 0);
 
+    db.exec_safe("BEGIN").expect("started transaction");
     // is current + 1
     // doesn't bump forward on successive calls
     assert_eq!(
@@ -110,6 +111,7 @@ fn test_next_db_version() -> Result<(), String> {
 
     // existing db version not touched
     assert_eq!(0, unsafe { (*ext_data).dbVersion });
+    db.exec_safe("COMMIT").expect("committed transaction");
 
     unsafe {
         test_exports::c::crsql_freeExtData(ext_data);
@@ -447,56 +449,285 @@ fn test_insert_db_version_cache() -> Result<(), ResultCode> {
     Ok(())
 }
 
-fn scalar(db: &sqlite::ManagedConnection, sql: &str) -> Result<i64, String> {
-    let stmt = db.prepare_v2(sql).map_err(|e| format!("prepare {sql}: {e:?}"))?;
-    match stmt.step() {
-        Ok(ResultCode::ROW) => {}
-        rc => {
-            return Err(format!(
-                "step {sql}: {rc:?} errmsg={:?}",
-                db.errmsg()
-            ))
-        }
-    }
-    Ok(stmt.column_int64(0))
+fn rollback_test_path() -> String {
+    let mut bytes = [0u8; 8];
+    sqlite::randomness(&mut bytes);
+    format!("test_db_version_rollback_{:016x}.db", u64::from_ne_bytes(bytes))
 }
 
-fn test_connection_state_refresh() -> Result<(), String> {
-    let a = crate::opendb_file("test_connection_state_refresh.db")
-        .map_err(|e| format!("open a: {e:?}"))?;
-    let b = crate::opendb_file("test_connection_state_refresh.db")
-        .map_err(|e| format!("open b: {e:?}"))?;
+fn remove_rollback_test_db(path: &str) {
+    let path = CString::new(path).unwrap();
+    #[cfg(not(target_os = "windows"))]
+    unsafe {
+        extern "C" {
+            fn unlink(path: *const c_char) -> core::ffi::c_int;
+        }
+        assert_eq!(unlink(path.as_ptr()), 0);
+    }
+    #[cfg(target_os = "windows")]
+    unsafe {
+        extern "C" {
+            fn _unlink(path: *const c_char) -> core::ffi::c_int;
+        }
+        assert_eq!(_unlink(path.as_ptr()), 0);
+    }
+}
+
+fn open_rollback_test_db(path: &str) -> Result<crate::CRConnection, ResultCode> {
+    let db = crate::opendb_file(path)?;
+    db.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+    db.db.exec_safe("SELECT crsql_as_crr('t')")?;
+    Ok(db)
+}
+
+fn test_connection_state_refresh() -> Result<(), ResultCode> {
+    let a = crate::opendb_file("test_connection_state_refresh.db")?;
+    let b = crate::opendb_file("test_connection_state_refresh.db")?;
     a.db.exec_safe(
         "DROP TABLE IF EXISTS foo;
         DROP TABLE IF EXISTS foo__crsql_clock;
         DELETE FROM crsql_master WHERE key = 'config.merge-equal-values';
         DELETE FROM crsql_db_versions;
         VACUUM;",
-    )
-    .map_err(|e| format!("reset db: {e:?}"))?;
-    a.db.exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, v)")
-        .map_err(|e| format!("create foo: {e:?}"))?;
-    a.db.exec_safe("SELECT crsql_as_crr('foo')")
-        .map_err(|e| format!("as_crr: {e:?}"))?;
-    assert_eq!(scalar(&a.db, "SELECT crsql_db_version()")?, 0);
+    )?;
+    a.db.exec_safe("CREATE TABLE foo (id PRIMARY KEY NOT NULL, v)")?;
+    a.db.exec_safe("SELECT crsql_as_crr('foo')")?;
+    assert_eq!(scalar(a.db.db, "SELECT crsql_db_version()")?, 0);
 
-    b.db.exec_safe("SELECT crsql_config_set('merge-equal-values', 1)")
-        .map_err(|e| format!("b set config 1: {e:?}"))?;
-    b.db.exec_safe("INSERT INTO foo VALUES (1, 'first')")
-        .map_err(|e| format!("b insert 1: {e:?}"))?;
-    assert_eq!(scalar(&a.db, "SELECT crsql_config_get('merge-equal-values')")?, 1);
-    assert_eq!(scalar(&a.db, "SELECT crsql_peek_next_db_version()")?, 2);
+    b.db.exec_safe("SELECT crsql_config_set('merge-equal-values', 1)")?;
+    b.db.exec_safe("INSERT INTO foo VALUES (1, 'first')")?;
+    assert_eq!(scalar(a.db.db, "SELECT crsql_config_get('merge-equal-values')")?, 1);
+    assert_eq!(scalar(a.db.db, "SELECT crsql_peek_next_db_version()")?, 2);
 
-    b.db.exec_safe("SELECT crsql_config_set('merge-equal-values', 0)")
-        .map_err(|e| format!("b set config 0: {e:?}"))?;
-    b.db.exec_safe("INSERT INTO foo VALUES (2, 'second')")
-        .map_err(|e| format!("b insert 2: {e:?}"))?;
-    assert_eq!(scalar(&a.db, "SELECT crsql_peek_next_db_version()")?, 3);
-    assert_eq!(scalar(&a.db, "SELECT crsql_config_get('merge-equal-values')")?, 0);
+    b.db.exec_safe("SELECT crsql_config_set('merge-equal-values', 0)")?;
+    b.db.exec_safe("INSERT INTO foo VALUES (2, 'second')")?;
+    assert_eq!(scalar(a.db.db, "SELECT crsql_peek_next_db_version()")?, 3);
+    assert_eq!(scalar(a.db.db, "SELECT crsql_config_get('merge-equal-values')")?, 0);
+    Ok(())
+}
+
+fn test_refresh_retries_after_reload_failure() -> Result<(), ResultCode> {
+    let path = rollback_test_path();
+    {
+        let a = open_rollback_test_db(&path)?;
+        let b = crate::opendb_file(&path)?;
+        assert_eq!(scalar(b.db.db, "SELECT crsql_db_version()")?, 0);
+
+        b.db.exec_safe("BEGIN")?;
+        b.db.exec_safe("SELECT crsql_config_set('merge-equal-values', 1)")?;
+        b.db.exec_safe(
+            "UPDATE crsql_master SET value = 'invalid' WHERE key = 'config.merge-equal-values'",
+        )?;
+        b.db.exec_safe("INSERT INTO t VALUES (1, 'external')")?;
+        b.db.exec_safe("COMMIT")?;
+
+        assert!(scalar(a.db.db, "SELECT crsql_config_get('merge-equal-values')").is_err());
+        a.db.exec_safe(
+            "UPDATE crsql_master SET value = 1 WHERE key = 'config.merge-equal-values'",
+        )?;
+        assert_eq!(
+            scalar(a.db.db, "SELECT crsql_config_get('merge-equal-values')")?,
+            1
+        );
+    }
+    remove_rollback_test_db(&path);
+    Ok(())
+}
+
+fn scalar(db: *mut sqlite::sqlite3, sql: &str) -> Result<i64, ResultCode> {
+    let stmt = db.prepare_v2(sql)?;
+    assert_eq!(stmt.step()?, ResultCode::ROW, "{sql}");
+    Ok(stmt.column_int64(0))
+}
+
+fn test_savepoint_rollback_after_first_write() -> Result<(), ResultCode> {
+    let path = rollback_test_path();
+    {
+        let db = open_rollback_test_db(&path)?;
+        db.db.exec_safe("BEGIN")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
+        db.db.exec_safe("INSERT INTO t VALUES (1, 'before')")?;
+        db.db.exec_safe("SAVEPOINT s")?;
+        db.db.exec_safe("INSERT INTO t VALUES (2, 'rolled back')")?;
+        db.db.exec_safe("ROLLBACK TO s")?;
+        db.db.exec_safe("RELEASE s")?;
+        db.db.exec_safe("INSERT INTO t VALUES (3, 'after')")?;
+        db.db.exec_safe("COMMIT")?;
+        assert_eq!(scalar(db.db.db, "SELECT count(*) FROM t")?, 2);
+        assert_eq!(
+            scalar(db.db.db, "SELECT count(*) FROM t__crsql_clock WHERE db_version = 1")?,
+            2
+        );
+    }
+    {
+        let db = crate::opendb_file(&path)?;
+        assert_eq!(scalar(db.db.db, "SELECT crsql_peek_next_db_version()")?, 2);
+        db.db.exec_safe("BEGIN")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000002')")?;
+        db.db.exec_safe("INSERT INTO t VALUES (4, 'next')")?;
+        db.db.exec_safe("COMMIT")?;
+        assert_eq!(scalar(db.db.db, "SELECT MAX(db_version) FROM t__crsql_clock")?, 2);
+    }
+    remove_rollback_test_db(&path);
+    Ok(())
+}
+
+fn test_savepoint_rollback_without_surviving_writes() -> Result<(), ResultCode> {
+    let path = rollback_test_path();
+    {
+        let db = open_rollback_test_db(&path)?;
+        db.db.exec_safe("BEGIN")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
+        db.db.exec_safe("SAVEPOINT s")?;
+        db.db.exec_safe("INSERT INTO t VALUES (1, 'rolled back')")?;
+        db.db.exec_safe("ROLLBACK TO s")?;
+        db.db.exec_safe("RELEASE s")?;
+        db.db.exec_safe("COMMIT")?;
+        assert_eq!(scalar(db.db.db, "SELECT count(*) FROM t__crsql_clock")?, 0);
+        assert_eq!(scalar(db.db.db, "SELECT MAX(db_version) FROM crsql_db_versions")?, 1);
+    }
+    {
+        let db = crate::opendb_file(&path)?;
+        assert_eq!(scalar(db.db.db, "SELECT crsql_peek_next_db_version()")?, 2);
+        db.db.exec_safe("BEGIN")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000002')")?;
+        db.db.exec_safe("INSERT INTO t VALUES (2, 'first committed')")?;
+        db.db.exec_safe("COMMIT")?;
+        assert_eq!(scalar(db.db.db, "SELECT MAX(db_version) FROM t__crsql_clock")?, 2);
+    }
+    remove_rollback_test_db(&path);
+    Ok(())
+}
+
+fn test_transaction_rollback_does_not_persist_version() -> Result<(), ResultCode> {
+    let path = rollback_test_path();
+    {
+        let db = open_rollback_test_db(&path)?;
+        db.db.exec_safe("BEGIN")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
+        db.db.exec_safe("INSERT INTO t VALUES (1, 'rolled back')")?;
+        db.db.exec_safe("ROLLBACK")?;
+        assert_eq!(scalar(db.db.db, "SELECT count(*) FROM crsql_db_versions")?, 0);
+    }
+    {
+        let db = crate::opendb_file(&path)?;
+        assert_eq!(scalar(db.db.db, "SELECT crsql_peek_next_db_version()")?, 1);
+        db.db.exec_safe("BEGIN")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000002')")?;
+        db.db.exec_safe("INSERT INTO t VALUES (2, 'kept')")?;
+        db.db.exec_safe("COMMIT")?;
+        assert_eq!(scalar(db.db.db, "SELECT MAX(db_version) FROM crsql_db_versions")?, 1);
+    }
+    remove_rollback_test_db(&path);
+    Ok(())
+}
+
+fn test_stale_version_aborts_commit() -> Result<(), ResultCode> {
+    let path = rollback_test_path();
+    {
+        let db = open_rollback_test_db(&path)?;
+        db.db.exec_safe("BEGIN")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
+        db.db.exec_safe("INSERT INTO t VALUES (1, 'kept')")?;
+        db.db.exec_safe(
+            "INSERT INTO crsql_db_versions (site_id, db_version) VALUES (crsql_site_id(), 9)",
+        )?;
+        assert_eq!(db.db.exec_safe("COMMIT"), Err(ResultCode::CONSTRAINT));
+        assert_eq!(scalar(db.db.db, "SELECT count(*) FROM t")?, 0);
+        assert_eq!(scalar(db.db.db, "SELECT count(*) FROM crsql_db_versions")?, 0);
+    }
+    remove_rollback_test_db(&path);
+    Ok(())
+}
+
+fn test_savepoint_rollback_first_write_then_commit() -> Result<(), ResultCode> {
+    let path = rollback_test_path();
+    let persisted_version = {
+        let db = open_rollback_test_db(&path)?;
+        db.db.exec_safe("BEGIN")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
+        db.db.exec_safe("SAVEPOINT s")?;
+        db.db.exec_safe("INSERT INTO t VALUES (1, 'rolled back')")?;
+        db.db.exec_safe("ROLLBACK TO s")?;
+        db.db.exec_safe("RELEASE s")?;
+        db.db.exec_safe("INSERT INTO t VALUES (2, 'kept')")?;
+        db.db.exec_safe("COMMIT")?;
+        assert_eq!(scalar(db.db.db, "SELECT MAX(db_version) FROM t__crsql_clock")?, 1);
+        scalar(
+            db.db.db,
+            "SELECT COALESCE((SELECT db_version FROM crsql_db_versions WHERE site_id = crsql_site_id()), 0)",
+        )?
+    };
+    let (next_version, written_version, timestamps) = {
+        let db = crate::opendb_file(&path)?;
+        let next_version = scalar(db.db.db, "SELECT crsql_peek_next_db_version()")?;
+        db.db.exec_safe("BEGIN")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000002')")?;
+        db.db.exec_safe("INSERT INTO t VALUES (3, 'next')")?;
+        db.db.exec_safe("COMMIT")?;
+        (
+            next_version,
+            scalar(db.db.db, "SELECT MAX(db_version) FROM t__crsql_clock")?,
+            scalar(
+                db.db.db,
+                "SELECT COUNT(DISTINCT ts) FROM t__crsql_clock WHERE db_version = 1",
+            )?,
+        )
+    };
+    remove_rollback_test_db(&path);
+    assert_eq!(persisted_version, 1, "committed clock version must be persisted");
+    assert_eq!(next_version, 2, "committed version 1 must not be reused after reopening");
+    assert_eq!(written_version, 2);
+    assert_eq!(timestamps, 1, "separate transactions must not share db_version 1");
+    Ok(())
+}
+
+fn test_failed_statement_then_commit_does_not_reuse_version() -> Result<(), ResultCode> {
+    let path = rollback_test_path();
+    let persisted_version = {
+        let db = open_rollback_test_db(&path)?;
+        db.db.exec_safe("BEGIN")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000001')")?;
+        assert_eq!(
+            db.db.exec_safe("INSERT INTO t VALUES (1, 'first'), (1, 'duplicate')"),
+            Err(ResultCode::CONSTRAINT)
+        );
+        assert_eq!(scalar(db.db.db, "SELECT count(*) FROM t")?, 0);
+        db.db.exec_safe("INSERT INTO t VALUES (2, 'kept')")?;
+        db.db.exec_safe("COMMIT")?;
+        assert_eq!(scalar(db.db.db, "SELECT count(*) FROM t__crsql_clock")?, 1);
+        scalar(
+            db.db.db,
+            "SELECT COALESCE((SELECT db_version FROM crsql_db_versions WHERE site_id = crsql_site_id()), 0)",
+        )?
+    };
+    let (next_version, written_version, timestamps) = {
+        let db = crate::opendb_file(&path)?;
+        let next_version = scalar(db.db.db, "SELECT crsql_peek_next_db_version()")?;
+        db.db.exec_safe("BEGIN")?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000002')")?;
+        db.db.exec_safe("INSERT INTO t VALUES (3, 'next')")?;
+        db.db.exec_safe("COMMIT")?;
+        (
+            next_version,
+            scalar(db.db.db, "SELECT MAX(db_version) FROM t__crsql_clock")?,
+            scalar(
+                db.db.db,
+                "SELECT COUNT(DISTINCT ts) FROM t__crsql_clock WHERE db_version = 1",
+            )?,
+        )
+    };
+    remove_rollback_test_db(&path);
+    assert_eq!(persisted_version, 1, "the surviving write must persist version 1");
+    assert_eq!(next_version, 2, "a later transaction must not reuse version 1");
+    assert_eq!(written_version, 2);
+    assert_eq!(timestamps, 1, "separate transactions must not share db_version 1");
     Ok(())
 }
 
 pub fn run_suite() -> Result<(), String> {
+    test_refresh_retries_after_reload_failure()
+        .map_err(|e| format!("test_refresh_retries_after_reload_failure failed: {e:?}"))?;
     test_connection_state_refresh().map_err(|e| format!("test_connection_state_refresh failed: {:?}", e))?;
     test_fetch_db_version_from_storage()?;
     test_next_db_version()?;
@@ -505,6 +736,18 @@ pub fn run_suite() -> Result<(), String> {
     test_get_or_set_pk_cl().map_err(|e| format!("test_get_or_set_pk_cl failed: {:?}", e))?;
     test_insert_db_version_cache()
         .map_err(|e| format!("test_insert_db_version_cache failed: {:?}", e))?;
+    test_savepoint_rollback_after_first_write()
+        .map_err(|e| format!("test_savepoint_rollback_after_first_write failed: {:?}", e))?;
+    test_savepoint_rollback_without_surviving_writes()
+        .map_err(|e| format!("test_savepoint_rollback_without_surviving_writes failed: {:?}", e))?;
+    test_transaction_rollback_does_not_persist_version()
+        .map_err(|e| format!("test_transaction_rollback_does_not_persist_version failed: {:?}", e))?;
+    test_stale_version_aborts_commit()
+        .map_err(|e| format!("test_stale_version_aborts_commit failed: {:?}", e))?;
+    test_failed_statement_then_commit_does_not_reuse_version()
+        .map_err(|e| format!("test_failed_statement_then_commit_does_not_reuse_version failed: {:?}", e))?;
+    test_savepoint_rollback_first_write_then_commit()
+        .map_err(|e| format!("test_savepoint_rollback_first_write_then_commit failed: {:?}", e))?;
     Ok(())
 }
 

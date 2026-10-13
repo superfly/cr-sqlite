@@ -27,16 +27,33 @@ pub fn refresh_connection_state_if_needed(
     db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
 ) -> Result<(), String> {
+    let (previous_data_version, previous_db_version) = unsafe {
+        ((*ext_data).pragmaDataVersion, (*ext_data).dbVersion)
+    };
     let rc = unsafe { crsql_fetchPragmaDataVersion(db, ext_data) };
     if rc == -1 {
+        unsafe {
+            (*ext_data).pragmaDataVersion = previous_data_version;
+            (*ext_data).dbVersion = previous_db_version;
+        }
         return Err("failed to fetch PRAGMA data_version".to_string());
     }
+    // `data_version` cannot distinguish "unchanged" from "never loaded":
+    // dbVersion is the one lazily-initialized cache, so its -1 sentinel
+    // doubles as the first-load check for all of them.
     if rc == 0 && unsafe { (*ext_data).dbVersion } != -1 {
         return Ok(());
     }
-    crate::db_version::reload_db_version(db, ext_data)?;
-    crate::config::reload_connection_config(db, ext_data)?;
-    Ok(())
+    let result = crate::db_version::reload_db_version(db, ext_data)
+        .map(|_| ())
+        .and_then(|_| crate::config::reload_connection_config(db, ext_data));
+    if result.is_err() {
+        unsafe {
+            (*ext_data).pragmaDataVersion = previous_data_version;
+            (*ext_data).dbVersion = previous_db_version;
+        }
+    }
+    result
 }
 
 #[no_mangle]

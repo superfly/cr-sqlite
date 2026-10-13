@@ -70,6 +70,8 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   pExtData->tableInfos = 0;
   pExtData->lastDbVersions = 0;
   pExtData->ordinalMap = 0;
+  pExtData->pVersionGuardStmt = 0;
+  pExtData->versionGuardEnlisted = 0;
   pExtData->rowsImpacted = 0;
   pExtData->updatedTableInfosThisTx = 0;
   crsql_init_table_info_vec(pExtData);
@@ -143,6 +145,7 @@ void crsql_freeExtData(crsql_ExtData *pExtData) {
   }
   sqlite3_finalize(pExtData->pDbVersionStmt);
   sqlite3_finalize(pExtData->pSetDbVersionStmt);
+  sqlite3_finalize(pExtData->pVersionGuardStmt);
   sqlite3_finalize(pExtData->pPragmaSchemaVersionStmt);
   sqlite3_finalize(pExtData->pPragmaDataVersionStmt);
   sqlite3_finalize(pExtData->pSetSyncBitStmt);
@@ -156,6 +159,7 @@ void crsql_freeExtData(crsql_ExtData *pExtData) {
   }
   pExtData->pDbVersionStmt = 0;
   pExtData->pSetDbVersionStmt = 0;
+  pExtData->pVersionGuardStmt = 0;
   pExtData->pPragmaSchemaVersionStmt = 0;
   pExtData->pPragmaDataVersionStmt = 0;
   pExtData->pSetSyncBitStmt = 0;
@@ -179,6 +183,7 @@ void crsql_finalize(crsql_ExtData *pExtData) {
   // printf("crsql_finalize\n");
   sqlite3_finalize(pExtData->pDbVersionStmt);
   sqlite3_finalize(pExtData->pSetDbVersionStmt);
+  sqlite3_finalize(pExtData->pVersionGuardStmt);
   sqlite3_finalize(pExtData->pPragmaSchemaVersionStmt);
   sqlite3_finalize(pExtData->pPragmaDataVersionStmt);
   sqlite3_finalize(pExtData->pSetSyncBitStmt);
@@ -193,6 +198,7 @@ void crsql_finalize(crsql_ExtData *pExtData) {
   crsql_clear_stmt_cache(pExtData);
   pExtData->pDbVersionStmt = 0;
   pExtData->pSetDbVersionStmt = 0;
+  pExtData->pVersionGuardStmt = 0;
   pExtData->pPragmaSchemaVersionStmt = 0;
   pExtData->pPragmaDataVersionStmt = 0;
   pExtData->pSetSyncBitStmt = 0;
