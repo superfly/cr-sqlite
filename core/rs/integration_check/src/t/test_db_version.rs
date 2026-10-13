@@ -538,6 +538,28 @@ fn test_connection_state_refresh() -> Result<(), ResultCode> {
     Ok(())
 }
 
+fn test_v2_config_refresh_updates_db_version() -> Result<(), ResultCode> {
+    let path = rollback_test_path();
+    {
+        let a = crate::opendb_file(&path)?;
+        let b = crate::opendb_file(&path)?;
+        assert_eq!(scalar(a.db.db, "SELECT crsql_db_version()")?, 0);
+
+        b.db.exec_safe("SELECT crsql_config_set('metadata-write-version', 3)")?;
+        b.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+        b.db.exec_safe("SELECT crsql_as_crr('t')")?;
+        b.db.exec_safe("INSERT INTO t VALUES (1, 'external')")?;
+
+        assert_eq!(
+            scalar(a.db.db, "SELECT crsql_config_get('metadata-write-version')")?,
+            3
+        );
+        assert_eq!(scalar(a.db.db, "SELECT crsql_peek_next_db_version()")?, 2);
+    }
+    remove_rollback_test_db(&path);
+    Ok(())
+}
+
 fn test_refresh_retries_after_reload_failure() -> Result<(), ResultCode> {
     let path = rollback_test_path();
     {
@@ -760,6 +782,8 @@ fn test_failed_statement_then_commit_does_not_reuse_version() -> Result<(), Resu
 pub fn run_suite() -> Result<(), String> {
     test_refresh_retries_after_reload_failure()
         .map_err(|e| format!("test_refresh_retries_after_reload_failure failed: {e:?}"))?;
+    test_v2_config_refresh_updates_db_version()
+        .map_err(|e| format!("test_v2_config_refresh_updates_db_version failed: {e:?}"))?;
     test_connection_state_refresh().map_err(|e| format!("test_connection_state_refresh failed: {:?}", e))?;
     test_fetch_db_version_from_storage()?;
     test_next_db_version()?;

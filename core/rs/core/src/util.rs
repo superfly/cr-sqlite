@@ -193,18 +193,20 @@ pub unsafe fn get_master_value_cached(
     if stmt.is_null() {
         return Err(ResultCode::ERROR);
     }
-    stmt.bind_text(1, key, Destructor::STATIC)?;
-    match stmt.step()? {
-        ResultCode::ROW => {
-            let value = stmt.column_int64(0);
-            stmt.reset()?;
-            stmt.clear_bindings()?;
-            Ok(Some(value))
+    let result = stmt.bind_text(1, key, Destructor::STATIC).and_then(|_| {
+        match stmt.step()? {
+            ResultCode::ROW => Ok(Some(stmt.column_int64(0))),
+            _ => Ok(None),
         }
-        _ => {
-            stmt.reset()?;
-            stmt.clear_bindings()?;
-            Ok(None)
+    });
+    let reset_result = stmt.reset();
+    let clear_result = stmt.clear_bindings();
+    match result {
+        Err(rc) => Err(rc),
+        Ok(value) => {
+            reset_result?;
+            clear_result?;
+            Ok(value)
         }
     }
 }

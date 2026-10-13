@@ -88,35 +88,7 @@ pub unsafe fn ensure_config_current(
         return Ok(());
     }
 
-    let data_version_changed = crate::c::crsql_fetchPragmaDataVersion(db, ext_data);
-    if data_version_changed < 0 {
-        return Err(config_refresh_error(db, ext_data, "PRAGMA data_version", None));
-    }
-
-    if data_version_changed != 0 {
-        let config_values = [
-            (MERGE_EQUAL_VALUES, &mut (*ext_data).mergeEqualValues),
-            (METADATA_WRITE_VERSION, &mut (*ext_data).metadataWriteVersion),
-            (METADATA_USE_VERSION, &mut (*ext_data).metadataUseVersion),
-            (SYNC_LOG_VERSION, &mut (*ext_data).syncLogVersion),
-        ];
-        for (name, target) in config_values {
-            let key = format!("config.{name}");
-            match crate::util::get_master_value_cached(ext_data, &key) {
-                Ok(Some(value)) => *target = value as c_int,
-                Ok(None) => {}
-                Err(_) => {
-                    return Err(config_refresh_error(
-                        db,
-                        ext_data,
-                        "read config (cached step)",
-                        Some(name),
-                    ));
-                }
-            }
-        }
-    }
-
+    crate::ext_data::refresh_connection_state_if_needed(db, ext_data)?;
     (*ext_data).checkedConfigThisTx = if autocommit { 0 } else { 1 };
     Ok(())
 }
@@ -128,7 +100,7 @@ pub fn reload_connection_config(
     let stmt = db
         .prepare_v2("SELECT value FROM crsql_master WHERE key = 'config.merge-equal-values'")
         .map_err(|rc| format!("failed to prepare config refresh: {rc}"))?;
-    let value = match stmt.step() {
+    let merge_equal_values = match stmt.step() {
         Ok(ResultCode::ROW) => {
             if stmt.column_type(0) != Ok(ColumnType::Integer) {
                 return Err("invalid merge-equal-values setting".into());
@@ -138,7 +110,25 @@ pub fn reload_connection_config(
         Ok(ResultCode::DONE) => 0,
         Ok(rc) | Err(rc) => return Err(format!("failed to read config: {rc}")),
     };
-    unsafe { (*ext_data).mergeEqualValues = value };
+    let read_cached = |name: &str| {
+        let key = format!("config.{name}");
+        unsafe { crate::util::get_master_value_cached(ext_data, &key) }.map_err(|_| unsafe {
+            config_refresh_error(db, ext_data, "read config (cached step)", Some(name))
+        })
+    };
+    let metadata_write_version = read_cached(METADATA_WRITE_VERSION)?
+        .unwrap_or(METADATA_WRITE_VERSION_DEFAULT as i64) as c_int;
+    let metadata_use_version = read_cached(METADATA_USE_VERSION)?
+        .unwrap_or(METADATA_USE_VERSION_DEFAULT as i64) as c_int;
+    let sync_log_version = read_cached(SYNC_LOG_VERSION)?
+        .unwrap_or(SYNC_LOG_VERSION_DEFAULT as i64) as c_int;
+
+    unsafe {
+        (*ext_data).mergeEqualValues = merge_equal_values;
+        (*ext_data).metadataWriteVersion = metadata_write_version;
+        (*ext_data).metadataUseVersion = metadata_use_version;
+        (*ext_data).syncLogVersion = sync_log_version;
+    }
     Ok(())
 }
 
