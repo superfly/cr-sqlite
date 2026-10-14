@@ -9,7 +9,7 @@ use sqlite::{sqlite3, Connection, ResultCode, Stmt};
 use sqlite_nostd as sqlite;
 
 use crate::{
-    c::{crsql_ExtData, crsql_fetchPragmaDataVersion},
+    c::{crsql_ExtData, crsql_readPragmaDataVersion},
     util::get_db_version_union_query,
 };
 
@@ -17,43 +17,53 @@ use crate::{
  * Refresh connection-local state cached in `crsql_ExtData` after another
  * connection committed changes to the database.
  *
- * `PRAGMA data_version` only changes for commits made by other connections
- * and is pinned while this connection holds a transaction open, so this is a
- * cheap no-op in the common case. When the data version did change, every
- * cached value is reloaded through its own reload_* function so independent
- * caches cannot observe the same change inconsistently.
+ * Read the data version on every call rather than tracking a per-transaction
+ * flag; stepping the cached PRAGMA statement is cheaper than accounting for
+ * read-only commits and savepoint rollbacks. When the data version changes,
+ * load each cache into temporary state and apply it only after every load
+ * succeeds.
  */
 pub fn refresh_connection_state_if_needed(
     db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
 ) -> Result<(), String> {
-    let (previous_data_version, previous_db_version) = unsafe {
-        ((*ext_data).pragmaDataVersion, (*ext_data).dbVersion)
-    };
-    let rc = unsafe { crsql_fetchPragmaDataVersion(db, ext_data) };
-    if rc == -1 {
-        unsafe {
-            (*ext_data).pragmaDataVersion = previous_data_version;
-            (*ext_data).dbVersion = previous_db_version;
-        }
+    let mut data_version = 0;
+    let rc = unsafe { crsql_readPragmaDataVersion(ext_data, &mut data_version) };
+    if rc != ResultCode::OK as c_int {
         return Err("failed to fetch PRAGMA data_version".to_string());
     }
-    // `data_version` cannot distinguish "unchanged" from "never loaded":
-    // dbVersion is the one lazily-initialized cache, so its -1 sentinel
-    // doubles as the first-load check for all of them.
-    if rc == 0 && unsafe { (*ext_data).dbVersion } != -1 {
+    if data_version == unsafe { (*ext_data).pragmaDataVersion }
+        && unsafe { (*ext_data).dbVersion } != -1
+    {
         return Ok(());
     }
-    let result = crate::db_version::reload_db_version(db, ext_data)
-        .map(|_| ())
-        .and_then(|_| crate::config::reload_connection_config(db, ext_data));
-    if result.is_err() {
-        unsafe {
-            (*ext_data).pragmaDataVersion = previous_data_version;
-            (*ext_data).dbVersion = previous_db_version;
-        }
+
+    let config = crate::config::load_connection_config(db, ext_data)?;
+    let db_version = crate::db_version::load_db_version(ext_data)?;
+    crate::crsql_debug!(
+        "connection state refresh data_version={} -> {} db_version={} -> {} write_version={} -> {} use_version={} -> {} sync_log_version={} -> {} merge_equal_values={} -> {}",
+        unsafe { (*ext_data).pragmaDataVersion },
+        data_version,
+        unsafe { (*ext_data).dbVersion },
+        db_version,
+        unsafe { (*ext_data).metadataWriteVersion },
+        config.metadata_write_version,
+        unsafe { (*ext_data).metadataUseVersion },
+        config.metadata_use_version,
+        unsafe { (*ext_data).syncLogVersion },
+        config.sync_log_version,
+        unsafe { (*ext_data).mergeEqualValues },
+        config.merge_equal_values
+    );
+    unsafe {
+        (*ext_data).mergeEqualValues = config.merge_equal_values;
+        (*ext_data).metadataWriteVersion = config.metadata_write_version;
+        (*ext_data).metadataUseVersion = config.metadata_use_version;
+        (*ext_data).syncLogVersion = config.sync_log_version;
+        (*ext_data).dbVersion = db_version;
+        (*ext_data).pragmaDataVersion = data_version;
     }
-    result
+    Ok(())
 }
 
 #[no_mangle]
@@ -71,6 +81,9 @@ pub fn recreate_db_version_stmt(
     db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
 ) -> Result<ResultCode, ResultCode> {
+    if ext_data.is_null() {
+        return Err(ResultCode::ERROR);
+    }
     let clock_tables_stmt = unsafe { (*ext_data).pSelectClockTablesStmt };
     let db_version_stmt = unsafe { (*ext_data).pDbVersionStmt };
 

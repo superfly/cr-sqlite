@@ -14,6 +14,12 @@ pub unsafe extern "C" fn crsql_commit_hook(user_data: *mut c_void) -> c_int {
     let ext_data = user_data as *mut crsql_ExtData;
 
     if (*ext_data).pendingDbVersion > -1 {
+        crate::crsql_debug!(
+            "db_version commit current={} pending={} guard_enlisted={}",
+            (*ext_data).dbVersion,
+            (*ext_data).pendingDbVersion,
+            (*ext_data).versionGuardEnlisted
+        );
         (*ext_data).dbVersion = (*ext_data).pendingDbVersion;
     }
 
@@ -28,14 +34,21 @@ pub unsafe extern "C" fn crsql_commit_hook(user_data: *mut c_void) -> c_int {
 // staticlib WASM build. Return void to match.
 #[no_mangle]
 pub unsafe extern "C" fn crsql_rollback_hook(user_data: *mut c_void) {
-    commit_or_rollback_reset(user_data as *mut crsql_ExtData);
+    let ext_data = user_data as *mut crsql_ExtData;
+    if (*ext_data).pendingDbVersion > -1 {
+        crate::crsql_debug!(
+            "db_version rollback current={} discarded_pending={}",
+            (*ext_data).dbVersion,
+            (*ext_data).pendingDbVersion
+        );
+    }
+    commit_or_rollback_reset(ext_data);
 }
 
 pub unsafe fn commit_or_rollback_reset(ext_data: *mut crsql_ExtData) {
     (*ext_data).pendingDbVersion = -1;
     (*ext_data).seq = 0;
     (*ext_data).timestamp = 0;
-    (*ext_data).updatedTableInfosThisTx = 0;
 
     let mut ordinals: mem::ManuallyDrop<Box<BTreeMap<Vec<u8>, i64>>> = mem::ManuallyDrop::new(
         Box::from_raw((*ext_data).ordinalMap as *mut BTreeMap<Vec<u8>, i64>),

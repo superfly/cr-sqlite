@@ -18,6 +18,7 @@ use crate::tableinfo::{crsql_ensure_table_infos_are_up_to_date, ColumnInfo, Tabl
 pub mod after_delete;
 pub mod after_insert;
 pub mod after_update;
+pub mod v2;
 
 fn trigger_fn_preamble<F>(
     ctx: *mut sqlite::context,
@@ -43,6 +44,11 @@ where
             "failed to ensure table infos are up to date: {}",
             rc
         ));
+    }
+
+    // Enforce timestamp: either per-transaction (crsql_set_ts) or default-ts must be set.
+    if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
+        return Err("timestamp not set — call crsql_set_ts() first or set default-ts".to_string());
     }
 
     let mut table_infos =
@@ -111,7 +117,7 @@ fn mark_new_pk_row_created(
     result
 }
 
-fn bump_seq(ext_data: *mut crsql_ExtData) -> c_int {
+pub fn bump_seq(ext_data: *mut crsql_ExtData) -> c_int {
     unsafe {
         (*ext_data).seq += 1;
         (*ext_data).seq - 1

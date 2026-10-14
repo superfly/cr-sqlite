@@ -2,11 +2,19 @@
 #define CRSQLITE_EXTDATA_H
 
 #include "sqlite3ext.h"
+#include <stddef.h>
 SQLITE_EXTENSION_INIT3
 
 // NOTE: any changes here must be updated in `c.rs` until we've finished porting
 // to rust.
 typedef struct crsql_ExtData crsql_ExtData;
+typedef void (*crsql_debug_callback_fn)(void *, const unsigned char *, size_t);
+typedef struct crsql_DebugCallback crsql_DebugCallback;
+struct crsql_DebugCallback {
+  crsql_debug_callback_fn callback;
+  void *context;
+};
+
 struct crsql_ExtData {
   // perma statement -- used to check db schema version
   sqlite3_stmt *pPragmaSchemaVersionStmt;
@@ -22,11 +30,6 @@ struct crsql_ExtData {
   sqlite3_int64 pendingDbVersion;
 
   int pragmaSchemaVersion;
-  int updatedTableInfosThisTx;
-
-  // we need another schema version number that tracks when we checked it
-  // for zpTableInfos.
-  int pragmaSchemaVersionForTableInfos;
 
   unsigned char *siteId;
   sqlite3_stmt *pDbVersionStmt;
@@ -47,8 +50,13 @@ struct crsql_ExtData {
   sqlite3_stmt *pSelectClockTablesStmt;
 
   int mergeEqualValues;
+  int metadataWriteVersion;
+  int metadataUseVersion;
+  int syncLogVersion;
   unsigned long long timestamp;
+  unsigned long long defaultTimestamp;
   void *ordinalMap;
+  sqlite3_stmt *pConfigValueStmt;
   sqlite3_stmt *pVersionGuardStmt;
   int versionGuardEnlisted;
 };
@@ -56,9 +64,8 @@ struct crsql_ExtData {
 crsql_ExtData *crsql_newExtData(sqlite3 *db);
 int crsql_initSiteIdExt(sqlite3 *db, crsql_ExtData *pExtData, unsigned char *siteIdBuffer);
 void crsql_freeExtData(crsql_ExtData *pExtData);
-int crsql_fetchPragmaSchemaVersion(sqlite3 *db, crsql_ExtData *pExtData,
-                                   int which);
-int crsql_fetchPragmaDataVersion(sqlite3 *db, crsql_ExtData *pExtData);
+int crsql_readPragmaSchemaVersion(crsql_ExtData *pExtData, int *schemaVersion);
+int crsql_readPragmaDataVersion(crsql_ExtData *pExtData, int *dataVersion);
 int crsql_recreate_db_version_stmt(sqlite3 *db, crsql_ExtData *pExtData);
 void crsql_finalize(crsql_ExtData *pExtData);
 void crsql_init_ordinal_map(crsql_ExtData *pExtData);

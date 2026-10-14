@@ -50,10 +50,18 @@ pub extern "C" fn crsql_peek_next_db_version(
 
 pub fn peek_next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> Result<i64, String> {
     if unsafe { (*ext_data).versionGuardEnlisted } != 0 {
-        return Ok(unsafe { (*ext_data).pendingDbVersion });
+        let version = unsafe { (*ext_data).pendingDbVersion };
+        crate::crsql_debug!("db_version peek reused pending={}", version);
+        return Ok(version);
     }
     crate::ext_data::refresh_connection_state_if_needed(db, ext_data)?;
-    Ok(unsafe { (*ext_data).dbVersion + 1 })
+    let version = unsafe { (*ext_data).dbVersion + 1 };
+    crate::crsql_debug!(
+        "db_version peek current={} next={}",
+        unsafe { (*ext_data).dbVersion },
+        version
+    );
+    Ok(version)
 }
 
 /**
@@ -65,67 +73,63 @@ pub fn peek_next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> R
  */
 pub fn next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> Result<i64, String> {
     if unsafe { (*ext_data).versionGuardEnlisted } != 0 {
-        return Ok(unsafe { (*ext_data).pendingDbVersion });
+        let version = unsafe { (*ext_data).pendingDbVersion };
+        crate::crsql_debug!("db_version reuse pending={}", version);
+        return Ok(version);
     }
     crate::ext_data::refresh_connection_state_if_needed(db, ext_data)?;
     unsafe {
-        let ret = (*ext_data).dbVersion + 1;
+        let current = (*ext_data).dbVersion;
+        let ret = current + 1;
         (*ext_data).pendingDbVersion = ret;
-        if crsql_enlist_db_version(db, ext_data) != ResultCode::OK as c_int {
+        let rc = crsql_enlist_db_version(db, ext_data);
+        if rc != ResultCode::OK as c_int {
+            crate::crsql_debug!(
+                "db_version enlist failed current={} pending={} rc={}",
+                current,
+                ret,
+                rc
+            );
             // xSync must not persist a version when enlistment failed.
             (*ext_data).versionGuardEnlisted = 0;
             return Err("failed to enlist db_version guard".into());
         }
+        crate::crsql_debug!(
+            "db_version allocated current={} pending={} guard=enlisted",
+            current,
+            ret
+        );
         Ok(ret)
     }
 }
 
-pub fn reload_db_version(
-    _db: *mut sqlite3,
-    ext_data: *mut crsql_ExtData,
-) -> Result<ResultCode, String> {
+pub fn load_db_version(ext_data: *mut crsql_ExtData) -> Result<i64, String> {
     unsafe {
         let site_id_slice = core::slice::from_raw_parts((*ext_data).siteId, SITE_ID_LEN as usize);
-
-        let db_version_stmt = (*ext_data).pDbVersionStmt;
-
-        let bind_result = (*ext_data).pDbVersionStmt.bind_blob(
-            1,
-            site_id_slice,
-            sqlite_nostd::Destructor::STATIC,
-        );
-
-        if bind_result.is_err() {
+        let stmt = (*ext_data).pDbVersionStmt;
+        if stmt
+            .bind_blob(1, site_id_slice, sqlite_nostd::Destructor::STATIC)
+            .is_err()
+        {
+            let _ = reset_cached_stmt(stmt);
             return Err("failed binding to db_version_stmt".into());
         }
-        let rc = db_version_stmt.step();
-        match rc {
-            // no rows? We're a fresh db with the min starting version
-            Ok(ResultCode::DONE) => {
-                db_version_stmt.reset().or_else(|rc| {
-                    Err(format!(
-                        "failed to reset db version stmt after DONE: {}",
-                        rc
-                    ))
-                })?;
-                (*ext_data).dbVersion = MIN_POSSIBLE_DB_VERSION;
-                Ok(ResultCode::OK)
-            }
-            // got a row? It is our db version.
-            Ok(ResultCode::ROW) => {
-                (*ext_data).dbVersion = db_version_stmt.column_int64(0);
-                db_version_stmt
-                    .reset()
-                    .or_else(|rc| Err(format!("failed to reset db version stmt after ROW: {}", rc)))
-            }
-            // Not row or done? Something went wrong.
+
+        let version = match stmt.step() {
+            Ok(ResultCode::DONE) => MIN_POSSIBLE_DB_VERSION,
+            Ok(ResultCode::ROW) => stmt.column_int64(0),
             Ok(rc) | Err(rc) => {
-                db_version_stmt.reset().or_else(|rc| {
-                    Err(format!("failed to reset db version stmt after ROW: {}", rc))
-                })?;
-                Err(format!("failed to step db version stmt: {}", rc))
+                let _ = reset_cached_stmt(stmt);
+                return Err(format!("failed to step db version stmt: {rc}"));
             }
-        }
+        };
+        reset_cached_stmt(stmt).map_err(|rc| format!("failed to reset db version stmt: {rc:?}"))?;
+        crate::crsql_debug!(
+            "db_version loaded site_id={:?} version={}",
+            site_id_slice,
+            version
+        );
+        Ok(version)
     }
 }
 
@@ -144,18 +148,26 @@ pub extern "C" fn crsql_init_ordinal_map(ext_data: *mut crsql_ExtData) {
 #[no_mangle]
 pub extern "C" fn crsql_drop_last_db_versions_map(ext_data: *mut crsql_ExtData) {
     unsafe {
+        if (*ext_data).lastDbVersions.is_null() {
+            return;
+        }
         drop(Box::from_raw(
             (*ext_data).lastDbVersions as *mut BTreeMap<Vec<u8>, i64>,
         ));
+        (*ext_data).lastDbVersions = core::ptr::null_mut();
     }
 }
 
 #[no_mangle]
 pub extern "C" fn crsql_drop_ordinal_map(ext_data: *mut crsql_ExtData) {
     unsafe {
+        if (*ext_data).ordinalMap.is_null() {
+            return;
+        }
         drop(Box::from_raw(
             (*ext_data).ordinalMap as *mut BTreeMap<Vec<u8>, i64>,
         ));
+        (*ext_data).ordinalMap = core::ptr::null_mut();
     }
 }
 
@@ -197,6 +209,12 @@ pub fn insert_db_version(
         };
 
         if cached_db_v >= insert_db_vrsn {
+            crate::crsql_debug!(
+                "db_version incoming ignored site_id={:?} incoming={} cached={}",
+                insert_site_id,
+                insert_db_vrsn,
+                cached_db_v
+            );
             // already inserted a greater or equal db version!
             return Ok(());
         }
@@ -208,8 +226,18 @@ pub fn insert_db_version(
             // cause we can get our own rows from other nodes but the version should never be greater than our own.
             let db_version = (*ext_data).dbVersion;
             if insert_db_vrsn > db_version {
+                crate::crsql_debug!(
+                    "db_version incoming rejected for local site incoming={} current={}",
+                    insert_db_vrsn,
+                    db_version
+                );
                 return Err(ResultCode::ERROR);
             }
+            crate::crsql_debug!(
+                "db_version incoming ignored for local site incoming={} current={}",
+                insert_db_vrsn,
+                db_version
+            );
             return Ok(());
         }
 
@@ -231,6 +259,12 @@ pub fn insert_db_version(
 
         // this is still the biggest db version we've seen in this transaction.
         last_db_versions.insert(insert_site_id.to_vec(), insert_db_vrsn);
+        crate::crsql_debug!(
+            "db_version incoming upserted site_id={:?} version={} ordinal={}",
+            insert_site_id,
+            insert_db_vrsn,
+            ordinal
+        );
         Ok(())
     }
 }

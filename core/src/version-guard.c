@@ -21,6 +21,8 @@
 
 #include "consts.h"
 
+extern void crsql_debug_db_version_sync(sqlite3_int64 version, int rc);
+
 typedef struct {
   sqlite3_vtab base;
   crsql_ExtData *extData;
@@ -116,7 +118,9 @@ static int versionGuardSync(sqlite3_vtab *vtab) {
     result = rc;
   }
   rc = sqlite3_reset(stmt);
-  return result == SQLITE_OK ? rc : result;
+  int finalResult = result == SQLITE_OK ? rc : result;
+  crsql_debug_db_version_sync(version, finalResult);
+  return finalResult;
 }
 
 static int versionGuardEnd(sqlite3_vtab *vtab) {

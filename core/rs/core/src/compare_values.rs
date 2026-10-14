@@ -21,6 +21,20 @@ pub fn crsql_compare_sqlite_values(l: *mut sqlite::value, r: *mut sqlite::value)
         sqlite::ColumnType::Float => {
             let l_double = l.double();
             let r_double = r.double();
+            // NaN compares as not-less-than and not-greater-than everything,
+            // which would make NaN == NaN (and NaN == any float) incorrectly.
+            // When either value is NaN, compare by bit pattern so that
+            // differing representations are detected as changed.
+            if l_double.is_nan() || r_double.is_nan() {
+                let l_bits = l_double.to_bits();
+                let r_bits = r_double.to_bits();
+                if l_bits < r_bits {
+                    return -1;
+                } else if l_bits > r_bits {
+                    return 1;
+                }
+                return 0;
+            }
             if l_double < r_double {
                 return -1;
             } else if l_double > r_double {

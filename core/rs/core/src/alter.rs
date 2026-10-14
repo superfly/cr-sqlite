@@ -32,9 +32,14 @@ unsafe fn compact_post_alter(
     ext_data: *mut crsql_ExtData,
     errmsg: *mut *mut c_char,
 ) -> Result<ResultCode, ResultCode> {
+    if tbl_name.is_null() {
+        return Err(ResultCode::MISUSE);
+    }
     let tbl_name_str = CStr::from_ptr(tbl_name).to_str()?;
     refresh_connection_state_if_needed(db, ext_data).or_else(|msg| {
-        errmsg.set(&msg);
+        if !errmsg.is_null() {
+            errmsg.set(&msg);
+        }
         Err(ResultCode::ERROR)
     })?;
     let current_db_version = (*ext_data).dbVersion;
@@ -69,6 +74,7 @@ unsafe fn compact_post_alter(
              DROP TABLE \"{table_name}__crsql_pks\";",
             table_name = crate::util::escape_ident(tbl_name_str),
         ))?;
+        crate::tableinfo::invalidate_table_info_cache(ext_data);
     } else {
         // clock table is still relevant but needs compacting
         // in case columns were removed during the migration
@@ -88,9 +94,10 @@ unsafe fn compact_post_alter(
         // TODO: if we move the sentinel metadata to the lookaside this becomes much simpler
         let mut sql = String::from(
             format!(
-              "DELETE FROM \"{tbl_name}__crsql_clock\" WHERE (col_name != '-1' OR (col_name = '-1' AND col_version % 2 != 0))
+              "DELETE FROM \"{tbl_name}__crsql_clock\" WHERE (col_name != '{cl_sentinel}' OR (col_name = '{cl_sentinel}' AND col_version % 2 != 0))
               AND NOT EXISTS (SELECT 1 FROM \"{tbl_name}\" JOIN \"{tbl_name}__crsql_pks\" ON ",
               tbl_name = crate::util::escape_ident(tbl_name_str),
+              cl_sentinel = crate::c::DELETE_SENTINEL,
             ),
         );
         let c_rc = crsql_ensure_table_infos_are_up_to_date(db, ext_data, errmsg);
@@ -140,10 +147,6 @@ unsafe fn compact_post_alter(
         db.exec_safe(&sql)?;
     }
 
-    let stmt = db.prepare_v2(
-        "INSERT OR REPLACE INTO crsql_master (key, value) VALUES ('pre_compact_dbversion', ?)",
-    )?;
-    stmt.bind_int64(1, current_db_version)?;
-    stmt.step()?;
+    crate::util::set_master_value(db, "pre_compact_dbversion", current_db_version)?;
     Ok(ResultCode::OK)
 }
