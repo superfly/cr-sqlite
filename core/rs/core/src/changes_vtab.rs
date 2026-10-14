@@ -412,7 +412,7 @@ unsafe fn changes_filter(
 
     let metadata_use_version = unsafe { (*(*tab).pExtData).metadataUseVersion };
     let sync_log_version = unsafe { (*(*tab).pExtData).syncLogVersion };
-    let schema_version = unsafe { (*(*tab).pExtData).pragmaSchemaVersionForTableInfos };
+    let schema_version = unsafe { (*(*tab).pExtData).pragmaSchemaVersion };
 
     // Check if we can reuse the cached prepared statement.
     // Cache hit: cached stmt exists + same idx_str + same config + same schema version.

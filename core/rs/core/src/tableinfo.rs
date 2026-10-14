@@ -1,7 +1,6 @@
 use crate::alloc::string::ToString;
 use crate::c::crsql_ExtData;
-use crate::c::crsql_fetchPragmaSchemaVersion;
-use crate::c::TABLE_INFO_SCHEMA_VERSION;
+use crate::c::crsql_readPragmaSchemaVersion;
 use crate::consts;
 use crate::pack_columns::bind_package_to_stmt;
 use crate::pack_columns::ColumnValue;
@@ -976,6 +975,15 @@ pub extern "C" fn crsql_drop_table_info_vec(ext_data: *mut crsql_ExtData) {
     }
 }
 
+pub fn invalidate_table_info_cache(ext_data: *mut crsql_ExtData) {
+    if ext_data.is_null() {
+        return;
+    }
+    unsafe {
+        (*ext_data).pragmaSchemaVersion = -1;
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
     db: *mut sqlite::sqlite3,
@@ -993,24 +1001,19 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
         return ResultCode::ERROR as c_int;
     }
 
-    let schema_changed =
-        unsafe { crsql_fetchPragmaSchemaVersion(db, ext_data, TABLE_INFO_SCHEMA_VERSION) };
-
-    if schema_changed != 0 && schema_changed != 1 {
+    let mut schema_version = 0;
+    let rc = unsafe { crsql_readPragmaSchemaVersion(ext_data, &mut schema_version) };
+    if rc != ResultCode::OK as c_int {
         if !err.is_null() && unsafe { (*err).is_null() } {
             unsafe {
-                *err = CString::new("Could not fetch SQLite schema version")
+                *err = CString::new("Could not read SQLite schema version")
                     .expect("static error has no NUL")
                     .into_raw();
             }
         }
         return ResultCode::ERROR as c_int;
     }
-
-    let already_updated = unsafe { (*ext_data).updatedTableInfosThisTx == 1 };
-    if already_updated && schema_changed == 0 {
-        return ResultCode::OK as c_int;
-    }
+    let schema_changed = schema_version != unsafe { (*ext_data).pragmaSchemaVersion };
 
     // Some embedding paths can invoke a CRR operation before the optional
     // table-info vector has been allocated. Treat that as an empty cache and
@@ -1023,7 +1026,7 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
         Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>)
     };
 
-    if schema_changed > 0 || table_infos.len() == 0 {
+    if schema_changed || table_infos.len() == 0 {
         // SAFETY: Replacing the cached Vec<TableInfo> contents is safe because
         // callers of `crsql_ensure_table_infos_are_up_to_date` call it *before*
         // borrowing any `&TableInfo` from the vec. No operation performed
@@ -1038,10 +1041,8 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
         match pull_all_table_infos(db, ext_data, err) {
             Ok(new_table_infos) => {
                 *table_infos = new_table_infos;
+                unsafe { (*ext_data).pragmaSchemaVersion = schema_version };
                 forget(table_infos);
-                unsafe {
-                    (*ext_data).updatedTableInfosThisTx = 1;
-                }
                 return ResultCode::OK as c_int;
             }
             Err(e) => {
@@ -1052,9 +1053,6 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
     }
 
     forget(table_infos);
-    unsafe {
-        (*ext_data).updatedTableInfosThisTx = 1;
-    }
     return ResultCode::OK as c_int;
 }
 

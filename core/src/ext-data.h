@@ -20,7 +20,6 @@ struct crsql_ExtData {
   sqlite3_stmt *pPragmaSchemaVersionStmt;
   sqlite3_stmt *pPragmaDataVersionStmt;
   int pragmaDataVersion;
-  int checkedConfigThisTx;
 
   // this gets set at the start of each transaction on the first invocation
   // to crsql_next_db_version()
@@ -31,11 +30,6 @@ struct crsql_ExtData {
   sqlite3_int64 pendingDbVersion;
 
   int pragmaSchemaVersion;
-  int updatedTableInfosThisTx;
-
-  // we need another schema version number that tracks when we checked it
-  // for zpTableInfos.
-  int pragmaSchemaVersionForTableInfos;
 
   unsigned char *siteId;
   sqlite3_stmt *pDbVersionStmt;
@@ -70,9 +64,8 @@ struct crsql_ExtData {
 crsql_ExtData *crsql_newExtData(sqlite3 *db);
 int crsql_initSiteIdExt(sqlite3 *db, crsql_ExtData *pExtData, unsigned char *siteIdBuffer);
 void crsql_freeExtData(crsql_ExtData *pExtData);
-int crsql_fetchPragmaSchemaVersion(sqlite3 *db, crsql_ExtData *pExtData,
-                                   int which);
-int crsql_fetchPragmaDataVersion(sqlite3 *db, crsql_ExtData *pExtData);
+int crsql_readPragmaSchemaVersion(crsql_ExtData *pExtData, int *schemaVersion);
+int crsql_readPragmaDataVersion(crsql_ExtData *pExtData, int *dataVersion);
 int crsql_recreate_db_version_stmt(sqlite3 *db, crsql_ExtData *pExtData);
 void crsql_finalize(crsql_ExtData *pExtData);
 void crsql_init_ordinal_map(crsql_ExtData *pExtData);

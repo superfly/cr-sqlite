@@ -80,52 +80,29 @@ pub fn next_db_version(db: *mut sqlite3, ext_data: *mut crsql_ExtData) -> Result
     }
 }
 
-pub fn reload_db_version(
-    _db: *mut sqlite3,
-    ext_data: *mut crsql_ExtData,
-) -> Result<ResultCode, String> {
+pub fn load_db_version(ext_data: *mut crsql_ExtData) -> Result<i64, String> {
     unsafe {
         let site_id_slice = core::slice::from_raw_parts((*ext_data).siteId, SITE_ID_LEN as usize);
-
-        let db_version_stmt = (*ext_data).pDbVersionStmt;
-
-        let bind_result = (*ext_data).pDbVersionStmt.bind_blob(
-            1,
-            site_id_slice,
-            sqlite_nostd::Destructor::STATIC,
-        );
-
-        if bind_result.is_err() {
+        let stmt = (*ext_data).pDbVersionStmt;
+        if stmt
+            .bind_blob(1, site_id_slice, sqlite_nostd::Destructor::STATIC)
+            .is_err()
+        {
+            let _ = reset_cached_stmt(stmt);
             return Err("failed binding to db_version_stmt".into());
         }
-        let rc = db_version_stmt.step();
-        match rc {
-            // no rows? We're a fresh db with the min starting version
-            Ok(ResultCode::DONE) => {
-                db_version_stmt.reset().or_else(|rc| {
-                    Err(format!(
-                        "failed to reset db version stmt after DONE: {}",
-                        rc
-                    ))
-                })?;
-                (*ext_data).dbVersion = MIN_POSSIBLE_DB_VERSION;
-                Ok(ResultCode::OK)
-            }
-            // got a row? It is our db version.
-            Ok(ResultCode::ROW) => {
-                (*ext_data).dbVersion = db_version_stmt.column_int64(0);
-                db_version_stmt
-                    .reset()
-                    .or_else(|rc| Err(format!("failed to reset db version stmt after ROW: {}", rc)))
-            }
-            // Not row or done? Something went wrong.
+
+        let version = match stmt.step() {
+            Ok(ResultCode::DONE) => MIN_POSSIBLE_DB_VERSION,
+            Ok(ResultCode::ROW) => stmt.column_int64(0),
             Ok(rc) | Err(rc) => {
-                db_version_stmt.reset().or_else(|rc| {
-                    Err(format!("failed to reset db version stmt after ROW: {}", rc))
-                })?;
-                Err(format!("failed to step db version stmt: {}", rc))
+                let _ = reset_cached_stmt(stmt);
+                return Err(format!("failed to step db version stmt: {rc}"));
             }
-        }
+        };
+        reset_cached_stmt(stmt)
+            .map_err(|rc| format!("failed to reset db version stmt: {rc:?}"))?;
+        Ok(version)
     }
 }
 

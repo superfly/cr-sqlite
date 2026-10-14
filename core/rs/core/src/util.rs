@@ -195,7 +195,13 @@ pub unsafe fn get_master_value_cached(
     }
     let result = stmt.bind_text(1, key, Destructor::STATIC).and_then(|_| {
         match stmt.step()? {
-            ResultCode::ROW => Ok(Some(stmt.column_int64(0))),
+            ResultCode::ROW => {
+                if ColumnType::from_i32(sqlite::column_type(stmt, 0)) != Some(ColumnType::Integer) {
+                    Err(ResultCode::ERROR)
+                } else {
+                    Ok(Some(stmt.column_int64(0)))
+                }
+            }
             _ => Ok(None),
         }
     });

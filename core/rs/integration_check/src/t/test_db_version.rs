@@ -42,7 +42,7 @@ fn get_site_id(db: *mut sqlite::sqlite3) -> *mut c_char {
     buf as *mut c_char
 }
 
-fn test_fetch_db_version_from_storage() -> Result<ResultCode, String> {
+fn test_load_db_version_from_storage() -> Result<ResultCode, String> {
     let c = crate::opendb().expect("db opened");
     let db = &c.db;
     let raw_db = db.db;
@@ -50,35 +50,26 @@ fn test_fetch_db_version_from_storage() -> Result<ResultCode, String> {
     let site_id = get_site_id(raw_db);
 
     let ext_data = unsafe { test_exports::c::crsql_newExtData(raw_db) };
-    let rc = unsafe { test_exports::c::crsql_initSiteIdExt(raw_db, ext_data, site_id as *mut core::ffi::c_uchar) };
+    let rc = unsafe {
+        test_exports::c::crsql_initSiteIdExt(raw_db, ext_data, site_id as *mut core::ffi::c_uchar)
+    };
     assert_eq!(rc, 0);
 
-    test_exports::db_version::reload_db_version(raw_db, ext_data)?;
-    // no clock tables, no version.
-    assert_eq!(0, unsafe { (*ext_data).dbVersion });
+    assert_eq!(test_exports::db_version::load_db_version(ext_data)?, 0);
+    assert_eq!(-1, unsafe { (*ext_data).dbVersion });
+    assert_eq!(test_exports::db_version::load_db_version(ext_data)?, 0);
 
-    // this was a bug where calling twice on a fresh db would fail the second
-    // time.
-    test_exports::db_version::reload_db_version(raw_db, ext_data)?;
-    // should still return same data on a subsequent call with no schema
-    assert_eq!(0, unsafe { (*ext_data).dbVersion });
-
-    // create some schemas
     db.exec_safe("CREATE TABLE foo (a primary key not null, b);")
         .expect("made foo");
     db.exec_safe("SELECT crsql_set_ts('1700000000')")
         .expect("set ts");
     db.exec_safe("SELECT crsql_as_crr('foo');")
         .expect("made foo crr");
-    test_exports::db_version::reload_db_version(raw_db, ext_data)?;
-    // still v0 since no rows are inserted
-    assert_eq!(0, unsafe { (*ext_data).dbVersion });
+    assert_eq!(test_exports::db_version::load_db_version(ext_data)?, 0);
 
-    // version is bumped due to insert
     db.exec_safe("INSERT INTO foo (a, b) VALUES (1, 2);")
         .expect("inserted");
-    test_exports::db_version::reload_db_version(raw_db, ext_data)?;
-    assert_eq!(1, unsafe { (*ext_data).dbVersion });
+    assert_eq!(test_exports::db_version::load_db_version(ext_data)?, 1);
 
     db.exec_safe("CREATE TABLE bar (a primary key not null, b);")
         .expect("created bar");
@@ -89,11 +80,8 @@ fn test_fetch_db_version_from_storage() -> Result<ResultCode, String> {
     db.exec_safe("INSERT INTO bar VALUES (1, 2)")
         .expect("inserted into bar");
 
-    test_exports::db_version::reload_db_version(raw_db, ext_data)?;
-    assert_eq!(2, unsafe { (*ext_data).dbVersion });
-
-    test_exports::db_version::reload_db_version(raw_db, ext_data)?;
-    assert_eq!(2, unsafe { (*ext_data).dbVersion });
+    assert_eq!(test_exports::db_version::load_db_version(ext_data)?, 2);
+    assert_eq!(test_exports::db_version::load_db_version(ext_data)?, 2);
 
     unsafe {
         test_exports::c::crsql_freeExtData(ext_data);
@@ -538,6 +526,77 @@ fn test_connection_state_refresh() -> Result<(), ResultCode> {
     Ok(())
 }
 
+fn test_table_info_refresh_after_crr_creation_in_tx() -> Result<(), String> {
+    let path = rollback_test_path();
+    {
+        let db = open_rollback_test_db(&path).map_err(|e| format!("open: {e:?}"))?;
+        db.db.exec_safe("BEGIN IMMEDIATE")
+            .map_err(|e| format!("begin immediate: {e:?}"))?;
+        db.db.exec_safe("SELECT crsql_set_ts('1700000001')")
+            .map_err(|e| format!("set ts: {e:?}"))?;
+        db.db.exec_safe("CREATE TABLE t2 (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")
+            .map_err(|e| format!("create t2: {e:?}"))?;
+        db.db.exec_safe("SELECT crsql_as_crr('t2')")
+            .map_err(|e| format!("as_crr t2: {e:?}"))?;
+        db.db.exec_safe("INSERT INTO t2 VALUES (1, 'new crr')")
+            .map_err(|e| {
+                format!(
+                    "insert t2: {e:?} errmsg={}",
+                    db.db.errmsg().unwrap_or_else(|_| alloc::string::ToString::to_string("unknown"))
+                )
+            })?;
+        db.db.exec_safe("COMMIT")
+            .map_err(|e| format!("commit: {e:?}"))?;
+        assert_eq!(
+            scalar(db.db.db, "SELECT count(*) FROM t2__crsql_v2_clock")
+                .map_err(|e| format!("count clock: {e:?}"))?,
+            1
+        );
+    }
+    remove_rollback_test_db(&path);
+    Ok(())
+}
+
+fn test_read_only_connection_refreshes_db_version() -> Result<(), ResultCode> {
+    let path = rollback_test_path();
+    {
+        let writer = crate::opendb_file(&path)?;
+        writer
+            .db
+            .exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+        writer.db.exec_safe("SELECT crsql_as_crr('t')")?;
+        let observer = crate::opendb_file(&path)?;
+        let mut previous_data_version = scalar(observer.db.db, "PRAGMA data_version")?;
+        assert_eq!(scalar(observer.db.db, "SELECT crsql_db_version()")?, 0);
+
+        for version in 1_i64..=3 {
+            writer.db.exec_safe("BEGIN")?;
+            writer.db.exec_safe(&format!(
+                "SELECT crsql_set_ts('{}')",
+                1700000000 + version
+            ))?;
+            writer
+                .db
+                .exec_safe(&format!("INSERT INTO t VALUES ({version}, 'value')"))?;
+            writer.db.exec_safe("COMMIT")?;
+
+            let data_version = scalar(observer.db.db, "PRAGMA data_version")?;
+            assert_ne!(data_version, previous_data_version);
+            assert_eq!(
+                scalar(observer.db.db, "SELECT crsql_db_version()")?,
+                version
+            );
+            assert_eq!(
+                scalar(observer.db.db, "SELECT crsql_peek_next_db_version()")?,
+                version + 1
+            );
+            previous_data_version = data_version;
+        }
+    }
+    remove_rollback_test_db(&path);
+    Ok(())
+}
+
 fn test_v2_config_refresh_updates_db_version() -> Result<(), ResultCode> {
     let path = rollback_test_path();
     {
@@ -560,11 +619,66 @@ fn test_v2_config_refresh_updates_db_version() -> Result<(), ResultCode> {
     Ok(())
 }
 
-fn test_refresh_retries_after_reload_failure() -> Result<(), ResultCode> {
+fn test_table_info_refresh_after_read_only_transaction() -> Result<(), ResultCode> {
     let path = rollback_test_path();
     {
         let a = open_rollback_test_db(&path)?;
         let b = crate::opendb_file(&path)?;
+        let site_id = get_site_id(a.db.db);
+        let ext_data = unsafe { test_exports::c::crsql_newExtData(a.db.db) };
+        let rc = unsafe {
+            test_exports::c::crsql_initSiteIdExt(
+                a.db.db,
+                ext_data,
+                site_id as *mut core::ffi::c_uchar,
+            )
+        };
+        assert_eq!(rc, 0);
+
+        a.db.exec_safe("BEGIN")?;
+        let mut err = core::ptr::null_mut();
+        assert_eq!(
+            test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(
+                a.db.db,
+                ext_data,
+                &mut err,
+            ),
+            ResultCode::OK as i32
+        );
+        let cached_schema_version = unsafe { (*ext_data).pragmaSchemaVersion };
+        a.db.exec_safe("COMMIT")?;
+
+        b.db.exec_safe("CREATE TABLE unrelated (id INTEGER)")?;
+        let schema_version = scalar(a.db.db, "PRAGMA schema_version")? as i32;
+        assert_ne!(schema_version, cached_schema_version);
+
+        a.db.exec_safe("BEGIN")?;
+        assert_eq!(
+            test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(
+                a.db.db,
+                ext_data,
+                &mut err,
+            ),
+            ResultCode::OK as i32
+        );
+        assert_eq!(
+            unsafe { (*ext_data).pragmaSchemaVersion },
+            schema_version
+        );
+        a.db.exec_safe("COMMIT")?;
+        unsafe { test_exports::c::crsql_freeExtData(ext_data) };
+    }
+    remove_rollback_test_db(&path);
+    Ok(())
+}
+
+fn test_refresh_retries_after_reload_failure() -> Result<(), ResultCode> {
+    let path = rollback_test_path();
+    {
+        let a = crate::opendb_file(&path)?;
+        let b = crate::opendb_file(&path)?;
+        b.db.exec_safe("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL, v TEXT)")?;
+        b.db.exec_safe("SELECT crsql_as_crr('t')")?;
         assert_eq!(scalar(b.db.db, "SELECT crsql_db_version()")?, 0);
 
         b.db.exec_safe("BEGIN")?;
@@ -583,6 +697,7 @@ fn test_refresh_retries_after_reload_failure() -> Result<(), ResultCode> {
             scalar(a.db.db, "SELECT crsql_config_get('merge-equal-values')")?,
             1
         );
+        assert_eq!(scalar(a.db.db, "SELECT crsql_peek_next_db_version()")?, 2);
     }
     remove_rollback_test_db(&path);
     Ok(())
@@ -780,12 +895,18 @@ fn test_failed_statement_then_commit_does_not_reuse_version() -> Result<(), Resu
 }
 
 pub fn run_suite() -> Result<(), String> {
+    test_table_info_refresh_after_crr_creation_in_tx()
+        .map_err(|e| format!("test_table_info_refresh_after_crr_creation_in_tx failed: {e:?}"))?;
     test_refresh_retries_after_reload_failure()
         .map_err(|e| format!("test_refresh_retries_after_reload_failure failed: {e:?}"))?;
+    test_read_only_connection_refreshes_db_version()
+        .map_err(|e| format!("test_read_only_connection_refreshes_db_version failed: {e:?}"))?;
     test_v2_config_refresh_updates_db_version()
         .map_err(|e| format!("test_v2_config_refresh_updates_db_version failed: {e:?}"))?;
+    test_table_info_refresh_after_read_only_transaction()
+        .map_err(|e| format!("test_table_info_refresh_after_read_only_transaction failed: {e:?}"))?;
     test_connection_state_refresh().map_err(|e| format!("test_connection_state_refresh failed: {:?}", e))?;
-    test_fetch_db_version_from_storage()?;
+    test_load_db_version_from_storage()?;
     test_next_db_version()?;
     test_get_or_set_site_ordinal()
         .map_err(|e| format!("test_get_or_set_site_ordinal failed: {:?}", e))?;

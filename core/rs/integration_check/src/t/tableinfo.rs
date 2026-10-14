@@ -73,9 +73,6 @@ fn test_ensure_table_infos_are_up_to_date() {
     // we're going to change table infos so we can check that it does not get filled again since no schema changes happened
     table_infos[0].tbl_name = "bar".to_string();
 
-    unsafe {
-        (*ext_data).updatedTableInfosThisTx = 0;
-    }
     let rc = test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err);
     assert_eq!(rc, ResultCode::OK as c_int);
 
@@ -97,9 +94,6 @@ fn test_ensure_table_infos_are_up_to_date() {
     )
     .expect("made boo clock");
 
-    unsafe {
-        (*ext_data).updatedTableInfosThisTx = 0;
-    }
     let rc = test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err);
     assert_eq!(rc, ResultCode::OK as c_int);
 
@@ -114,9 +108,6 @@ fn test_ensure_table_infos_are_up_to_date() {
     c.exec_safe("DROP TABLE foo__crsql_clock")
         .expect("dropped foo clock");
 
-    unsafe {
-        (*ext_data).updatedTableInfosThisTx = 0;
-    }
     let rc = test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err);
     assert_eq!(rc, ResultCode::OK as c_int);
     drop_err_ptr(err);
@@ -159,7 +150,6 @@ fn test_reinitializes_null_table_info_cache() {
     );
     unsafe { test_exports::tableinfo::crsql_drop_table_info_vec(ext_data) };
     assert!(unsafe { (*ext_data).tableInfos.is_null() });
-    unsafe { (*ext_data).updatedTableInfosThisTx = 0 };
 
     // A remote merge can arrive through a connection whose cache has not been
     // initialized. The refresh path must recreate the empty cache instead of

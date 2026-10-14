@@ -146,14 +146,9 @@ fn crsql_as_table_impl(
     // Stale markers would cause incremental_maintenance to drop freshly re-created
     // CRR metadata tables on re-registration.
     unsafe { crate::util::clear_all_per_table_master_keys(db, table); }
-    // The DDL above (DROP TABLE, DROP TRIGGER) bumps PRAGMA schema_version,
-    // which would trigger a cache refresh on the next `ensure` call. But
-    // `updatedTableInfosThisTx` may still be 1 from earlier in this transaction,
-    // causing `ensure` to skip the refresh. Reset it to force a re-pull so
-    // the dropped CRR's TableInfo is removed from the in-memory cache.
-    if !ext_data.is_null() {
-        unsafe { (*ext_data).updatedTableInfosThisTx = 0; }
-    }
+    // The DDL above (DROP TABLE, DROP TRIGGER) invalidates cached table info.
+    // Force the next `ensure` call to reload the schema without this CRR.
+    crate::tableinfo::invalidate_table_info_cache(ext_data);
     Ok(ResultCode::OK)
 }
 
@@ -1034,6 +1029,7 @@ unsafe extern "C" fn x_crsql_as_crr(
         return;
     }
 
+    crate::tableinfo::invalidate_table_info_cache(ext_data);
     let rc = db.exec_safe("RELEASE as_crr");
     if rc.is_err() {
         ctx.result_error("failed to release as_crr savepoint");
@@ -1104,8 +1100,10 @@ unsafe extern "C" fn x_crsql_begin_alter(
         sqlite::result_error_code(ctx, rc.unwrap_err() as c_int);
         let _ = db.exec_safe("ROLLBACK TO alter_crr");
         let _ = db.exec_safe("RELEASE alter_crr");
+        crate::tableinfo::invalidate_table_info_cache(ext_data);
         return;
     }
+    crate::tableinfo::invalidate_table_info_cache(ext_data);
     ctx.result_text_static("OK");
 }
 
@@ -1134,6 +1132,7 @@ unsafe extern "C" fn x_crsql_commit_alter(
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
     let mut err_msg = null_mut();
     let db = ctx.db_handle();
+    crate::tableinfo::invalidate_table_info_cache(ext_data);
 
     // V2 clock tables require a non-zero ts. Error early if not set.
     if unsafe { crate::config::ensure_timestamp(ext_data).is_err() } {
@@ -1146,6 +1145,7 @@ unsafe extern "C" fn x_crsql_commit_alter(
             Ok(table_info) => {
                 match create_triggers(db, &table_info, &mut err_msg) {
                     Ok(ResultCode::OK) => {
+                        crate::tableinfo::invalidate_table_info_cache(ext_data);
                         // need to ensure the right table infos in ext data
                         crsql_ensure_table_infos_are_up_to_date(
                             db,
@@ -1209,7 +1209,7 @@ unsafe extern "C" fn x_crsql_commit_alter(
         }
 
         if rc == ResultCode::OK as c_int {
-            crsql_create_crr(
+            let create_rc = crsql_create_crr(
                 db,
                 schema_name.as_ptr() as *const c_char,
                 table_name.as_ptr() as *const c_char,
@@ -1218,7 +1218,11 @@ unsafe extern "C" fn x_crsql_commit_alter(
                 0,
                 0,
                 &mut err_msg as *mut _,
-            )
+            );
+            if create_rc == ResultCode::OK as c_int {
+                crate::tableinfo::invalidate_table_info_cache(ext_data);
+            }
+            create_rc
         } else {
             rc
         }
@@ -1245,6 +1249,7 @@ unsafe extern "C" fn x_crsql_commit_alter(
         // which restores the triggers that crsql_begin_alter dropped.
         let _ = db.exec_safe("ROLLBACK TO alter_crr");
         let _ = db.exec_safe("RELEASE alter_crr");
+        crate::tableinfo::invalidate_table_info_cache(ext_data);
         return;
     }
 }

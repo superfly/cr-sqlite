@@ -74,6 +74,7 @@ unsafe fn compact_post_alter(
              DROP TABLE \"{table_name}__crsql_pks\";",
             table_name = crate::util::escape_ident(tbl_name_str),
         ))?;
+        crate::tableinfo::invalidate_table_info_cache(ext_data);
     } else {
         // clock table is still relevant but needs compacting
         // in case columns were removed during the migration

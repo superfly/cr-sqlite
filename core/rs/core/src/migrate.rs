@@ -102,6 +102,7 @@ unsafe fn incremental_maintenance(
     // Priority 1: V1 table cleanup tasks (from v2&v1 -> v2 transition)
     process_cleanup_tasks(
         db,
+        ext_data,
         chunk_size,
         &mut total_remaining,
         "cleanup_v1_tables",
@@ -111,6 +112,7 @@ unsafe fn incremental_maintenance(
     // Priority 2: V2 table cleanup tasks (from v2&v1 -> v1 rollback)
     process_cleanup_tasks(
         db,
+        ext_data,
         chunk_size,
         &mut total_remaining,
         "cleanup_v2_tables",
@@ -199,7 +201,10 @@ unsafe fn incremental_maintenance(
         if !has_v2 && migration_queued {
             // First call for this table: create V2 tables
             match crate::bootstrap_v2::create_v2_tables(db, tbl_info) {
-                Ok(_) => crate::crsql_debug!("migration: created v2 tables for {}", tbl_info.tbl_name),
+                Ok(_) => {
+                    crate::crsql_debug!("migration: created v2 tables for {}", tbl_info.tbl_name);
+                    crate::tableinfo::invalidate_table_info_cache(ext_data);
+                }
                 Err(e) => {
                     crate::crsql_debug!(
                         "migration: create_v2_tables failed for {}: {:?}",
@@ -244,6 +249,7 @@ unsafe fn incremental_maintenance(
 /// suffixed table, and drops the tables when empty. Clears the marker when done.
 unsafe fn process_cleanup_tasks(
     db: *mut sqlite3,
+    ext_data: *mut crsql_ExtData,
     chunk_size: c_int,
     total_remaining: &mut i64,
     marker_prefix: &str,
@@ -271,7 +277,7 @@ unsafe fn process_cleanup_tasks(
             }
             continue;
         }
-        let remaining = cleanup_tables_chunk(db, tbl_name, budget, suffixes)?;
+        let remaining = cleanup_tables_chunk(db, ext_data, tbl_name, budget, suffixes)?;
         budget -= chunk_size as i64 - remaining.max(0);
         if remaining == 0 {
             crate::util::clear_master_key(db, &format!("{}_{}", marker_prefix, tbl_name))?;
@@ -330,6 +336,7 @@ unsafe fn table_exists(db: *mut sqlite3, escaped: &str, suffix: &str) -> bool {
 
 unsafe fn cleanup_tables_chunk(
     db: *mut sqlite3,
+    ext_data: *mut crsql_ExtData,
     tbl_name: &str,
     chunk_size: i64,
     suffixes: &[&str],
@@ -409,6 +416,7 @@ unsafe fn cleanup_tables_chunk(
                     suffix = suffix,
                 ))?;
             }
+            crate::tableinfo::invalidate_table_info_cache(ext_data);
             crate::util::clear_master_key(db, &total_key)?;
             return Ok(0i64);
         }
@@ -439,6 +447,7 @@ unsafe fn cleanup_tables_chunk(
                         suffix = suffix,
                     ))?;
                 }
+                crate::tableinfo::invalidate_table_info_cache(ext_data);
                 crate::util::clear_master_key(db, &total_key)?;
                 return Ok(0i64);
             }

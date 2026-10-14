@@ -38,8 +38,6 @@ static void textNewExtData() {
   assert(pExtData->pPragmaDataVersionStmt != 0);
   // last schema version fetched -- none so -1
   assert(pExtData->pragmaSchemaVersion == -1);
-  // same as above
-  assert(pExtData->pragmaSchemaVersionForTableInfos == -1);
   // set in initSiteId
   assert(pExtData->siteId != 0);
   // statement used to get pDbVersionStmt
@@ -51,9 +49,6 @@ static void textNewExtData() {
 
   // data version should have been fetched
   assert(pExtData->pragmaDataVersion != -1);
-  // configuration has not yet been checked in a transaction
-  assert(pExtData->checkedConfigThisTx == 0);
-
   crsql_finalize(pExtData);
   crsql_freeExtData(pExtData);
   crsql_close(db);
@@ -99,60 +94,51 @@ static void testFinalize() {
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
-static void testFetchPragmaSchemaVersion() {
-  printf("FetchPragmaSchemaVersion\n");
+static void testReadPragmaSchemaVersion() {
+  printf("ReadPragmaSchemaVersion\n");
   sqlite3 *db;
   int rc;
-  int didChange = 0;
   rc = sqlite3_open(":memory:", &db);
   assert(rc == SQLITE_OK);
   unsigned char *siteIdBuffer =
       sqlite3_malloc(SITE_ID_LEN * sizeof *(siteIdBuffer));
   crsql_ExtData *pExtData = crsqlExtDataInit(db, siteIdBuffer);
 
-  // fetch the schema info for db version update
-  didChange = crsql_fetchPragmaSchemaVersion(db, pExtData, 0);
-  assert(pExtData->pragmaSchemaVersion != -1);
-  assert(didChange == 1);
+  int schemaVersion = -1;
+  rc = crsql_readPragmaSchemaVersion(pExtData, &schemaVersion);
+  assert(rc == SQLITE_OK);
+  assert(schemaVersion != -1);
+  assert(pExtData->pragmaSchemaVersion == -1);
 
-  // fetch the schema info for table info
-  didChange = crsql_fetchPragmaSchemaVersion(db, pExtData, 1);
-  assert(didChange == 1);
-  assert(pExtData->pragmaSchemaVersionForTableInfos != -1);
+  int oldVersion = schemaVersion;
+  rc = crsql_readPragmaSchemaVersion(pExtData, &schemaVersion);
+  assert(rc == SQLITE_OK);
+  assert(schemaVersion == oldVersion);
+  assert(pExtData->pragmaSchemaVersion == -1);
 
-  // re-fetch both with no schema change, should be same value
-  int oldVersion = pExtData->pragmaSchemaVersion;
-  didChange = crsql_fetchPragmaSchemaVersion(db, pExtData, 0);
-  assert(oldVersion == pExtData->pragmaSchemaVersion);
-  assert(didChange == 0);
-
-  oldVersion = pExtData->pragmaSchemaVersionForTableInfos;
-  didChange = crsql_fetchPragmaSchemaVersion(db, pExtData, 1);
-  assert(oldVersion == pExtData->pragmaSchemaVersionForTableInfos);
-  assert(didChange == 0);
-
-  // now make a schema modification
   sqlite3_exec(db, "CREATE TABLE foo (a)", 0, 0, 0);
-  oldVersion = pExtData->pragmaSchemaVersion;
-  didChange = crsql_fetchPragmaSchemaVersion(db, pExtData, 0);
-  assert(oldVersion != pExtData->pragmaSchemaVersion);
-  assert(didChange == 1);
+  rc = crsql_readPragmaSchemaVersion(pExtData, &schemaVersion);
+  assert(rc == SQLITE_OK);
+  assert(schemaVersion != oldVersion);
+  assert(pExtData->pragmaSchemaVersion == -1);
 
-  oldVersion = pExtData->pragmaSchemaVersionForTableInfos;
-  didChange = crsql_fetchPragmaSchemaVersion(db, pExtData, 1);
-  assert(oldVersion != pExtData->pragmaSchemaVersionForTableInfos);
-  assert(didChange == 1);
-
-  // re-fetch both with no schema change again, should be same value
-  oldVersion = pExtData->pragmaSchemaVersion;
-  didChange = crsql_fetchPragmaSchemaVersion(db, pExtData, 0);
-  assert(oldVersion == pExtData->pragmaSchemaVersion);
-  assert(didChange == 0);
-
-  oldVersion = pExtData->pragmaSchemaVersionForTableInfos;
-  didChange = crsql_fetchPragmaSchemaVersion(db, pExtData, 1);
-  assert(oldVersion == pExtData->pragmaSchemaVersionForTableInfos);
-  assert(didChange == 0);
+  oldVersion = schemaVersion;
+  assert(sqlite3_exec(
+             db,
+             "SAVEPOINT schema_version_rollback; CREATE TABLE rollback_foo (a)",
+             0, 0, 0) == SQLITE_OK);
+  rc = crsql_readPragmaSchemaVersion(pExtData, &schemaVersion);
+  assert(rc == SQLITE_OK);
+  assert(schemaVersion != oldVersion);
+  assert(pExtData->pragmaSchemaVersion == -1);
+  assert(sqlite3_exec(
+             db,
+             "ROLLBACK TO schema_version_rollback; RELEASE schema_version_rollback",
+             0, 0, 0) == SQLITE_OK);
+  rc = crsql_readPragmaSchemaVersion(pExtData, &schemaVersion);
+  assert(rc == SQLITE_OK);
+  assert(schemaVersion == oldVersion);
+  assert(pExtData->pragmaSchemaVersion == -1);
 
   crsql_finalize(pExtData);
   crsql_freeExtData(pExtData);
@@ -166,6 +152,8 @@ static void testFetchPragmaDataVersion() {
   sqlite3 *db1;
   sqlite3 *db2;
   int rc;
+  int dataVersion1;
+  int dataVersion2;
   char *errmsg = 0;
   rc = sqlite3_open("testFetchPragmaDataVersion.db", &db1);
   assert(rc == SQLITE_OK);
@@ -181,45 +169,53 @@ static void testFetchPragmaDataVersion() {
   siteIdBuffer = sqlite3_malloc(SITE_ID_LEN * sizeof *(siteIdBuffer));
   crsql_ExtData *pExtData2 = crsqlExtDataInit(db2, siteIdBuffer);
 
-  // should not change after init
-  rc = crsql_fetchPragmaDataVersion(db1, pExtData1);
-  assert(rc == 0);
-  rc = crsql_fetchPragmaDataVersion(db2, pExtData2);
-  assert(rc == 0);
+  rc = crsql_readPragmaDataVersion(pExtData1, &dataVersion1);
+  assert(rc == SQLITE_OK);
+  assert(dataVersion1 == pExtData1->pragmaDataVersion);
+  rc = crsql_readPragmaDataVersion(pExtData2, &dataVersion2);
+  assert(rc == SQLITE_OK);
+  assert(dataVersion2 == pExtData2->pragmaDataVersion);
 
-  // should not change if write was issued on its connection
+  // A connection's own writes do not change its data_version.
   rc = sqlite3_exec(db1, "INSERT INTO fpdv VALUES (1)", 0, 0, 0);
   assert(rc == SQLITE_OK);
-  rc = crsql_fetchPragmaDataVersion(db1, pExtData1);
-  assert(rc == 0);
+  rc = crsql_readPragmaDataVersion(pExtData1, &dataVersion1);
+  assert(rc == SQLITE_OK);
+  assert(dataVersion1 == pExtData1->pragmaDataVersion);
 
-  // should change if write was issued on another connection
-  rc = crsql_fetchPragmaDataVersion(db2, pExtData2);
-  assert(rc == 2);
+  // Another connection's commit changes the value without changing the cache.
+  rc = crsql_readPragmaDataVersion(pExtData2, &dataVersion2);
+  assert(rc == SQLITE_OK);
+  assert(dataVersion2 != pExtData2->pragmaDataVersion);
+  rc = crsql_readPragmaDataVersion(pExtData2, &dataVersion2);
+  assert(rc == SQLITE_OK);
+  assert(dataVersion2 != pExtData2->pragmaDataVersion);
+  pExtData2->pragmaDataVersion = dataVersion2;
+  rc = crsql_readPragmaDataVersion(pExtData2, &dataVersion2);
+  assert(rc == SQLITE_OK);
+  assert(dataVersion2 == pExtData2->pragmaDataVersion);
 
-  // should not change after updating itself
-  rc = crsql_fetchPragmaDataVersion(db2, pExtData2);
-  assert(rc == 0);
-
-  // same test but in reverse direction
   rc = sqlite3_exec(db2, "INSERT INTO fpdv VALUES (1)", 0, 0, 0);
   assert(rc == SQLITE_OK);
-  rc = crsql_fetchPragmaDataVersion(db2, pExtData2);
-  assert(rc == 0);
+  rc = crsql_readPragmaDataVersion(pExtData2, &dataVersion2);
+  assert(rc == SQLITE_OK);
+  assert(dataVersion2 == pExtData2->pragmaDataVersion);
 
-  rc = crsql_fetchPragmaDataVersion(db1, pExtData1);
-  assert(rc == 2);
+  rc = crsql_readPragmaDataVersion(pExtData1, &dataVersion1);
+  assert(rc == SQLITE_OK);
+  assert(dataVersion1 != pExtData1->pragmaDataVersion);
+  pExtData1->pragmaDataVersion = dataVersion1;
 
   // A schema commit from another connection can invalidate the cached
   // PRAGMA statement. The helper must reprepare it before retrying.
   rc = sqlite3_exec(db1, "CREATE TABLE fpdv_schema_change (a)", 0, 0, 0);
   assert(rc == SQLITE_OK);
-  rc = crsql_fetchPragmaDataVersion(db2, pExtData2);
-  assert(rc == 2);
-
-  // should not change after updating itself
-  rc = crsql_fetchPragmaDataVersion(db1, pExtData1);
-  assert(rc == 0);
+  rc = crsql_readPragmaDataVersion(pExtData2, &dataVersion2);
+  assert(rc == SQLITE_OK);
+  assert(dataVersion2 != pExtData2->pragmaDataVersion);
+  rc = crsql_readPragmaDataVersion(pExtData1, &dataVersion1);
+  assert(rc == SQLITE_OK);
+  assert(dataVersion1 == pExtData1->pragmaDataVersion);
 
   crsql_finalize(pExtData1);
   crsql_freeExtData(pExtData1);
@@ -238,6 +234,6 @@ void crsqlExtDataTestSuite() {
   textNewExtData();
   testFreeExtData();
   testFinalize();
-  testFetchPragmaSchemaVersion();
+  testReadPragmaSchemaVersion();
   testFetchPragmaDataVersion();
 }

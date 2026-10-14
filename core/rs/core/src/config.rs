@@ -6,7 +6,7 @@ use core::ffi::c_int;
 use num_traits::FromPrimitive;
 use sqlite::{Connection, Context};
 use sqlite_nostd as sqlite;
-use sqlite_nostd::{ColumnType, ManagedStmt, ResultCode, Value};
+use sqlite_nostd::{ManagedStmt, ResultCode, Value};
 
 use crate::c::crsql_ExtData;
 
@@ -58,14 +58,13 @@ unsafe fn config_refresh_error(
         Err(_) => "error",
     };
     format!(
-        "cr-sqlite config refresh failed: operation={}, key={}, rc={}, sqlite_error={}, autocommit={}, data_version={}, checked_this_tx={}, crsql_master={}, table_infos={:p}, write_version={}, use_version={}, sync_log_version={}, merge_equal_values={}",
+        "cr-sqlite config refresh failed: operation={}, key={}, rc={}, sqlite_error={}, autocommit={}, data_version={}, crsql_master={}, table_infos={:p}, write_version={}, use_version={}, sync_log_version={}, merge_equal_values={}",
         operation,
         key.unwrap_or("<none>"),
         sqlite_rc,
         sqlite_error,
         db.get_autocommit(),
         (*ext_data).pragmaDataVersion,
-        (*ext_data).checkedConfigThisTx,
         master_exists,
         (*ext_data).tableInfos,
         (*ext_data).metadataWriteVersion,
@@ -79,43 +78,27 @@ pub unsafe fn ensure_config_current(
     db: *mut sqlite_nostd::sqlite3,
     ext_data: *mut crsql_ExtData,
 ) -> Result<(), String> {
-    // Read-only/autocommit statements do not invoke the commit hook, so a
-    // transaction flag would otherwise remain set forever after the first
-    // SELECT. In autocommit mode each operation is its own transaction and
-    // must check data_version independently.
-    let autocommit = db.get_autocommit();
-    if (*ext_data).checkedConfigThisTx != 0 && !autocommit {
-        return Ok(());
-    }
-
-    crate::ext_data::refresh_connection_state_if_needed(db, ext_data)?;
-    (*ext_data).checkedConfigThisTx = if autocommit { 0 } else { 1 };
-    Ok(())
+    crate::ext_data::refresh_connection_state_if_needed(db, ext_data)
 }
 
-pub fn reload_connection_config(
+pub(crate) struct ConnectionConfig {
+    pub(crate) merge_equal_values: c_int,
+    pub(crate) metadata_write_version: c_int,
+    pub(crate) metadata_use_version: c_int,
+    pub(crate) sync_log_version: c_int,
+}
+
+pub(crate) fn load_connection_config(
     db: *mut sqlite::sqlite3,
     ext_data: *mut crsql_ExtData,
-) -> Result<(), alloc::string::String> {
-    let stmt = db
-        .prepare_v2("SELECT value FROM crsql_master WHERE key = 'config.merge-equal-values'")
-        .map_err(|rc| format!("failed to prepare config refresh: {rc}"))?;
-    let merge_equal_values = match stmt.step() {
-        Ok(ResultCode::ROW) => {
-            if stmt.column_type(0) != Ok(ColumnType::Integer) {
-                return Err("invalid merge-equal-values setting".into());
-            }
-            stmt.column_int(0)
-        }
-        Ok(ResultCode::DONE) => 0,
-        Ok(rc) | Err(rc) => return Err(format!("failed to read config: {rc}")),
-    };
+) -> Result<ConnectionConfig, alloc::string::String> {
     let read_cached = |name: &str| {
         let key = format!("config.{name}");
         unsafe { crate::util::get_master_value_cached(ext_data, &key) }.map_err(|_| unsafe {
             config_refresh_error(db, ext_data, "read config (cached step)", Some(name))
         })
     };
+    let merge_equal_values = read_cached(MERGE_EQUAL_VALUES)?.unwrap_or(0) as c_int;
     let metadata_write_version = read_cached(METADATA_WRITE_VERSION)?
         .unwrap_or(METADATA_WRITE_VERSION_DEFAULT as i64) as c_int;
     let metadata_use_version = read_cached(METADATA_USE_VERSION)?
@@ -123,13 +106,12 @@ pub fn reload_connection_config(
     let sync_log_version = read_cached(SYNC_LOG_VERSION)?
         .unwrap_or(SYNC_LOG_VERSION_DEFAULT as i64) as c_int;
 
-    unsafe {
-        (*ext_data).mergeEqualValues = merge_equal_values;
-        (*ext_data).metadataWriteVersion = metadata_write_version;
-        (*ext_data).metadataUseVersion = metadata_use_version;
-        (*ext_data).syncLogVersion = sync_log_version;
-    }
-    Ok(())
+    Ok(ConnectionConfig {
+        merge_equal_values,
+        metadata_write_version,
+        metadata_use_version,
+        sync_log_version,
+    })
 }
 
 pub extern "C" fn crsql_config_set(
@@ -424,22 +406,12 @@ pub extern "C" fn crsql_config_set(
     }
 }
 
-/// Rollback the config_set savepoint and invalidate any in-memory table info
-/// cache that may have been populated by schema changes (e.g. V2 table
-/// creation during the 1->2 transition) that are now being rolled back.
-/// Without resetting these flags, the stale cache would persist for the
-/// remainder of the transaction — `crsql_ensure_table_infos_are_up_to_date`
-/// would see `updatedTableInfosThisTx == 1` and `schema_changed == 0` (the
-/// DDL was rolled back so PRAGMA schema_version reverted) and return early
-/// without re-pulling, leaving V2 TableInfo entries for tables that no
-/// longer exist.
+/// Roll back the config_set savepoint and invalidate the cached schema cookie
+/// so the next table-info lookup reloads the restored schema.
 fn rollback_config_set(db: *mut sqlite_nostd::sqlite3, ext_data: *mut crsql_ExtData) {
     let _ = db.exec_safe("ROLLBACK TO config_set");
     let _ = db.exec_safe("RELEASE config_set");
-    unsafe {
-        (*ext_data).updatedTableInfosThisTx = 0;
-        (*ext_data).pragmaSchemaVersionForTableInfos = -1;
-    }
+    crate::tableinfo::invalidate_table_info_cache(ext_data);
 }
 
 /// Persist an integer config setting to crsql_master as `config.{name}`.
@@ -684,9 +656,7 @@ fn create_v2_tables_for_existing_crrs(
 
     // Creating V2 tables bumps PRAGMA schema_version. Clear the per-tx flag so
     // ensure actually re-pulls instead of returning the pre-transition (V1) cache.
-    unsafe {
-        (*ext_data).updatedTableInfosThisTx = 0;
-    }
+    crate::tableinfo::invalidate_table_info_cache(ext_data);
     let mut err: *mut core::ffi::c_char = core::ptr::null_mut();
     let rc = crate::tableinfo::crsql_ensure_table_infos_are_up_to_date(
         db,

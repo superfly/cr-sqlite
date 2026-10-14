@@ -87,10 +87,8 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   // printf("instantiated pSetDbVersionStmt, rc: %d\n", rc);
 
   pExtData->seq = 0;
-  pExtData->pragmaSchemaVersion = -1;
   pExtData->pragmaDataVersion = -1;
-  pExtData->checkedConfigThisTx = 0;
-  pExtData->pragmaSchemaVersionForTableInfos = -1;
+  pExtData->pragmaSchemaVersion = -1;
   pExtData->pDbVersionStmt = 0;
   rc = sqlite3_prepare_v3(
       db,
@@ -116,7 +114,6 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   pExtData->pVersionGuardStmt = 0;
   pExtData->versionGuardEnlisted = 0;
   pExtData->rowsImpacted = 0;
-  pExtData->updatedTableInfosThisTx = 0;
   crsql_init_table_info_vec(pExtData);
   crsql_init_last_db_versions_map(pExtData);
   crsql_init_ordinal_map(pExtData);
@@ -177,11 +174,13 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   }
 
   sqlite3_finalize(pStmt);
-  int pv = crsql_fetchPragmaDataVersion(db, pExtData);
-  if (pv < 0 || rc != SQLITE_OK) {
+  int dataVersion = 0;
+  rc = crsql_readPragmaDataVersion(pExtData, &dataVersion);
+  if (rc != SQLITE_OK) {
     crsql_freeExtData(pExtData);
     return 0;
   }
+  pExtData->pragmaDataVersion = dataVersion;
 
   return pExtData;
 }
@@ -288,59 +287,28 @@ void crsql_finalize(crsql_ExtData *pExtData) {
   pExtData->pSelectClockTablesStmt = 0;
 }
 
-#define DB_VERSION_SCHEMA_VERSION 0
-#define TABLE_INFO_SCHEMA_VERSION 1
-
-int crsql_fetchPragmaSchemaVersion(sqlite3 *db, crsql_ExtData *pExtData,
-                                   int which) {
+int crsql_readPragmaSchemaVersion(crsql_ExtData *pExtData, int *schemaVersion) {
+  if (!schemaVersion) return SQLITE_MISUSE;
   int rc = sqlite3_step(pExtData->pPragmaSchemaVersionStmt);
-  if (rc == SQLITE_ROW) {
-    int version = sqlite3_column_int(pExtData->pPragmaSchemaVersionStmt, 0);
-    sqlite3_reset(pExtData->pPragmaSchemaVersionStmt);
-    if (which == DB_VERSION_SCHEMA_VERSION) {
-      if (version > pExtData->pragmaSchemaVersion) {
-        pExtData->pragmaSchemaVersion = version;
-        return 1;
-      }
-    } else {
-      if (version > pExtData->pragmaSchemaVersionForTableInfos) {
-        pExtData->pragmaSchemaVersionForTableInfos = version;
-        return 1;
-      }
-    }
-
-    return 0;
-  } else {
-    int finalizeRc = sqlite3_reset(pExtData->pPragmaSchemaVersionStmt);
-    if (rc == SQLITE_DONE) {
-      return finalizeRc;
-    }
-    return rc;
+  if (rc != SQLITE_ROW) {
+    int resetRc = sqlite3_reset(pExtData->pPragmaSchemaVersionStmt);
+    if (resetRc != SQLITE_OK) return resetRc;
+    return rc == SQLITE_DONE ? SQLITE_ERROR : rc;
   }
+
+  *schemaVersion = sqlite3_column_int(pExtData->pPragmaSchemaVersionStmt, 0);
+  return sqlite3_reset(pExtData->pPragmaSchemaVersionStmt);
 }
 
-// Returns:
-//   0  - data version unchanged
-//   2  - data version changed
-//  -1  - error
-int crsql_fetchPragmaDataVersion(sqlite3 *db, crsql_ExtData *pExtData) {
-  (void)db;
+int crsql_readPragmaDataVersion(crsql_ExtData *pExtData, int *dataVersion) {
+  if (!dataVersion) return SQLITE_MISUSE;
   int rc = sqlite3_step(pExtData->pPragmaDataVersionStmt);
   if (rc != SQLITE_ROW) {
-    int finalizeRc = sqlite3_reset(pExtData->pPragmaDataVersionStmt);
-    if (rc == SQLITE_DONE) {
-      return finalizeRc == SQLITE_OK ? 0 : -1;
-    }
-    return -1;
+    int resetRc = sqlite3_reset(pExtData->pPragmaDataVersionStmt);
+    if (resetRc != SQLITE_OK) return resetRc;
+    return rc == SQLITE_DONE ? SQLITE_ERROR : rc;
   }
 
-  int version = sqlite3_column_int(pExtData->pPragmaDataVersionStmt, 0);
-  sqlite3_reset(pExtData->pPragmaDataVersionStmt);
-
-  if (version != pExtData->pragmaDataVersion) {
-    pExtData->pragmaDataVersion = version;
-    return 2;
-  }
-
-  return 0;
+  *dataVersion = sqlite3_column_int(pExtData->pPragmaDataVersionStmt, 0);
+  return sqlite3_reset(pExtData->pPragmaDataVersionStmt);
 }
