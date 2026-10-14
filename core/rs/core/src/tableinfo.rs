@@ -139,29 +139,32 @@ pub struct TableInfo {
     move_non_pk_col_stmt: RefCell<Option<ManagedStmt>>,
     mark_locally_created_stmt: RefCell<Option<ManagedStmt>>,
     maybe_mark_locally_reinserted_stmt: RefCell<Option<ManagedStmt>>,
-    cl_cache: BTreeMap<i64, i64>,
+    cl_cache: RefCell<BTreeMap<i64, i64>>,
     /// Cached V2 prepared statements. None if table is not V2-enabled,
     /// or if statements haven't been prepared yet.
     v2_stmts: RefCell<Option<crate::v2_stmts::V2Stmts>>,
 }
 
 impl TableInfo {
-    pub fn get_cl(&self, key: i64) -> Option<&i64> {
-        self.cl_cache.get(&key)
+    pub fn get_cl(&self, key: i64) -> Option<i64> {
+        self.cl_cache.borrow().get(&key).copied()
     }
 
-    pub fn set_cl(&mut self, key: i64, cl: i64) {
+    pub fn set_cl(&self, key: i64, cl: i64) {
+        let mut cl_cache = self.cl_cache.borrow_mut();
         // clear the cache if we are over limit
-        if self.cl_cache.len() >= MAX_CL_CACHE_SIZE {
-            self.cl_cache.clear();
+        if cl_cache.len() >= MAX_CL_CACHE_SIZE {
+            cl_cache.clear();
         }
-        self.cl_cache.insert(key, cl);
+        cl_cache.insert(key, cl);
+    }
+
+    pub fn invalidate_cl(&self, key: i64) {
+        self.cl_cache.borrow_mut().remove(&key);
     }
 
     pub fn clear_cl_cache(&mut self) {
-        if !self.cl_cache.is_empty() {
-            self.cl_cache.clear();
-        }
+        self.cl_cache.borrow_mut().clear();
     }
 
     fn find_non_pk_col(&self, col_name: &str) -> Result<&ColumnInfo, ResultCode> {
@@ -1415,7 +1418,7 @@ pub fn pull_table_info(
         select_clock_stmt: RefCell::new(None),
         insert_clock_stmt: RefCell::new(None),
         update_clock_stmt: RefCell::new(None),
-        cl_cache: BTreeMap::new(),
+        cl_cache: RefCell::new(BTreeMap::new()),
         v2_stmts: RefCell::new(None),
     })
 }

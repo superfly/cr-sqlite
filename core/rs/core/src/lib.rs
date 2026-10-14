@@ -1409,7 +1409,7 @@ unsafe extern "C" fn x_crsql_cache_pk_cl(
     let table_info = table_infos.iter().find(|t| t.tbl_name == table_name);
 
     if let Some(table_info) = table_info {
-        let cl = table_info.get_cl(pk_key).cloned().unwrap_or(-1);
+        let cl = table_info.get_cl(pk_key).unwrap_or(-1);
         sqlite::result_int64(ctx, cl);
     } else {
         ctx.result_error("table not found");

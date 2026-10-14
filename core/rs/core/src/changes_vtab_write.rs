@@ -431,7 +431,7 @@ fn get_local_cl(
     key: sqlite::int64,
 ) -> Result<sqlite::int64, ResultCode> {
     if let Some(cl) = tbl_info.get_cl(key) {
-        return Ok(*cl);
+        return Ok(cl);
     }
 
     let cl = {
@@ -527,6 +527,7 @@ unsafe fn mirror_v1_alive_transition(
     if incoming_cl > local_cl && incoming_cl > 1 {
         // Match the V1 resurrection semantics: old non-sentinel clocks are
         // retained at version zero until winning column changes replace them.
+        tbl_info.invalidate_cl(v1_key);
         zero_clocks_on_resurrect(db, tbl_info, v1_key)?;
         set_winner_clock(
             db,
@@ -572,6 +573,7 @@ unsafe fn mirror_v1_value_change(
         db_version,
         seq
     );
+    tbl_info.invalidate_cl(key);
     set_winner_clock(
         db, ext_data, tbl_info, key, col_name, col_vrsn, db_version, site_id, seq, ts,
     )?;
@@ -603,6 +605,7 @@ unsafe fn mirror_v1_delete(
         db_version,
         seq
     );
+    tbl_info.invalidate_cl(key);
     set_winner_clock(
         db,
         ext_data,
@@ -2100,6 +2103,7 @@ unsafe fn v2_packed_merge(
             impacted = true;
             if dual_write_enabled(ext_data) {
                 let v1_key = tbl_info.get_or_create_key(db, unpacked_pks)?;
+                tbl_info.invalidate_cl(v1_key);
                 set_winner_clock(
                     db,
                     ext_data,
