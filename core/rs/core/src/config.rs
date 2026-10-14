@@ -134,6 +134,7 @@ pub extern "C" fn crsql_config_set(
             return;
         }
         unsafe { (*ext_data).defaultTimestamp = v as u64 };
+        crate::crsql_debug!("config set name={} value={} scope=connection", name, v);
         ctx.result_int64(v);
         return;
     }
@@ -386,6 +387,13 @@ pub extern "C" fn crsql_config_set(
                     // All persistence succeeded — set the result, apply the
                     // ext_data updates (driven by the same config_changes list),
                     // and release the savepoint.
+                    for (config_name, config_value) in config_changes.iter() {
+                        crate::crsql_debug!(
+                            "config staged name={} value={}",
+                            config_name,
+                            config_value
+                        );
+                    }
                     ctx.result_value(value);
                     apply_config_changes_to_ext_data(ext_data, config_changes);
                     let _ = db.exec_safe("RELEASE config_set");

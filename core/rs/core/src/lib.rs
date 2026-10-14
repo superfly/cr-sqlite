@@ -112,13 +112,15 @@ pub extern "C" fn crsql_as_table(
     let db = ctx.db_handle();
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
     let table = args[0].text();
+    crate::crsql_debug!("crsql_as_table start table={}", table);
 
     if let Err(_) = db.exec_safe("SAVEPOINT as_table;") {
         ctx.result_error("failed to start as_table savepoint");
         return;
     }
 
-    if let Err(_) = crsql_as_table_impl(db, table, ext_data) {
+    if let Err(rc) = crsql_as_table_impl(db, table, ext_data) {
+        crate::crsql_debug!("crsql_as_table failed table={} rc={:?}", table, rc);
         ctx.result_error("failed to downgrade the crr");
         if let Err(_) = db.exec_safe("ROLLBACK") {
             // fine.
@@ -126,8 +128,10 @@ pub extern "C" fn crsql_as_table(
         return;
     }
 
-    if let Err(_) = db.exec_safe("RELEASE as_table;") {
-        // fine
+    if let Err(rc) = db.exec_safe("RELEASE as_table;") {
+        crate::crsql_debug!("crsql_as_table release failed table={} rc={:?}", table, rc);
+    } else {
+        crate::crsql_debug!("crsql_as_table complete table={}", table);
     }
 }
 
@@ -1012,6 +1016,13 @@ unsafe extern "C" fn x_crsql_as_crr(
         return;
     }
 
+    crate::crsql_debug!(
+        "crsql_as_crr start schema={} table={} use_rowid={:?} skip_hash={}",
+        schema_name,
+        table_name,
+        use_rowid,
+        skip_hash
+    );
     let rc = crsql_create_crr(
         db,
         schema_name.as_ptr() as *const c_char,
@@ -1032,9 +1043,11 @@ unsafe extern "C" fn x_crsql_as_crr(
     crate::tableinfo::invalidate_table_info_cache(ext_data);
     let rc = db.exec_safe("RELEASE as_crr");
     if rc.is_err() {
+        crate::crsql_debug!("crsql_as_crr failed to release savepoint schema={} table={}", schema_name, table_name);
         ctx.result_error("failed to release as_crr savepoint");
         return;
     }
+    crate::crsql_debug!("crsql_as_crr complete schema={} table={}", schema_name, table_name);
     ctx.result_text_static("OK");
 }
 
@@ -1337,6 +1350,7 @@ unsafe extern "C" fn x_crsql_set_ts(
         }
     }
     (*ext_data).timestamp = ts_u64;
+    crate::crsql_debug!("transaction timestamp set value={}", ts_u64);
     ctx.result_text_static("OK");
 }
 

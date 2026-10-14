@@ -61,6 +61,12 @@ fn after_delete(
     // V1 code path (write to V1)
     let ts = unsafe { (*ext_data).timestamp.to_string() };
     let db_version = crate::db_version::next_db_version(db, ext_data)?;
+    crate::crsql_debug!(
+        "local delete table={} db_version={} timestamp={}",
+        tbl_info.tbl_name,
+        db_version,
+        ts
+    );
     let seq = bump_seq(ext_data);
     let key = tbl_info
         .get_or_create_key_via_raw_values(db, pks_old)

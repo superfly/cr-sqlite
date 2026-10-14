@@ -92,6 +92,12 @@ fn after_insert(
     let ts = unsafe { (*ext_data).timestamp.to_string() };
 
     let db_version = crate::db_version::next_db_version(db, ext_data)?;
+    crate::crsql_debug!(
+        "local insert table={} db_version={} timestamp={}",
+        tbl_info.tbl_name,
+        db_version,
+        ts
+    );
     let (create_record_existed, key_new) = tbl_info
         .get_or_create_key_for_insert(db, pks_new)
         .map_err(|_| "failed getting or creating lookaside key")?;

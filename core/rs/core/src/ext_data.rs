@@ -40,6 +40,21 @@ pub fn refresh_connection_state_if_needed(
 
     let config = crate::config::load_connection_config(db, ext_data)?;
     let db_version = crate::db_version::load_db_version(ext_data)?;
+    crate::crsql_debug!(
+        "connection state refresh data_version={} -> {} db_version={} -> {} write_version={} -> {} use_version={} -> {} sync_log_version={} -> {} merge_equal_values={} -> {}",
+        unsafe { (*ext_data).pragmaDataVersion },
+        data_version,
+        unsafe { (*ext_data).dbVersion },
+        db_version,
+        unsafe { (*ext_data).metadataWriteVersion },
+        config.metadata_write_version,
+        unsafe { (*ext_data).metadataUseVersion },
+        config.metadata_use_version,
+        unsafe { (*ext_data).syncLogVersion },
+        config.sync_log_version,
+        unsafe { (*ext_data).mergeEqualValues },
+        config.merge_equal_values
+    );
     unsafe {
         (*ext_data).mergeEqualValues = config.merge_equal_values;
         (*ext_data).metadataWriteVersion = config.metadata_write_version;

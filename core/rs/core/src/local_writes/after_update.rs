@@ -221,8 +221,15 @@ fn after_update(
 
     // actually set the db_version
     if changed {
-        // TODO: assert this is same as next_db_version
-        crate::db_version::next_db_version(db, ext_data)?;
+        let db_version = crate::db_version::next_db_version(db, ext_data)?;
+        crate::crsql_debug!(
+            "local update table={} db_version={} changed_columns={} key_changed={} timestamp={}",
+            tbl_info.tbl_name,
+            db_version,
+            changed_indices.len(),
+            key_changed,
+            ts
+        );
     }
 
     if let Some((old_key, cl)) = cl_info {

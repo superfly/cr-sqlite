@@ -159,6 +159,12 @@ pub fn v2_after_insert(
     let skip_hash = tbl_info.skip_hash;
     let hashed_pk = compute_hashed_pk(tbl_info, pks_new)?;
     let ts_val = unsafe { (*ext_data).timestamp as i64 };
+    crate::crsql_debug!(
+        "local insert v2 table={} db_version={} timestamp={}",
+        tbl_info.tbl_name,
+        db_version,
+        ts_val
+    );
 
     // Get cached statements (lazily prepared on first use)
     let mut v2_stmts_ref = tbl_info.get_v2_stmts(db, ext_data)
@@ -318,6 +324,13 @@ pub fn v2_after_update(
     let skip_hash = tbl_info.skip_hash;
     let hashed_pk = compute_hashed_pk(tbl_info, pks_new)?;
     let ts_val = unsafe { (*ext_data).timestamp as i64 };
+    crate::crsql_debug!(
+        "local update v2 table={} db_version={} changed_columns={} key_changed=false timestamp={}",
+        tbl_info.tbl_name,
+        db_version,
+        changed_col_indices.len(),
+        ts_val
+    );
 
     let mut v2_stmts_ref = tbl_info.get_v2_stmts(db, ext_data)
         .map_err(|e| format!("failed to get v2 stmts: {:?}", e))?;
@@ -383,6 +396,12 @@ pub fn v2_after_delete(
     let skip_hash = tbl_info.skip_hash;
     let hashed_pk = compute_hashed_pk(tbl_info, pks_old)?;
     let ts_val = unsafe { (*ext_data).timestamp as i64 };
+    crate::crsql_debug!(
+        "local delete v2 table={} db_version={} timestamp={}",
+        tbl_info.tbl_name,
+        db_version,
+        ts_val
+    );
 
     let mut v2_stmts_ref = tbl_info.get_v2_stmts(db, ext_data)
         .map_err(|e| format!("failed to get v2 stmts: {:?}", e))?;

@@ -48,6 +48,20 @@ pub fn debug_log_args(args: core::fmt::Arguments<'_>) {
     }
 }
 
+#[no_mangle]
+pub extern "C" fn crsql_debug_db_version_sync(version: i64, rc: i32) {
+    crate::crsql_debug!(
+        "db_version xSync version={} result={} rc={}",
+        version,
+        if rc == sqlite::ResultCode::OK as i32 {
+            "ready-to-commit"
+        } else {
+            "failed"
+        },
+        rc
+    );
+}
+
 #[macro_export]
 macro_rules! crsql_debug {
     ($($arg:tt)*) => {
