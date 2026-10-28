@@ -4,5 +4,5 @@ hypothesis==6.75.9
 iniconfig==2.0.0
 packaging==23.1
 pluggy==1.0.0
-pytest==7.3.1
+pytest==9.0.3
 sortedcontainers==2.4.0
