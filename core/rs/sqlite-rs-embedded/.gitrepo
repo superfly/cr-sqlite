@@ -1,0 +1,12 @@
+; DO NOT EDIT (unless you know what you are doing)
+;
+; This subdirectory is a git "subrepo", and this file is maintained by the
+; git-subrepo command. See https://github.com/ingydotnet/git-subrepo#readme
+;
+[subrepo]
+	remote = git@github.com:superfly/sqlite-rs-embedded.git
+	branch = main
+	commit = 0802167607a592d03f808739f6a426c45c19e9e2
+	parent = 5e28cc16287119f93b56761e09b06c1182fb1047
+	method = merge
+	cmdver = 0.4.9

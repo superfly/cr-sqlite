@@ -1,3 +1,0 @@
-[submodule "core/rs/sqlite-rs-embedded"]
-  path = core/rs/sqlite-rs-embedded
-	url = git@github.com:vlcn-io/sqlite-rs-embedded.git

@@ -1,0 +1,19 @@
+{
+   Internal Rust leak in __rust_std_internal_init_fn
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:malloc
+   fun:alloc
+   fun:alloc_impl
+   fun:allocate
+   fun:{closure#0}<std::thread::thread::Inner, std::alloc::System>
+   fun:allocate_for_layout<core::mem::maybe_uninit::MaybeUninit<std::thread::thread::Inner>, alloc::sync::{impl#17}::new_uninit_in::{closure_env#0}<std::thread::thread::Inner, std::alloc::System>, fn(*mut u8) -> *mut alloc::sync::ArcInner<core::mem::maybe_uninit::MaybeUninit<std::thread::thread::Inner>>>
+   fun:new_uninit_in<std::thread::thread::Inner, std::alloc::System>
+   fun:_ZN3std6thread6thread6Thread3new17h41a8f2b84f36f158E
+   fun:_ZN3std6thread7current12init_current17hec215036a0fd9580E
+   fun:current_or_unnamed
+   fun:_ZN3std4sync4mpmc7context7Context3new17h3d6872bcad03bbe3E
+   fun:__rust_std_internal_init_fn
+   ...
+   fun:_ZN4test9test_main17hd83a4ce8973e5af0E
+}

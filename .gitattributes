@@ -1,3 +1,3 @@
 core/src/sqlite/* linguist-vendored
 py/perf/* linguist-documentation
-
+core/rs/sqlite-rs-embedded/** linguist-vendored

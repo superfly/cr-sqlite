@@ -1,0 +1,20 @@
+[package]
+name = "sqlite_web"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+panic = "abort"
+
+[lib]
+name = "sqlite_web"
+crate-type = ["rlib"]
+
+[dependencies]
+sqlite_nostd = { path="../sqlite_nostd" }
+stable_trap = { path="../stable_trap" }
+
+[features]
+loadable_extension = ["sqlite_nostd/loadable_extension"]
+static = ["sqlite_nostd/static"]
+

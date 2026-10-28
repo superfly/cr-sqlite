@@ -69,8 +69,8 @@ jobs:
 
       - name: Rust Nightly
         run: |
-          rustup toolchain install nightly-2023-10-05
-          rustup target add aarch64-apple-darwin --toolchain nightly-2023-10-05
+          rustup toolchain install nightly-2026-01-01
+          rustup target add aarch64-apple-darwin --toolchain nightly-2026-01-01
 
       - name: Build MacOS Arm dylib
         run: |
@@ -121,9 +121,9 @@ jobs:
 
       - name: Rust Nightly
         run: |
-          rustup toolchain install nightly-2023-10-05
-          rustup target add aarch64-unknown-linux-gnu --toolchain nightly-2023-10-05
-          rustup component add rust-src --toolchain nightly-2023-10-05-x86_64-unknown-linux-gnu
+          rustup toolchain install nightly-2026-01-01
+          rustup target add aarch64-unknown-linux-gnu --toolchain nightly-2026-01-01
+          rustup component add rust-src --toolchain nightly-2026-01-01-x86_64-unknown-linux-gnu
 
       - name: Build
         run: |
@@ -157,9 +157,9 @@ jobs:
 
       - name: Rust Nightly
         run: |
-          rustup toolchain install nightly-2023-10-05
-          rustup target add x86_64-pc-windows-gnu --toolchain nightly-2023-10-05
-          rustup component add rust-src --toolchain nightly-2023-10-05-x86_64-unknown-linux-gnu
+          rustup toolchain install nightly-2026-01-01
+          rustup target add x86_64-pc-windows-gnu --toolchain nightly-2026-01-01
+          rustup component add rust-src --toolchain nightly-2026-01-01-x86_64-unknown-linux-gnu
 
       - name: mingw-w64
         run: |
@@ -197,9 +197,9 @@ jobs:
 
       - name: Rust Nightly
         run: |
-          rustup toolchain install nightly-2023-10-05
-          rustup target add i686-pc-windows-gnu --toolchain nightly-2023-10-05
-          rustup component add rust-src --toolchain nightly-2023-10-05-x86_64-unknown-linux-gnu
+          rustup toolchain install nightly-2026-01-01
+          rustup target add i686-pc-windows-gnu --toolchain nightly-2026-01-01
+          rustup component add rust-src --toolchain nightly-2026-01-01-x86_64-unknown-linux-gnu
 
       - name: mingw-w64
         run: |
@@ -237,9 +237,9 @@ jobs:
 
       - name: Rust Nightly
         run: |
-          rustup toolchain install nightly-2023-10-05
-          rustup target add aarch64-linux-android --toolchain nightly-2023-10-05
-          rustup component add rust-src --toolchain nightly-2023-10-05-x86_64-unknown-linux-gnu
+          rustup toolchain install nightly-2026-01-01
+          rustup target add aarch64-linux-android --toolchain nightly-2026-01-01
+          rustup component add rust-src --toolchain nightly-2026-01-01-x86_64-unknown-linux-gnu
 
       - uses: nttld/setup-ndk@v1
         id: setup-ndk
