@@ -21,6 +21,26 @@ use crate::stmt_cache::reset_cached_stmt;
 use crate::tableinfo::{crsql_ensure_table_infos_are_up_to_date, TableInfo};
 use crate::util::slab_rowid;
 
+#[repr(i64)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeOp {
+    #[allow(dead_code)]
+    Noop = 0,
+    Insert = 1,
+    Update = 2,
+    Delete = 3,
+    Resurrection = 4,
+}
+
+#[inline]
+fn encode_op_rowid(op: ChangeOp, tbl_idx: i32, inner_rowid: sqlite::int64) -> sqlite::int64 {
+    let base = slab_rowid(tbl_idx, inner_rowid);
+    if base < 0 {
+        return base;
+    }
+    ((op as i64) << 60) | base
+}
+
 /// Set the sync bit, run `f`, then clear the sync bit.
 /// Ensures the clear always runs even if `f` returns an error.
 unsafe fn with_sync_bit<F, T>(ext_data: *mut crsql_ExtData, f: F) -> Result<T, ResultCode>
@@ -1057,7 +1077,7 @@ unsafe fn v1_merge_insert(
                 }
                 Ok(inner_rowid) => {
                     (*ext_data).rowsImpacted += 1;
-                    *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
+                    *rowid = encode_op_rowid(ChangeOp::Delete, tbl_info_index as i32, inner_rowid);
                     return Ok(ResultCode::OK);
                 }
             }
@@ -1092,7 +1112,12 @@ unsafe fn v1_merge_insert(
             // a success & rowid of -1 means the merge was a no-op
             if inner_rowid != -1 {
                 (*ext_data).rowsImpacted += 1;
-                *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
+                let op = if row_exists_locally || insert_cl > 1 {
+                    ChangeOp::Resurrection
+                } else {
+                    ChangeOp::Insert
+                };
+                *rowid = encode_op_rowid(op, tbl_info_index as i32, inner_rowid);
             }
             return Ok(ResultCode::OK);
         }
@@ -1103,7 +1128,9 @@ unsafe fn v1_merge_insert(
         // which should resurrect the row. I.e., don't wait on the sentinel value to resurrect the row!
         // If the row does not exist locally and the insert_cl is > 1 then we need to create a sentinel to record the insert cl.
         // Not doing so will cause us to assume a cl of 1.
-        if needs_resurrect && (row_exists_locally || (!row_exists_locally && insert_cl > 1)) {
+        let is_resurrection =
+            needs_resurrect && (row_exists_locally || (!row_exists_locally && insert_cl > 1));
+        if is_resurrection {
             // this should work -- same as `merge_sentinel_only_insert` except we're not done once we do it
             // and the version to set to is the cl not col_vrsn of current insert
             let inner_rowid = merge_sentinel_only_insert(
@@ -1121,7 +1148,11 @@ unsafe fn v1_merge_insert(
             // a success & rowid of -1 means the merge was a no-op
             if inner_rowid != -1 {
                 (*ext_data).rowsImpacted += 1;
-                *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
+                *rowid = encode_op_rowid(
+                    ChangeOp::Resurrection,
+                    tbl_info_index as i32,
+                    inner_rowid,
+                );
             }
         }
 
@@ -1205,7 +1236,14 @@ unsafe fn v1_merge_insert(
             }
             Ok(inner_rowid) => {
                 (*ext_data).rowsImpacted += 1;
-                *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
+                let op = if is_resurrection {
+                    ChangeOp::Resurrection
+                } else if !row_exists_locally {
+                    ChangeOp::Insert
+                } else {
+                    ChangeOp::Update
+                };
+                *rowid = encode_op_rowid(op, tbl_info_index as i32, inner_rowid);
                 return Ok(ResultCode::OK);
             }
         }
@@ -1889,7 +1927,7 @@ unsafe fn v2_merge_insert_tombstone(
     if impacted {
         (*ext_data).rowsImpacted += 1;
         if !rowid.is_null() {
-            *rowid = slab_rowid(tbl_info_index as i32, 1);
+            *rowid = encode_op_rowid(ChangeOp::Delete, tbl_info_index as i32, 1);
         }
     }
 
@@ -2126,10 +2164,16 @@ unsafe fn v2_packed_merge(
     if impacted {
         (*ext_data).rowsImpacted += 1;
         if !rowid.is_null() {
-            // Use a synthetic non-zero rowid encoded with the table index.
-            // The actual value doesn't matter as long as it's non-zero for
-            // impactful merges and zero for no-ops.
-            *rowid = slab_rowid(tbl_info_index as i32, 1);
+            // Encode the winning merge operation type in bits 60..62 alongside
+            // the synthetic table-indexed rowid.
+            let op = if (local_cl > 0 && incoming_cl > local_cl) || (local_cl == 0 && incoming_cl > 1) {
+                ChangeOp::Resurrection
+            } else if local_cl == 0 {
+                ChangeOp::Insert
+            } else {
+                ChangeOp::Update
+            };
+            *rowid = encode_op_rowid(op, tbl_info_index as i32, 1);
         }
     }
 
